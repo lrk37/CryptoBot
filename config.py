@@ -24,7 +24,7 @@
 import os
 from dotenv import load_dotenv
 load_dotenv()
-USE_TESTNET = False
+USE_TESTNET = os.getenv('USE_TESTNET', 'False').lower() in ('true', '1', 't')
 if USE_TESTNET:
     API_KEY = os.getenv('BINANCE_TESTNET_API_KEY', '')
     API_SECRET = os.getenv('BINANCE_TESTNET_API_SECRET', '')
@@ -164,8 +164,8 @@ RETRY_DELAY = 5
 BALANCE_CACHE_TTL = 10
 POSITIONS_FILE = 'positions.json'
 TRADE_LOG_FILE = 'trade_log.json'
-ENABLE_TELEGRAM = False
-TELEGRAM_TOKEN = ''
-TELEGRAM_CHAT_ID = ''
-LOG_FILE = 'bot.log'
-LOG_LEVEL = 'INFO'
+ENABLE_TELEGRAM = os.getenv('ENABLE_TELEGRAM', 'False').lower() in ('true', '1', 't')
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
+LOG_FILE = os.getenv('LOG_FILE', 'bot.log')
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
