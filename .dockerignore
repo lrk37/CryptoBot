@@ -1,0 +1,14 @@
+.git
+.gitignore
+.env
+venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+bot.log
+*.tmp
+data/
+charts/*.png
+pycdc.exe
+search.txt

@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  cryptobot:
+    build: .
+    container_name: cryptobot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./charts:/app/charts
+      - ./data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

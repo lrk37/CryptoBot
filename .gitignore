@@ -1,0 +1,38 @@
+# Environment & Secrets
+.env
+.env.local
+*.key
+*.pem
+
+# Python & Virtual Environments
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Runtime & State Files
+bot.log
+positions.json
+positions.json.tmp
+trade_log.json
+trade_log.json.tmp
+scanner_state.json
+loss_state.json
+loss_state.json.tmp
+
+# Backtest Data & Charts
+data/
+charts/*.png
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary & Binary Artifacts
+*.tmp
+pycdc.exe
+search.txt

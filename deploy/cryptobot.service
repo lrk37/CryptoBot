@@ -1,0 +1,19 @@
+[Unit]
+Description=CryptoBot Automated Spot Trading Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/CryptoBot
+ExecStart=/home/ubuntu/CryptoBot/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+EnvironmentFile=/home/ubuntu/CryptoBot/.env
+
+# Standard output and error logging
+StandardOutput=append:/home/ubuntu/CryptoBot/bot.log
+StandardError=append:/home/ubuntu/CryptoBot/bot.log
+
+[Install]
+WantedBy=multi-user.target
