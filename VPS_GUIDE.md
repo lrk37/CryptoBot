@@ -22,7 +22,7 @@ Once you log into your newly created VPS via SSH:
 
 ```bash
 # 1. Download and run the automated installer script
-curl -sSL https://raw.githubusercontent.com/lrk37/CryptoBot/master/deploy/vps_setup.sh | bash
+curl -sSL https://raw.githubusercontent.com/lrk37/CryptoBot/main/deploy/vps_setup.sh | bash
 ```
 
 The script will automatically:

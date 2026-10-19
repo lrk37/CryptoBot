@@ -87,7 +87,7 @@ For unattended 24/7 operation on an Ubuntu Cloud VPS (e.g., Hetzner, DigitalOcea
 
 ```bash
 # Automated 1-Click Setup:
-curl -sSL https://raw.githubusercontent.com/lrk37/CryptoBot/master/deploy/vps_setup.sh | bash
+curl -sSL https://raw.githubusercontent.com/lrk37/CryptoBot/main/deploy/vps_setup.sh | bash
 ```
 
 See [`VPS_GUIDE.md`](VPS_GUIDE.md) for full instructions covering `systemd` service management, Docker deployment, and API security.
