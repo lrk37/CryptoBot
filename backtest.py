@@ -163,10 +163,13 @@ class StrategyBacktester:
                     if low_price <= trail_level:
                         exit_price = trail_level
                         reason = "TRAILING_STOP"
-                # 4. Max Hold Timeout
+                # 4. Invalidation / Max Hold Timeout: check if price broke below EMA21
                 elif bars_held >= max_hold_bars:
-                    exit_price = close_price
-                    reason = "HOLD_TIMEOUT"
+                    curr_ema21 = ema21.iloc[i]
+                    # Exit if candle closed below EMA21, or if held double max_hold (hard timeout)
+                    if close_price < curr_ema21 or bars_held >= (max_hold_bars * 2):
+                        exit_price = close_price
+                        reason = "TREND_INVALIDATED" if close_price < curr_ema21 else "HOLD_TIMEOUT"
 
                 if exit_price is not None:
                     # Apply exit slippage & fees
