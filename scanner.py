@@ -127,6 +127,8 @@ class MarketScanner:
 
         log.info(f"[SCANNER] {len(passed_prefilter)} passed volume pre-filter (>= ${min_vol:,.0f} USDT)")
 
+        # Keep the MOST LIQUID pairs when capping. (Previously the cap kept whichever pairs Binance listed first.)
+        passed_prefilter.sort(key=lambda s: float((tickers_24h.get(s) or {}).get('quoteVolume', 0) or 0), reverse=True)
         max_scan = getattr(self.cfg, 'MAX_SCAN_CANDIDATES', 60)
         passed_prefilter = passed_prefilter[:max_scan]
 

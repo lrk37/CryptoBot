@@ -132,12 +132,19 @@ class BinanceConnector:
             log.error(f"Failed to fetch 24h tickers batch: {e}")
             return {}
 
-    def get_balance(self, asset):
-        """Get balance for a specific asset (fresh, bypasses cache)."""
+    def get_balance(self, asset, include_locked=False):
+        """Get balance for a specific asset (fresh, bypasses cache).
+
+        Default = FREE amount only. Coins reserved by an open order (e.g. an OCO sell) are 'locked',
+        not 'free' -- pass include_locked=True to get free + locked.
+        """
         acct = self._retry(self.client.get_account)
         for b in acct.get('balances', []):
             if b['asset'] == asset:
-                return float(b['free'])
+                free = float(b['free'])
+                if include_locked:
+                    return free + float(b.get('locked', 0) or 0)
+                return free
         return 0.0
 
     def get_usdt_balance(self):
@@ -145,12 +152,33 @@ class BinanceConnector:
         return self._get_cached_balance('USDT')
 
     def get_asset_balance_fresh(self, symbol):
-        """Get fresh balance for the base asset of a trading pair."""
+        """Get fresh FREE (sellable) balance for the base asset of a trading pair."""
         base_asset = symbol.removesuffix('USDT')
         return self.get_balance(base_asset)
 
-    def get_portfolio_value(self, symbols=None):
-        """Estimate total portfolio value in USDT."""
+    def get_asset_total(self, symbol):
+        """Fresh free + locked balance for the base asset (locked = reserved by open orders such as an OCO)."""
+        base_asset = symbol.removesuffix('USDT')
+        return self.get_balance(base_asset, include_locked=True)
+
+    def net_executed_qty(self, order, symbol):
+        """Executed base quantity minus any commission taken in the base asset = what you actually hold."""
+        if not order:
+            return 0.0
+        executed = float(order.get('executedQty', 0) or 0)
+        base = symbol.removesuffix('USDT')
+        fee_base = 0.0
+        for f in order.get('fills') or []:
+            if f.get('commissionAsset') == base:
+                fee_base += float(f.get('commission', 0) or 0)
+        return max(executed - fee_base, 0.0)
+
+    def get_portfolio_value(self, symbols=None, quantities=None):
+        """Estimate total portfolio value in USDT.
+
+        quantities: optional {symbol: qty} of the bot's tracked positions. When given it is used instead of
+        the account balance, so locked (OCO) coins and unrelated pre-existing holdings are handled correctly.
+        """
         now = time.time()
         with self._portfolio_lock:
             if now - self._portfolio_cache_time < 30 and self._portfolio_cache > 0:
@@ -161,7 +189,10 @@ class BinanceConnector:
         if symbols:
             for s in symbols:
                 try:
-                    qty = self.get_asset_balance_fresh(s)
+                    if quantities is not None and s in quantities:
+                        qty = quantities[s]
+                    else:
+                        qty = self.get_asset_total(s)  # free + locked
                     if qty > 0:
                         px = self.get_price(s)
                         val += qty * px
@@ -175,7 +206,7 @@ class BinanceConnector:
 
     def verify_asset_holding(self, symbol, expected_qty):
         """Check if we actually hold the expected asset quantity."""
-        actual = self.get_asset_balance_fresh(symbol)
+        actual = self.get_asset_total(symbol)  # free + locked: coins held by an OCO are still ours
         return actual >= expected_qty * 0.9
 
     def invalidate_balance_cache(self):
@@ -365,8 +396,51 @@ class BinanceConnector:
             log.warning(f"Failed to get open orders for {symbol}: {e}")
             return []
 
+    def get_open_orders_strict(self, symbol):
+        """Open orders for a symbol, or None if the API call failed (an outage must never look like 'no orders')."""
+        try:
+            return self._retry(self.client.get_open_orders, symbol=symbol)
+        except Exception as e:
+            log.warning(f"Failed to get open orders for {symbol}: {e}")
+            return None
+
+    def get_last_sell_fill(self, symbol, since_ms):
+        """Most recent FILLED SELL order for `symbol` updated at/after since_ms (epoch ms).
+
+        Returns {'price': avg fill price, 'qty', 'type', 'order_id'} or None.
+        """
+        try:
+            orders = self._retry(self.client.get_all_orders, symbol=symbol, limit=20)
+        except Exception as e:
+            log.warning(f"Failed to fetch order history for {symbol}: {e}")
+            return None
+        best = None
+        for o in orders or []:
+            if o.get('side') != 'SELL' or o.get('status') != 'FILLED':
+                continue
+            ts = int(o.get('updateTime') or o.get('time') or 0)
+            if ts < since_ms:
+                continue
+            if best is None or ts > best[0]:
+                best = (ts, o)
+        if best is None:
+            return None
+        o = best[1]
+        executed = float(o.get('executedQty', 0) or 0)
+        quote = float(o.get('cummulativeQuoteQty', 0) or 0)
+        if executed <= 0 or quote <= 0:
+            return None
+        return {'price': quote / executed, 'qty': executed, 'type': o.get('type'), 'order_id': o.get('orderId')}
+
     def create_oco_sell(self, symbol, quantity, take_profit, stop_loss):
         """Place an OCO (One-Cancels-the-Other) sell order on Binance to protect the position."""
+        # Never ask for more than we hold free (commission may have been taken in the base asset)
+        try:
+            free = self.get_balance(symbol.removesuffix('USDT'))
+            if 0 < free < quantity:
+                quantity = free
+        except Exception as e:
+            log.warning(f"[OCO] could not check free balance for {symbol}: {e}")
         qty = self._round_lot(symbol, quantity)
         tp_price = self._round_price(symbol, take_profit)
         sl_price = self._round_price(symbol, stop_loss)

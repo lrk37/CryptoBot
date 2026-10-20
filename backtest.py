@@ -1,18 +1,19 @@
 """
 backtest.py — Quantitative Strategy Backtester for CryptoBot
 =============================================================
-Features:
-  - Fetches and caches historical Binance klines to local CSVs
-  - Simulates Scanner Engine strategy on closed 15m candles
-  - Realistic trade simulation: taker fees (0.1%), slippage (0.05%)
-  - ATR Stop Loss, Take Profit, Break-Even, Trailing Stop, Hold Timeout
-  - Calculates institutional quant metrics:
-      * Net Return & CAGR
-      * Sharpe Ratio (annualized)
-      * Sortino Ratio
-      * Profit Factor & Win Rate
-      * Max Drawdown & Calmar Ratio
-      * Payoff Ratio (Avg Win / Avg Loss) & Expectancy
+Uses the SAME stop / take-profit / break-even / trailing rules as the live bot
+(shared helpers `compute_stops` and `exit_triggers` in risk_manager.py) and reads the
+entry threshold from config.py (override with --min_score).
+
+What it models:   closed-bar signals, entry at the NEXT bar's open, taker fees, slippage,
+                  conservative intra-bar ordering (stop is checked before take-profit).
+What it CANNOT model (live scoring uses them, history doesn't have them): order-book depth
+                  bonus/filter, 24h pump penalty, BTC regime filter, top-N ranking across
+                  coins, 2-candle confirmation, the score>=80 fast-track.  Treat results as
+                  a test of the core signal + exits, not of the whole live scanner.
+
+Use --baseline N to compare against N runs of RANDOM entries with the same exits and costs:
+if random entries do about as well, the signal is not adding anything.
 """
 
 import os
@@ -30,6 +31,7 @@ except ImportError:
     Client = None
 
 import config as cfg
+from risk_manager import compute_stops, exit_triggers
 
 DATA_DIR = Path("data")
 
@@ -72,21 +74,34 @@ class StrategyBacktester:
                  trade_size_usdt: float = 100.0,
                  fee_pct: float = 0.1,
                  slippage_pct: float = 0.05,
-                 min_score: float = 60.0):
+                 min_score: float = None):
         self.initial_capital = initial_capital
         self.capital = initial_capital
         self.trade_size_usdt = trade_size_usdt
         self.fee_pct = fee_pct / 100.0
         self.slippage_pct = slippage_pct / 100.0
-        self.min_score = min_score
+        # Threshold comes from config.py unless explicitly overridden
+        self.min_score = float(min_score) if min_score is not None else float(getattr(cfg, 'MIN_SCORE_TO_TRADE', 60))
         self.trades = []
+        self.period_days = None
 
-    def run(self, symbol: str, df: pd.DataFrame) -> dict:
+    def run(self, symbol: str, df: pd.DataFrame, entry_mode: str = 'signal',
+            random_prob: float = 0.0, seed: int = None, _check_entry_bar: bool = True) -> dict:
+        """entry_mode='signal' -> the strategy's scoring; 'random' -> enter with probability
+        `random_prob` on every eligible bar (baseline with identical exits and costs)."""
+        self.trades = []
+        self.capital = self.initial_capital
+
         close = df['close']
         high = df['high']
         low = df['low']
         open_p = df['open']
         vol = df['volume']
+
+        try:
+            self.period_days = max((df.index[-1] - df.index[0]).total_seconds() / 86400.0, 1.0)
+        except Exception:
+            self.period_days = max(len(df) / 96.0, 1.0)
 
         # Technical Indicators
         ema9 = close.ewm(span=9, adjust=False).mean()
@@ -112,196 +127,216 @@ class StrategyBacktester:
 
         position = None
         cooldown_until_idx = 0
+        rng = np.random.default_rng(seed) if entry_mode == 'random' else None
 
-        # Configuration parameters
-        sl_pct_cfg = getattr(cfg, 'SCANNER_STOP_LOSS_PCT', 2.0) / 100.0
-        tp_pct_cfg = getattr(cfg, 'SCANNER_TAKE_PROFIT_PCT', 6.0) / 100.0
-        be_trigger_pct = getattr(cfg, 'BREAK_EVEN_TRIGGER_PCT', 2.0) / 100.0
-        trailing_offset_pct = getattr(cfg, 'SCANNER_TRAILING_OFFSET', 1.2) / 100.0
-        min_trailing_profit_pct = getattr(cfg, 'MIN_TRAILING_PROFIT_PCT', 2.5) / 100.0
-        max_hold_bars = getattr(cfg, 'MAX_SCANNER_HOLD_HOURS', 8) * 4  # 15m bars
+        # Exit parameters: identical to the live bot
+        trig = exit_triggers(cfg)
+        be_trigger = trig['be_trigger_pct'] / 100.0
+        trail_trigger = trig['trail_trigger_pct'] / 100.0
+        be_stop_pct = trig['fees_pct'] / 100.0
+        be_enabled = getattr(cfg, 'ENABLE_BREAK_EVEN_STOP', True)
+        trailing_enabled = getattr(cfg, 'SCANNER_TRAILING_STOP', True)
+        trailing_offset = getattr(cfg, 'SCANNER_TRAILING_OFFSET', 1.2) / 100.0
+        max_hold_bars = int(getattr(cfg, 'MAX_SCANNER_HOLD_HOURS', 8) * 4)  # 15m bars
+
+        def try_exit(i, curr_bar, curr_time):
+            """Evaluate exits for the open position on bar i (also used for the ENTRY bar itself)."""
+            nonlocal position, cooldown_until_idx
+            bars_held = i - position['entry_idx']
+            high_price = curr_bar['high']
+            low_price = curr_bar['low']
+            close_price = curr_bar['close']
+
+            if high_price > position['highest']:
+                position['highest'] = high_price
+            if low_price < position['lowest']:
+                position['lowest'] = low_price
+
+            # Break-even (the raised stop applies within the same bar = worst-case ordering)
+            peak_gain = (position['highest'] - position['entry_price']) / position['entry_price']
+            if be_enabled and peak_gain >= be_trigger and not position['be_activated']:
+                min_be = position['entry_price'] * (1 + be_stop_pct)
+                if min_be > position['stop_loss']:
+                    position['stop_loss'] = min_be
+                    position['be_activated'] = True
+
+            exit_price = None
+            reason = None
+
+            if low_price <= position['stop_loss']:                      # 1. Stop loss (checked first: conservative)
+                exit_price = min(position['stop_loss'], curr_bar['open'])
+                reason = "STOP_LOSS"
+            elif high_price >= position['take_profit']:                 # 2. Take profit
+                exit_price = max(position['take_profit'], curr_bar['open'])
+                reason = "TAKE_PROFIT"
+            else:
+                if trailing_enabled and peak_gain >= trail_trigger:     # 3. Trailing stop
+                    trail_level = position['highest'] * (1 - trailing_offset)
+                    if low_price <= trail_level:
+                        exit_price = min(trail_level, curr_bar['open'])
+                        reason = "TRAILING_STOP"
+                if exit_price is None and bars_held >= max_hold_bars:   # 4. Trend invalidation / hard timeout
+                    if bars_held >= 2 * max_hold_bars:
+                        exit_price = close_price
+                        reason = "HOLD_TIMEOUT"
+                    elif close_price < ema21.iloc[i]:
+                        exit_price = close_price
+                        reason = "TREND_INVALIDATED"
+
+            if exit_price is not None:
+                # Apply exit slippage & fees
+                exit_price_net = exit_price * (1 - self.slippage_pct)
+                trade_val_entry = position['entry_price_net'] * position['qty']
+                trade_val_exit = exit_price_net * position['qty']
+
+                fee_entry = trade_val_entry * self.fee_pct
+                fee_exit = trade_val_exit * self.fee_pct
+                total_fees = fee_entry + fee_exit
+
+                pnl_usdt = (trade_val_exit - trade_val_entry) - total_fees
+                pnl_pct = (pnl_usdt / trade_val_entry) * 100.0
+
+                self.capital += pnl_usdt
+
+                mfe = ((position['highest'] - position['entry_price']) / position['entry_price']) * 100.0
+                mae = ((position['lowest'] - position['entry_price']) / position['entry_price']) * 100.0
+
+                self.trades.append({
+                    'symbol': symbol,
+                    'entry_time': position['entry_time'],
+                    'exit_time': curr_time,
+                    'entry_price': position['entry_price'],
+                    'exit_price': exit_price,
+                    'pnl_pct': pnl_pct,
+                    'pnl_usdt': pnl_usdt,
+                    'mfe_pct': mfe,
+                    'mae_pct': mae,
+                    'bars_held': bars_held,
+                    'reason': reason,
+                    'score': position['score'],
+                    'sl_pct': position['sl_pct'],
+                    'tp_pct': position['tp_pct'],
+                    'capital_after': self.capital
+                })
+
+                position = None
+                cooldown_until_idx = i + 4  # 1 hour cooldown (4 x 15m)
 
         for i in range(55, len(df)):
             curr_bar = df.iloc[i]
-            prev_bar = df.iloc[i-1]
             curr_time = df.index[i]
 
             # In trade: check exit
             if position is not None:
-                bars_held = i - position['entry_idx']
-                high_price = curr_bar['high']
-                low_price = curr_bar['low']
-                close_price = curr_bar['close']
-
-                if high_price > position['highest']:
-                    position['highest'] = high_price
-                if low_price < position['lowest']:
-                    position['lowest'] = low_price
-
-                # Check Break-Even trigger
-                peak_gain = (position['highest'] - position['entry_price']) / position['entry_price']
-                if peak_gain >= be_trigger_pct and not position['be_activated']:
-                    min_be = position['entry_price'] * (1 + self.fee_pct * 2)
-                    if min_be > position['stop_loss']:
-                        position['stop_loss'] = min_be
-                        position['be_activated'] = True
-
-                exit_price = None
-                reason = None
-
-                # 1. Stop Loss check
-                if low_price <= position['stop_loss']:
-                    exit_price = min(position['stop_loss'], curr_bar['open'])
-                    reason = "STOP_LOSS"
-                # 2. Take Profit check
-                elif high_price >= position['take_profit']:
-                    exit_price = max(position['take_profit'], curr_bar['open'])
-                    reason = "TAKE_PROFIT"
-                # 3. Trailing Stop check
-                elif peak_gain >= min_trailing_profit_pct:
-                    trail_level = position['highest'] * (1 - trailing_offset_pct)
-                    if low_price <= trail_level:
-                        exit_price = trail_level
-                        reason = "TRAILING_STOP"
-                # 4. Invalidation / Max Hold Timeout: check if price broke below EMA21
-                elif bars_held >= max_hold_bars:
-                    curr_ema21 = ema21.iloc[i]
-                    # Exit if candle closed below EMA21, or if held double max_hold (hard timeout)
-                    if close_price < curr_ema21 or bars_held >= (max_hold_bars * 2):
-                        exit_price = close_price
-                        reason = "TREND_INVALIDATED" if close_price < curr_ema21 else "HOLD_TIMEOUT"
-
-                if exit_price is not None:
-                    # Apply exit slippage & fees
-                    exit_price_net = exit_price * (1 - self.slippage_pct)
-                    trade_val_entry = position['entry_price_net'] * position['qty']
-                    trade_val_exit = exit_price_net * position['qty']
-
-                    fee_entry = trade_val_entry * self.fee_pct
-                    fee_exit = trade_val_exit * self.fee_pct
-                    total_fees = fee_entry + fee_exit
-
-                    pnl_usdt = (trade_val_exit - trade_val_entry) - total_fees
-                    pnl_pct = (pnl_usdt / trade_val_entry) * 100.0
-
-                    self.capital += pnl_usdt
-
-                    mfe = ((position['highest'] - position['entry_price']) / position['entry_price']) * 100.0
-                    mae = ((position['lowest'] - position['entry_price']) / position['entry_price']) * 100.0
-
-                    self.trades.append({
-                        'symbol': symbol,
-                        'entry_time': position['entry_time'],
-                        'exit_time': curr_time,
-                        'entry_price': position['entry_price'],
-                        'exit_price': exit_price,
-                        'pnl_pct': pnl_pct,
-                        'pnl_usdt': pnl_usdt,
-                        'mfe_pct': mfe,
-                        'mae_pct': mae,
-                        'bars_held': bars_held,
-                        'reason': reason,
-                        'score': position['score'],
-                        'capital_after': self.capital
-                    })
-
-                    position = None
-                    cooldown_until_idx = i + 4  # 1 hour cooldown (4 x 15m)
+                try_exit(i, curr_bar, curr_time)
                 continue
 
-            # Looking for entry on closed bar prev_bar
+            # Looking for entry on closed bar i-1
             if i < cooldown_until_idx:
                 continue
-
-            p_close = close.iloc[i-1]
-            p_high = high.iloc[i-1]
-            p_low = low.iloc[i-1]
-            p_open = open_p.iloc[i-1]
-            p_vol = vol.iloc[i-1]
 
             atr_val = atr_series.iloc[i-1]
             if np.isnan(atr_val) or atr_val <= 0:
                 continue
 
-            # Hard Block: Doji filter
-            c_range = p_high - p_low
-            if c_range > 0 and (abs(p_close - p_open) / c_range) < 0.15:
-                continue
-
-            # Hard Block: EMA9 slope
-            ema9_val = ema9.iloc[i-1]
-            ema9_prev = ema9.iloc[i-3]
-            if (ema9_val - ema9_prev) / ema9_prev < -0.001:
-                continue
-
-            # Scoring rules
-            score = 0.0
-            # 1. EMA alignment
-            if ema9.iloc[i-1] > ema21.iloc[i-1] > ema50.iloc[i-1]:
-                score += 25.0
-            elif ema9.iloc[i-1] > ema21.iloc[i-1]:
-                score += 15.0
-
-            # 2. RSI band
-            rsi_val = rsi_series.iloc[i-1]
-            if 45 <= rsi_val <= 55:
-                score += 20.0
-            elif 55 < rsi_val <= 65:
-                score += 15.0
-            elif 65 < rsi_val <= 70:
-                score += 5.0
-            elif rsi_val > 70:
-                score -= 20.0
+            if entry_mode == 'random':
+                if rng.random() >= random_prob:
+                    continue
+                score = 0.0
             else:
-                score -= 15.0
+                p_close = close.iloc[i-1]
+                p_high = high.iloc[i-1]
+                p_low = low.iloc[i-1]
+                p_open = open_p.iloc[i-1]
+                p_vol = vol.iloc[i-1]
 
-            # 3. Volume surge
-            v_ma = vol_ma.iloc[i-1]
-            v_ratio = p_vol / v_ma if (not np.isnan(v_ma) and v_ma > 0) else 1.0
-            if v_ratio >= 2.0:
-                score += 25.0
-            elif v_ratio >= 1.5:
-                score += 15.0
-            elif v_ratio < 1.0:
-                score -= 10.0
-
-            # 4. Breakout
-            recent_20_h = high.iloc[i-21:i-1].max()
-            if p_close > recent_20_h:
-                b_dist = p_close - recent_20_h
-                b_ratio = b_dist / atr_val
-                if b_ratio >= 0.2:
-                    score += 25.0
-                else:
-                    score += 10.0
-
-            if score >= self.min_score:
-                # Enter at next bar's open with entry slippage
-                entry_market_price = curr_bar['open']
-                entry_price_net = entry_market_price * (1 + self.slippage_pct)
-
-                trade_size = min(self.trade_size_usdt, self.capital * 0.95)
-                if trade_size < 11.0:
+                # Hard Block: Doji filter
+                c_range = p_high - p_low
+                if c_range > 0 and (abs(p_close - p_open) / c_range) < 0.15:
                     continue
 
-                qty = trade_size / entry_price_net
-                sl = entry_market_price * (1 - sl_pct_cfg)
-                tp = entry_market_price * (1 + tp_pct_cfg)
+                # Hard Block: EMA9 slope
+                ema9_val = ema9.iloc[i-1]
+                ema9_prev = ema9.iloc[i-3]
+                if (ema9_val - ema9_prev) / ema9_prev < -0.001:
+                    continue
 
-                position = {
-                    'symbol': symbol,
-                    'entry_time': curr_time,
-                    'entry_idx': i,
-                    'entry_price': entry_market_price,
-                    'entry_price_net': entry_price_net,
-                    'qty': qty,
-                    'stop_loss': sl,
-                    'take_profit': tp,
-                    'highest': entry_market_price,
-                    'lowest': entry_market_price,
-                    'score': score,
-                    'be_activated': False
-                }
+                # Scoring rules (same as scanner.py, minus order-book / pump-penalty components)
+                score = 0.0
+                # 1. EMA alignment
+                if ema9.iloc[i-1] > ema21.iloc[i-1] > ema50.iloc[i-1]:
+                    score += 25.0
+                elif ema9.iloc[i-1] > ema21.iloc[i-1]:
+                    score += 15.0
+
+                # 2. RSI band
+                rsi_val = rsi_series.iloc[i-1]
+                if 45 <= rsi_val <= 55:
+                    score += 20.0
+                elif 55 < rsi_val <= 65:
+                    score += 15.0
+                elif 65 < rsi_val <= 70:
+                    score += 5.0
+                elif rsi_val > 70:
+                    score -= 20.0
+                else:
+                    score -= 15.0
+
+                # 3. Volume surge
+                v_ma = vol_ma.iloc[i-1]
+                v_ratio = p_vol / v_ma if (not np.isnan(v_ma) and v_ma > 0) else 1.0
+                if v_ratio >= 2.0:
+                    score += 25.0
+                elif v_ratio >= 1.5:
+                    score += 15.0
+                elif v_ratio < 1.0:
+                    score -= 10.0
+
+                # 4. Breakout
+                recent_20_h = high.iloc[i-21:i-1].max()
+                if p_close > recent_20_h:
+                    b_dist = p_close - recent_20_h
+                    b_ratio = b_dist / atr_val
+                    if b_ratio >= 0.2:
+                        score += 25.0
+                    else:
+                        score += 10.0
+
+                if score < self.min_score:
+                    continue
+
+            # Enter at next bar's open with entry slippage
+            entry_market_price = curr_bar['open']
+            entry_price_net = entry_market_price * (1 + self.slippage_pct)
+
+            trade_size = min(self.trade_size_usdt, self.capital * 0.95)
+            if trade_size < 11.0:
+                continue
+
+            qty = trade_size / entry_price_net
+            sl, tp, _, _ = compute_stops(cfg, 'scanner', entry_market_price, atr_val)  # same as live
+
+            position = {
+                'symbol': symbol,
+                'entry_time': curr_time,
+                'entry_idx': i,
+                'entry_price': entry_market_price,
+                'entry_price_net': entry_price_net,
+                'qty': qty,
+                'stop_loss': sl,
+                'take_profit': tp,
+                'sl_pct': (entry_market_price - sl) / entry_market_price * 100.0,
+                'tp_pct': (tp - entry_market_price) / entry_market_price * 100.0,
+                'highest': entry_market_price,
+                'lowest': entry_market_price,
+                'score': score,
+                'be_activated': False
+            }
+
+            # The entry bar's own range counts: we buy at its open, so its low can hit the stop.
+            # (Older versions skipped this, which silently removed some quick stop-outs.)
+            if _check_entry_bar:
+                try_exit(i, curr_bar, curr_time)
 
         return self.compute_metrics()
 
@@ -330,22 +365,23 @@ class StrategyBacktester:
         # Expectancy = (Win% * AvgWin) - (Loss% * AvgLoss)
         expectancy = ((win_rate / 100.0) * avg_win) - (((100 - win_rate) / 100.0) * avg_loss)
 
-        # Drawdown calculation
+        # Drawdown calculation (closed-trade equity)
         equity_curve = [self.initial_capital] + df_t['capital_after'].tolist()
         peaks = pd.Series(equity_curve).cummax()
         drawdowns = (pd.Series(equity_curve) - peaks) / peaks * 100.0
         max_drawdown = abs(drawdowns.min())
 
-        # Sharpe & Sortino (per-trade approximated to annualized)
+        # Sharpe & Sortino: per-trade ratios scaled by sqrt(trades per year).
+        # Sortino uses the standard downside deviation (RMS of shortfalls below 0 over ALL trades).
         returns = df_t['pnl_pct'] / 100.0
         mean_ret = returns.mean()
         std_ret = returns.std()
-        downside_std = returns[returns < 0].std()
+        downside_dev = float(np.sqrt(np.mean(np.minimum(returns.values, 0.0) ** 2)))
 
-        # Assuming ~350 trades/year scaling
-        annual_factor = math.sqrt(min(total_trades * 4, 350))
-        sharpe = (mean_ret / std_ret * annual_factor) if std_ret > 0 else 0.0
-        sortino = (mean_ret / downside_std * annual_factor) if (downside_std > 0 and not np.isnan(downside_std)) else 0.0
+        trades_per_year = total_trades * 365.0 / (self.period_days or 90.0)
+        annual_factor = math.sqrt(trades_per_year)
+        sharpe = (mean_ret / std_ret * annual_factor) if (std_ret and std_ret > 0) else 0.0
+        sortino = (mean_ret / downside_dev * annual_factor) if downside_dev > 0 else 0.0
 
         return {
             'initial_capital': self.initial_capital,
@@ -367,13 +403,55 @@ class StrategyBacktester:
             'avg_bars_held': round(df_t['bars_held'].mean(), 1)
         }
 
+
+def random_baseline(symbol: str, df: pd.DataFrame, actual_trades: list, n_runs: int,
+                    capital: float, trade_size: float, min_score: float = None, seed: int = 42) -> dict:
+    """Run `n_runs` backtests with RANDOM entries (same exits, fees, slippage), calibrated to take about as
+    many trades as the real strategy did. Tells you whether the signal beats coin-flip entries."""
+    n_actual = len(actual_trades)
+    if n_actual == 0:
+        return {}
+    in_pos = sum(t['bars_held'] for t in actual_trades)
+    eligible = max(len(df) - 55 - in_pos - 4 * n_actual, 1)
+    prob = min(n_actual / eligible, 1.0)
+
+    nets, exps, counts = [], [], []
+    for k in range(n_runs):
+        bt = StrategyBacktester(initial_capital=capital, trade_size_usdt=trade_size, min_score=min_score)
+        m = bt.run(symbol, df, entry_mode='random', random_prob=prob, seed=seed + k)
+        if 'error' in m:
+            continue
+        nets.append(m['net_return_pct'])
+        exps.append(float(np.mean([t['pnl_pct'] for t in bt.trades])))
+        counts.append(m['total_trades'])
+    return {'runs': len(nets), 'prob': prob, 'nets': nets, 'exps': exps, 'counts': counts}
+
+
+def print_config():
+    trig = exit_triggers(cfg)
+    print("-" * 65)
+    print(" EFFECTIVE SETTINGS (same helpers as the live bot)")
+    print(f"  Entry threshold : score >= {getattr(cfg, 'MIN_SCORE_TO_TRADE', 60)} (override with --min_score)")
+    if getattr(cfg, 'SCANNER_USE_ATR_STOPS', True):
+        print(f"  Stop loss       : ATR x{getattr(cfg, 'SCANNER_ATR_SL_MULTIPLIER', 3.0)}, "
+              f"clamped to {getattr(cfg, 'MIN_SL_PCT', 1.5)}%..{getattr(cfg, 'SCANNER_MAX_STOP_LOSS_PCT', 3.5)}% below entry")
+        print(f"  Take profit     : ATR x{getattr(cfg, 'SCANNER_ATR_TP_MULTIPLIER', 4.0)}, at least {getattr(cfg, 'MIN_TP_PCT', 0)}% above entry")
+    else:
+        print(f"  Stop / Take     : fixed -{getattr(cfg, 'SCANNER_STOP_LOSS_PCT', 2.5)}% / +{getattr(cfg, 'SCANNER_TAKE_PROFIT_PCT', 5.0)}%")
+    print(f"  Break-even arms : +{trig['be_trigger_pct']:.1f}% (stop moves to entry +{trig['fees_pct']:.1f}%)")
+    print(f"  Trailing arms   : +{trig['trail_trigger_pct']:.1f}% peak, offset {getattr(cfg, 'SCANNER_TRAILING_OFFSET', 1.2)}%")
+    h = getattr(cfg, 'MAX_SCANNER_HOLD_HOURS', 8)
+    print(f"  Timeouts        : after {h}h exit if a candle closes below EMA21; hard exit at {2 * h}h")
+    print("-" * 65)
+
+
 def print_report(symbol: str, metrics: dict):
-    print("\n" + "="*65)
+    print("\n" + "=" * 65)
     print(f"       BACKTEST RESULTS REPORT: {symbol}")
-    print("="*65)
+    print("=" * 65)
     if 'error' in metrics:
         print(f"[-] {metrics['error']}")
-        print("="*65 + "\n")
+        print("=" * 65 + "\n")
         return
 
     print(f" Initial Capital : ${metrics['initial_capital']:,.2f}")
@@ -387,9 +465,28 @@ def print_report(symbol: str, metrics: dict):
     print(f" Sortino Ratio   : {metrics['sortino_ratio']:.2f}")
     print(f" Avg Win / Loss  : {metrics['avg_win_pct']:+.2f}% / -{metrics['avg_loss_pct']:.2f}%")
     print(f" Payoff Ratio    : {metrics['payoff_ratio']:.2f}")
-    print(f" Trade Expectancy: {metrics['expectancy_pct']:+.2f}% per trade")
+    print(f" Trade Expectancy: {metrics['expectancy_pct']:+.2f}% per trade (net of fees and slippage)")
     print(f" Avg Hold Time   : {metrics['avg_bars_held'] * 15:.0f} mins ({metrics['avg_bars_held']:.1f} bars)")
-    print("="*65 + "\n")
+    print("=" * 65 + "\n")
+
+
+def print_baseline(metrics: dict, base: dict):
+    if not base or not base.get('runs'):
+        print("[-] Baseline skipped (no trades).")
+        return
+    nets = np.array(base['nets'])
+    exps = np.array(base['exps'])
+    actual = metrics['net_return_pct']
+    beat = float(np.mean(nets >= actual)) * 100.0
+    print("-" * 65)
+    print(f" RANDOM-ENTRY BASELINE ({base['runs']} runs, same exits/costs, ~{np.mean(base['counts']):.0f} trades each)")
+    print(f"  Expectancy / trade : mean {exps.mean():+.2f}%   (strategy: {metrics['expectancy_pct']:+.2f}%)")
+    print(f"  Net return         : mean {nets.mean():+.1f}%, 5th-95th pct {np.percentile(nets, 5):+.1f}% .. {np.percentile(nets, 95):+.1f}%"
+          f"   (strategy: {actual:+.1f}%)")
+    print(f"  Random runs that did at least as well as the strategy: {beat:.0f}%")
+    print("  -> If that share is large, the entry signal is not adding anything over coin-flip entries.")
+    print("-" * 65 + "\n")
+
 
 def main():
     parser = argparse.ArgumentParser(description="CryptoBot Strategy Backtester")
@@ -398,13 +495,23 @@ def main():
     parser.add_argument("--interval", type=str, default="15m", help="Candle interval (15m, 1h, etc.)")
     parser.add_argument("--capital", type=float, default=1000.0, help="Starting simulated capital in USDT")
     parser.add_argument("--trade_size", type=float, default=100.0, help="Trade size in USDT per order")
+    parser.add_argument("--min_score", type=float, default=None, help="Entry score threshold (default: MIN_SCORE_TO_TRADE from config.py)")
+    parser.add_argument("--baseline", type=int, default=0, help="Also run N random-entry baselines with the same exits/costs")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for the baseline")
     args = parser.parse_args()
 
     try:
         df = fetch_historical_candles(args.symbol, interval=args.interval, days=args.days)
-        tester = StrategyBacktester(initial_capital=args.capital, trade_size_usdt=args.trade_size)
+        tester = StrategyBacktester(initial_capital=args.capital, trade_size_usdt=args.trade_size, min_score=args.min_score)
+        print_config()
+        if args.min_score is not None:
+            print(f" (using --min_score {args.min_score})")
         metrics = tester.run(args.symbol, df)
         print_report(args.symbol, metrics)
+        if args.baseline > 0 and 'error' not in metrics:
+            base = random_baseline(args.symbol, df, tester.trades, args.baseline,
+                                   args.capital, args.trade_size, args.min_score, args.seed)
+            print_baseline(metrics, base)
     except Exception as e:
         print(f"[ERROR] Backtest failed: {e}")
 

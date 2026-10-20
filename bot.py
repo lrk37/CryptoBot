@@ -82,7 +82,12 @@ class ScannerEngine:
 
         # F-07: Use portfolio value (including open positions) for circuit breaker
         pos_symbols = self.risk_mgr.all_position_symbols()
-        portfolio_val = self.exchange.get_portfolio_value(symbols=pos_symbols)
+        pos_qty = {}
+        for s in pos_symbols:
+            p_ = self.risk_mgr.get_position(s)
+            if p_:
+                pos_qty[s] = p_.quantity
+        portfolio_val = self.exchange.get_portfolio_value(symbols=pos_symbols, quantities=pos_qty)
         if self.risk_mgr.check_circuit_breaker(portfolio_val):
             return
 
@@ -179,7 +184,7 @@ class ScannerEngine:
         if fill_price <= 0:
             fill_price = price
 
-        exec_qty = float(order.get('executedQty', 0))
+        exec_qty = self.exchange.net_executed_qty(order, symbol)  # net of commission paid in the coin
         if exec_qty <= 0:
             exec_qty = usdt_amount / fill_price
 
@@ -221,6 +226,7 @@ class ScannerEngine:
                     oco = self.exchange.create_oco_sell(symbol, exec_qty, pos.take_profit, pos.stop_loss)
                     if oco:
                         pos.details['oco_order_list_id'] = oco.get('orderListId')
+                        self.risk_mgr.persist_positions()
                 except Exception as e:
                     log.warning(f"[OCO EXCEPTION] Could not place OCO: {e}")
             
@@ -265,22 +271,31 @@ class ScannerEngine:
                 log.warning(f"[MONITOR] Failed to get price for {symbol}: {e}")
                 continue
 
-            # Check if position was already filled on Binance by exchange OCO order
+            # Did the exchange-side OCO already close this position?
+            # Decided from ORDER state, not balances: coins locked in an OCO are not 'free', and
+            # unrelated pre-existing holdings of the same coin would confuse a balance check.
             try:
-                actual_qty = self.exchange.get_asset_balance_fresh(symbol)
-                min_qty = self.exchange._get_min_qty(symbol)
-                if actual_qty < min_qty and pos.quantity >= min_qty:
-                    reason = "TAKE_PROFIT" if curr_price >= pos.entry_price else "STOP_LOSS"
-                    log.info(f"[EXCHANGE FILL] {symbol} no longer held — native OCO order filled ({reason})")
-                    pnl_pct = pos.pnl_pct(curr_price)
-                    self.risk_mgr.close_position(symbol, curr_price, f"OCO_{reason}")
-                    with self._state_lock:
-                        self._active_symbols.discard(symbol)
-                        self._symbol_cooldowns[symbol] = time.time() + getattr(cfg, 'SYMBOL_COOLDOWN_SEC', 3600)
-                    self.notifier.trade_closed(symbol, f"OCO_{reason}", pos.entry_price, curr_price, pnl_pct)
-                    continue
+                if pos.details.get('oco_order_list_id') is not None:
+                    open_orders = self.exchange.get_open_orders_strict(symbol)
+                    if open_orders is not None and len(open_orders) == 0:
+                        fill = self.exchange.get_last_sell_fill(symbol, int(pos.open_time * 1000) - 60_000)
+                        if fill:
+                            exit_px = fill['price']
+                            reason = "TAKE_PROFIT" if fill['type'] in ('LIMIT_MAKER', 'LIMIT') else "STOP_LOSS"
+                            log.info(f"[EXCHANGE FILL] {symbol} OCO leg filled ({reason}) at {exit_px:.6f}")
+                            pnl_pct = pos.pnl_pct(exit_px)
+                            self.risk_mgr.close_position(symbol, exit_px, f"OCO_{reason}")
+                            with self._state_lock:
+                                self._active_symbols.discard(symbol)
+                                self._symbol_cooldowns[symbol] = time.time() + getattr(cfg, 'SYMBOL_COOLDOWN_SEC', 3600)
+                            self.notifier.trade_closed(symbol, f"OCO_{reason}", pos.entry_price, exit_px, pnl_pct)
+                            continue
+                        log.warning(f"[OCO] {symbol}: OCO is no longer open but no filled SELL was found - "
+                                    f"dropping the OCO link; client-side exits stay active")
+                        pos.details.pop('oco_order_list_id', None)
+                        self.risk_mgr.persist_positions()
             except Exception as e:
-                log.debug(f"[MONITOR OCO CHECK] {e}")
+                log.warning(f"[MONITOR OCO CHECK] {symbol}: {e}")
 
             action = self.risk_mgr.evaluate(pos, curr_price)
             if action != "HOLD":
@@ -296,7 +311,8 @@ class ScannerEngine:
             self.exchange.cancel_open_orders(symbol)
 
             actual_qty = self.exchange.get_asset_balance_fresh(symbol)
-            sell_qty = actual_qty if actual_qty > 0 else pos.quantity
+            # Sell the POSITION, never more: free balance may include unrelated holdings of the same coin
+            sell_qty = min(actual_qty, pos.quantity) if actual_qty > 0 else pos.quantity
             order = self.exchange.market_sell(symbol, sell_qty)
 
             exit_price = self.exchange.avg_fill_price(order) if order else curr_price
