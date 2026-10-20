@@ -123,8 +123,33 @@ def run_walk_forward(args):
             'period': f'{s} → {e}',
             'start': s, 'end': e,
             'metrics': m, 'n_trades': m.get('total_trades', 0),
+            'trades': bt.trades,
+            'partial': False,
         })
         idx += test_bars
+
+    # ── Evaluate final tail window (if remaining data >= 7 days) ────────
+    min_partial_bars = 7 * bpd
+    if (len(df) - idx) >= min_partial_bars:
+        tail_bars = len(df) - idx
+        window = df.iloc[idx - warmup : len(df)].copy()
+        bt = StrategyBacktester(
+            initial_capital=cap, trade_size_usdt=tsize, min_score=mscore
+        )
+        m = bt.run(sym, window, interval=interval, start_bar=warmup)
+
+        s = df.index[idx].strftime('%Y-%m-%d')
+        e = df.index[-1].strftime('%Y-%m-%d')
+        tail_days = round(tail_bars / bpd, 1)
+
+        folds.append({
+            'fold': len(folds) + 1,
+            'period': f'{s} → {e} ({tail_days}d)',
+            'start': s, 'end': e,
+            'metrics': m, 'n_trades': m.get('total_trades', 0),
+            'trades': bt.trades,
+            'partial': True,
+        })
 
     # ── Report ────────────────────────────────────────────────
     W = 85
@@ -140,6 +165,7 @@ def run_walk_forward(args):
     print('─' * W)
 
     agg = dict(pf=[], sh=[], so=[], ex=[], wr=[], ret=[])
+    all_oos_trades = []
 
     for f in folds:
         m  = f['metrics']
@@ -159,52 +185,166 @@ def run_walk_forward(args):
             for k, v in [('pf', pf), ('sh', sh), ('so', so),
                          ('ex', ex), ('wr', wr), ('ret', nr)]:
                 agg[k].append(v)
+            all_oos_trades.extend(f.get('trades', []))
 
     print('─' * W)
 
     aggregate = {}
+    pooled_summary = {}
+
+    if all_oos_trades:
+        df_oos = pd.DataFrame(all_oos_trades)
+        oos_wins = df_oos[df_oos['pnl_usdt'] > 0]
+        oos_losses = df_oos[df_oos['pnl_usdt'] <= 0]
+        oos_t = len(df_oos)
+        oos_w = len(oos_wins)
+        oos_l = len(oos_losses)
+        oos_wr = (oos_w / oos_t) * 100.0 if oos_t > 0 else 0.0
+
+        oos_gp = float(oos_wins['pnl_usdt'].sum()) if oos_w > 0 else 0.0
+        oos_gl = float(abs(oos_losses['pnl_usdt'].sum())) if oos_l > 0 else 0.0
+        oos_net = oos_gp - oos_gl
+        oos_pf = (oos_gp / oos_gl) if oos_gl > 0 else float('inf')
+
+        oos_ex_pct = float(df_oos['pnl_pct'].mean())
+        oos_ex_usdt = oos_net / oos_t if oos_t > 0 else 0.0
+
+        running_cap = cap
+        cap_curve = [cap]
+        for tr in all_oos_trades:
+            running_cap += tr['pnl_usdt']
+            cap_curve.append(running_cap)
+        continuous_ret = ((running_cap - cap) / cap) * 100.0
+
+        eq_s = pd.Series(cap_curve)
+        eq_peaks = eq_s.cummax()
+        oos_max_dd = float(abs(((eq_s - eq_peaks) / eq_peaks.replace(0, 1) * 100.0).min()))
+
+        print('\n  POOLED OUT-OF-SAMPLE TOTALS (Continuous Account Simulation):')
+        print(f'    Total OOS Trades : {oos_t} ({oos_w} Wins / {oos_l} Losses | Win Rate: {oos_wr:.1f}%)')
+        print(f'    Pooled Profit Fac: {oos_pf:.2f} (Gross Win: ${oos_gp:.2f} / Gross Loss: ${oos_gl:.2f})')
+        print(f'    Pooled Expectancy: {oos_ex_pct:+.2f}% / trade (${oos_ex_usdt:+.2f} / trade)')
+        print(f'    Net Realized P&L : ${oos_net:+.2f} ({continuous_ret:+.2f}% continuous account return)')
+        print(f'    Max OOS Drawdown : {oos_max_dd:.2f}%')
+
+        pooled_summary = {
+            'total_trades': oos_t, 'win_rate_pct': round(oos_wr, 2),
+            'profit_factor': round(oos_pf, 2), 'expectancy_pct': round(oos_ex_pct, 2),
+            'net_profit_usdt': round(oos_net, 2), 'continuous_return_pct': round(continuous_ret, 2),
+            'max_drawdown_pct': round(oos_max_dd, 2),
+        }
+
     if agg['pf']:
         n          = len(agg['pf'])
         profitable = sum(1 for e in agg['ex'] if e > 0)
         consist    = profitable / n
 
-        print(f'\n  AGGREGATE ({n} folds with trades):')
-        print(f'    Profit Factor  : {np.mean(agg["pf"]):.2f} ± {np.std(agg["pf"]):.2f}')
-        print(f'    Sharpe Ratio   : {np.mean(agg["sh"]):.2f} ± {np.std(agg["sh"]):.2f}')
-        print(f'    Sortino Ratio  : {np.mean(agg["so"]):.2f} ± {np.std(agg["so"]):.2f}')
-        print(f'    Expectancy     : {np.mean(agg["ex"]):+.2f}% ± {np.std(agg["ex"]):.2f}%')
-        print(f'    Win Rate       : {np.mean(agg["wr"]):.1f}% ± {np.std(agg["wr"]):.1f}%')
-        print(f'    Net Return     : {np.mean(agg["ret"]):+.2f}% ± {np.std(agg["ret"]):.2f}%')
-        print(f'    Profitable     : {profitable}/{n} folds ({consist * 100:.0f}%)')
+        print(f'\n  FOLD-BY-FOLD DISPERSION ({n} folds with trades):')
+        print(f'    Mean PF (folds)  : {np.mean(agg["pf"]):.2f} ± {np.std(agg["pf"]):.2f}')
+        print(f'    Mean Sharpe      : {np.mean(agg["sh"]):.2f} ± {np.std(agg["sh"]):.2f}')
+        print(f'    Mean Sortino     : {np.mean(agg["so"]):.2f} ± {np.std(agg["so"]):.2f}')
+        print(f'    Mean Expectancy  : {np.mean(agg["ex"]):+.2f}% ± {np.std(agg["ex"]):.2f}%')
+        print(f'    Profitable Folds : {profitable}/{n} folds ({consist * 100:.0f}%)')
 
-        if consist >= 0.75:
-            label = 'HIGH ✓  — edge is stable across time periods'
+        if consist >= 0.75 and pooled_summary.get('profit_factor', 0) > 1.0:
+            label = 'HIGH ✓  — persistent edge across time windows'
         elif consist >= 0.50:
-            label = 'MODERATE — edge exists but inconsistent'
+            label = 'MODERATE — edge exists but inconsistent/regime-dependent'
         else:
-            label = 'LOW ✗   — likely overfitting or regime-dependent'
-        print(f'    Consistency    : {label}')
+            label = 'LOW ✗   — failing out of sample, no consistent edge'
+        print(f'    Consistency      : {label}')
 
         aggregate = {k: {'mean': round(float(np.mean(v)), 4),
                          'std':  round(float(np.std(v)), 4)}
                      for k, v in agg.items() if v}
         aggregate['profitable_folds'] = f'{profitable}/{n}'
     else:
-        print('\n  No trades in any fold — the strategy may need a lower score threshold.')
+        print('\n  No trades in any fold — the strategy took 0 trades.')
 
     print('═' * W + '\n')
 
     _save(f'walkforward_{sym}_{interval}_{days}d', {
         'symbol': sym, 'interval': interval, 'total_days': days,
         'test_days': test_d, 'n_folds': len(folds),
-        'folds': folds, 'aggregate': aggregate,
+        'folds': [{k: v for k, v in f.items() if k != 'trades'} for f in folds],
+        'pooled': pooled_summary,
+        'aggregate': aggregate,
     })
     return folds
 
 
 # ══════════════════════════════════════════════════════════════
-#  2. MULTI-SYMBOL BASKET TEST
+#  2. MULTI-SYMBOL BASKET TEST & PORTFOLIO SIMULATION
 # ══════════════════════════════════════════════════════════════
+
+def simulate_portfolio(all_trades: list, initial_capital: float = 1000.0,
+                       trade_size_usdt: float = 100.0, max_positions: int = 3) -> dict:
+    """Chronologically simulate a combined portfolio across multiple coins with shared capital.
+
+    Enforces:
+    - Shared cash balance
+    - Maximum concurrent open positions (default 3)
+    - True chronological event ordering (cash freed only after position exit)
+    """
+    if not all_trades:
+        return {
+            'initial_capital': initial_capital, 'final_capital': initial_capital,
+            'net_profit_usdt': 0.0, 'portfolio_return_pct': 0.0, 'max_drawdown_pct': 0.0,
+            'trades_taken': 0, 'trades_skipped': 0, 'max_concurrent_positions': max_positions,
+        }
+
+    # Sort all trades chronologically by entry_time
+    sorted_trades = sorted(all_trades, key=lambda t: t['entry_time'])
+
+    cash = initial_capital
+    open_positions = []
+    trades_taken = 0
+    trades_skipped = 0
+    equity_curve = [initial_capital]
+
+    for t in sorted_trades:
+        entry_time = t['entry_time']
+
+        # Settle any positions that closed at or before this entry
+        still_open = []
+        for pos in open_positions:
+            if pos['exit_time'] <= entry_time:
+                cash += pos['pnl_usdt']
+                equity_curve.append(cash)
+            else:
+                still_open.append(pos)
+        open_positions = still_open
+
+        # Capacity check
+        if len(open_positions) < max_positions and cash >= trade_size_usdt:
+            open_positions.append(t)
+            trades_taken += 1
+        else:
+            trades_skipped += 1
+
+    # Settle remaining positions
+    for pos in open_positions:
+        cash += pos['pnl_usdt']
+        equity_curve.append(cash)
+
+    net_profit = cash - initial_capital
+    portfolio_return_pct = (net_profit / initial_capital) * 100.0
+
+    eq_s = pd.Series(equity_curve)
+    peaks = eq_s.cummax()
+    max_dd = float(abs(((eq_s - eq_peaks) / eq_peaks.replace(0, 1) * 100.0).min()))
+
+    return {
+        'initial_capital': initial_capital,
+        'final_capital': round(cash, 2),
+        'net_profit_usdt': round(net_profit, 2),
+        'portfolio_return_pct': round(portfolio_return_pct, 2),
+        'max_drawdown_pct': round(max_dd, 2),
+        'trades_taken': trades_taken,
+        'trades_skipped': trades_skipped,
+        'max_concurrent_positions': max_positions,
+    }
+
 
 def run_basket(args):
     """Run strategy across top coins to verify cross-asset edge.
@@ -236,6 +376,7 @@ def run_basket(args):
 
     results = []
     agg = dict(pf=[], sh=[], so=[], ex=[], ret=[])
+    all_basket_trades = []
 
     for i, sym in enumerate(symbols, 1):
         try:
@@ -285,40 +426,71 @@ def run_basket(args):
         if t > 0:
             for k, v in [('pf', pf), ('sh', sh), ('so', so), ('ex', ex), ('ret', nr)]:
                 agg[k].append(v)
+            all_basket_trades.extend(bt.trades)
 
     print('─' * W)
 
     basket_summary = {}
-    if agg['pf']:
+    portfolio_summary = {}
+
+    if agg['pf'] and all_basket_trades:
         n       = len(agg['pf'])
         pos_exp = sum(1 for e in agg['ex'] if e > 0)
 
-        print(f'\n  BASKET SUMMARY ({n} symbols with trades):')
-        print(f'    Mean PF          : {np.mean(agg["pf"]):.2f} ± {np.std(agg["pf"]):.2f}')
-        print(f'    Mean Sharpe      : {np.mean(agg["sh"]):.2f} ± {np.std(agg["sh"]):.2f}')
-        print(f'    Mean Sortino     : {np.mean(agg["so"]):.2f} ± {np.std(agg["so"]):.2f}')
-        print(f'    Mean Expectancy  : {np.mean(agg["ex"]):+.2f}% ± {np.std(agg["ex"]):.2f}%')
-        print(f'    Symbols +expect  : {pos_exp}/{n} ({pos_exp / n * 100:.0f}%)')
-        print(f'    Cumulative Ret   : {sum(agg["ret"]):+.2f}% across {n} symbols')
+        df_b = pd.DataFrame(all_basket_trades)
+        b_wins = df_b[df_b['pnl_usdt'] > 0]
+        b_losses = df_b[df_b['pnl_usdt'] <= 0]
+        b_t = len(df_b)
+        b_w = len(b_wins)
+        b_l = len(b_losses)
+        b_gp = float(b_wins['pnl_usdt'].sum()) if b_w > 0 else 0.0
+        b_gl = float(abs(b_losses['pnl_usdt'].sum())) if b_l > 0 else 0.0
+        b_net = b_gp - b_gl
+        b_pf = (b_gp / b_gl) if b_gl > 0 else float('inf')
 
-        if pos_exp / n >= 0.60:
-            print(f'    Verdict          : BROAD EDGE ✓ — strategy works across most assets')
+        # Run true portfolio simulation (shared capital, max 3 positions)
+        max_pos = int(getattr(cfg, 'MAX_OPEN_TRADES', 3)) or 3
+        port = simulate_portfolio(all_basket_trades, initial_capital=cap,
+                                  trade_size_usdt=tsize, max_positions=max_pos)
+
+        print(f'\n  CROSS-ASSET SIGNAL BREADTH ({n} symbols with trades):')
+        print(f'    Symbols +Expectancy: {pos_exp}/{n} ({pos_exp / n * 100:.0f}%)')
+        print(f'    Mean Expectancy    : {np.mean(agg["ex"]):+.2f}% ± {np.std(agg["ex"]):.2f}%')
+        print(f'    Median Expectancy  : {np.median(agg["ex"]):+.2f}%')
+        print(f'    Pooled Profit Fac  : {b_pf:.2f} across all {b_t} trades (Gross Win: ${b_gp:.2f} / Gross Loss: ${b_gl:.2f})')
+        print(f'    Total Net P&L      : ${b_net:+.2f} (unconstrained sum of all coin trades)')
+
+        if pos_exp / n >= 0.60 and b_pf > 1.0:
+            verdict = 'BROAD EDGE ✓ — strategy works across most assets'
         elif pos_exp / n >= 0.40:
-            print(f'    Verdict          : SELECTIVE — edge exists but coin-dependent')
+            verdict = 'SELECTIVE — edge exists on select assets only'
         else:
-            print(f'    Verdict          : NARROW ✗ — edge limited to few assets')
+            verdict = 'NARROW / FAILING ✗ — edge fails across the liquid market'
+        print(f'    Signal Verdict     : {verdict}')
 
-        basket_summary = {k: {'mean': round(float(np.mean(v)), 4),
-                              'std':  round(float(np.std(v)), 4)}
-                          for k, v in agg.items() if v}
-        basket_summary['positive_symbols'] = f'{pos_exp}/{n}'
+        print(f'\n  PORTFOLIO SIMULATION (Shared ${cap:,.0f} Capital, Max {max_pos} Concurrent Positions):')
+        print(f'    Trades Executed    : {port["trades_taken"]} taken ({port["trades_skipped"]} skipped due to capacity limit)')
+        print(f'    Portfolio Return   : {port["portfolio_return_pct"]:+.2f}% (${port["net_profit_usdt"]:+.2f})')
+        print(f'    Portfolio Max DD   : {port["max_drawdown_pct"]:.2f}%')
+        print(f'    Final Capital      : ${port["final_capital"]:,.2f}')
+
+        basket_summary = {
+            'symbols_evaluated': n, 'positive_expectancy_symbols': f'{pos_exp}/{n}',
+            'mean_expectancy_pct': round(float(np.mean(agg['ex'])), 4),
+            'median_expectancy_pct': round(float(np.median(agg['ex'])), 4),
+            'pooled_profit_factor': round(b_pf, 2),
+            'total_net_pnl_usdt': round(b_net, 2),
+            'verdict': verdict,
+        }
+        portfolio_summary = port
 
     print(f'\n  Elapsed: {_elapsed(t0)}')
     print('═' * W + '\n')
 
     _save(f'basket_{interval}_{days}d', {
         'interval': interval, 'days': days, 'n_symbols': len(symbols),
-        'results': results, 'summary': basket_summary,
+        'results': results, 'signal_breadth': basket_summary,
+        'portfolio_simulation': portfolio_summary,
     })
     return results
 

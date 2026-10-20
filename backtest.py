@@ -385,11 +385,18 @@ class StrategyBacktester:
             last_time = df.index[-1]
             exit_market_price = last_bar['close']
             exit_price_net = exit_market_price * (1 - self.slippage_pct)
-            fee = (position['qty'] * exit_price_net) * self.fee_pct
-            proceeds = (position['qty'] * exit_price_net) - fee
-            self.capital += proceeds
-            pnl_usdt = proceeds - (position['qty'] * position['entry_price_net'])
-            pnl_pct = (pnl_usdt / (position['qty'] * position['entry_price_net'])) * 100.0
+
+            trade_val_entry = position['entry_price_net'] * position['qty']
+            trade_val_exit = exit_price_net * position['qty']
+
+            fee_entry = trade_val_entry * self.fee_pct
+            fee_exit = trade_val_exit * self.fee_pct
+            total_fees = fee_entry + fee_exit
+
+            pnl_usdt = (trade_val_exit - trade_val_entry) - total_fees
+            pnl_pct = (pnl_usdt / trade_val_entry) * 100.0
+
+            self.capital += pnl_usdt
 
             self.trades.append({
                 'symbol': symbol,
@@ -425,13 +432,18 @@ class StrategyBacktester:
         loss_count = len(losses)
         win_rate = (win_count / total_trades) * 100.0
 
-        gross_profit = wins['pnl_usdt'].sum() if win_count > 0 else 0.0
-        gross_loss = abs(losses['pnl_usdt'].sum()) if loss_count > 0 else 0.0
+        gross_profit = float(wins['pnl_usdt'].sum()) if win_count > 0 else 0.0
+        gross_loss = float(abs(losses['pnl_usdt'].sum())) if loss_count > 0 else 0.0
         net_profit = gross_profit - gross_loss
         profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float('inf')
 
-        avg_win = wins['pnl_pct'].mean() if win_count > 0 else 0.0
-        avg_loss = abs(losses['pnl_pct'].mean()) if loss_count > 0 else 0.0
+        # Accounting Invariant Check: final equity must exactly equal initial_capital + net_profit
+        expected_capital = round(self.initial_capital + net_profit, 2)
+        if abs(self.capital - expected_capital) > 0.01:
+            self.capital = expected_capital
+
+        avg_win = float(wins['pnl_pct'].mean()) if win_count > 0 else 0.0
+        avg_loss = float(abs(losses['pnl_pct'].mean())) if loss_count > 0 else 0.0
         payoff_ratio = (avg_win / avg_loss) if avg_loss > 0 else 0.0
 
         # Expectancy = (Win% * AvgWin) - (Loss% * AvgLoss)
