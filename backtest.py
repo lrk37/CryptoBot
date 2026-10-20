@@ -269,15 +269,15 @@ class StrategyBacktester:
                 elif ema9.iloc[i-1] > ema21.iloc[i-1]:
                     score += 15.0
 
-                # 2. RSI band
+                # 2. RSI band: reward true breakout momentum (55-68) instead of sluggish consolidation
                 rsi_val = rsi_series.iloc[i-1]
-                if 45 <= rsi_val <= 55:
-                    score += 20.0
-                elif 55 < rsi_val <= 65:
+                if 55 <= rsi_val <= 68:
+                    score += 25.0
+                elif 48 <= rsi_val < 55:
                     score += 15.0
-                elif 65 < rsi_val <= 70:
-                    score += 5.0
-                elif rsi_val > 70:
+                elif 68 < rsi_val <= 73:
+                    score += 10.0
+                elif rsi_val > 75:
                     score -= 20.0
                 else:
                     score -= 15.0

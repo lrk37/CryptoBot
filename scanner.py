@@ -282,17 +282,17 @@ class MarketScanner:
                 ema_score = 15.0
                 reasons.append("EMA9 > EMA21")
 
-            # 2. Smooth Dynamic RSI Scoring Band
-            if 45 <= rsi <= 55:
-                rsi_score = 20.0
-                reasons.append(f"RSI sweet spot ({rsi:.1f})")
-            elif 55 < rsi <= 65:
+            # 2. Smooth Dynamic RSI Scoring Band: reward true breakout momentum (55-68)
+            if 55 <= rsi <= 68:
+                rsi_score = 25.0
+                reasons.append(f"RSI momentum sweet spot ({rsi:.1f})")
+            elif 48 <= rsi < 55:
                 rsi_score = 15.0
-                reasons.append(f"RSI strong ({rsi:.1f})")
-            elif 65 < rsi <= 70:
-                rsi_score = 5.0
-                reasons.append(f"RSI extended ({rsi:.1f})")
-            elif rsi > 70:
+                reasons.append(f"RSI building ({rsi:.1f})")
+            elif 68 < rsi <= 73:
+                rsi_score = 10.0
+                reasons.append(f"RSI strong but extended ({rsi:.1f})")
+            elif rsi > 75:
                 rsi_score = -20.0
                 reasons.append(f"RSI overbought ({rsi:.1f})")
             else:

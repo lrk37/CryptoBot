@@ -23,6 +23,7 @@ from risk_manager import RiskManager
 from scanner import MarketScanner, ScanResult
 from notifier import TelegramNotifier
 from chart_logger import save_trade_chart
+from scan_logger import log_scan_candidates, update_forward_returns
 
 # Configure Logging
 log_format = '%(asctime)s  %(levelname)-8s  [%(threadName)-12s]  %(message)s'
@@ -101,6 +102,14 @@ class ScannerEngine:
         with self._state_lock:
             active_copy = list(self._active_symbols)
         results = self.scanner.scan_market(active_symbols=active_copy)
+        
+        # Log candidates & check empirical 1h/4h forward returns (no capital risk)
+        try:
+            log_scan_candidates(results, self.exchange)
+            update_forward_returns(self.exchange)
+        except Exception as e:
+            log.warning(f"[SCAN LOGGER] Forward tracking exception: {e}")
+
         if not results:
             log.info("[SCANNER ENGINE] No candidates passed scoring threshold")
             self._rotate_scores()
