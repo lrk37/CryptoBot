@@ -46,7 +46,7 @@ INTERVAL_MINUTES = {
 
 DEFAULT_BASKET = [
     'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
-    'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT', 'MATICUSDT',
+    'ADAUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT', 'POLUSDT',
     'NEARUSDT', 'ATOMUSDT', 'APTUSDT', 'SUIUSDT', 'ARBUSDT',
 ]
 
@@ -92,10 +92,11 @@ def run_walk_forward(args):
     cap      = args.capital
     tsize    = args.trade_size
     mscore   = args.min_score
+    refresh  = getattr(args, 'refresh', False)
 
     t0 = _time.time()
     print(f'\n[*] Fetching {days} days of {interval} data for {sym}...')
-    df = fetch_historical_candles(sym, interval=interval, days=days)
+    df = fetch_historical_candles(sym, interval=interval, days=days, refresh=refresh)
 
     bpd       = _bpd(interval)
     warmup    = 100                              # bars for indicator convergence
@@ -112,7 +113,7 @@ def run_walk_forward(args):
         bt = StrategyBacktester(
             initial_capital=cap, trade_size_usdt=tsize, min_score=mscore
         )
-        m = bt.run(sym, window)
+        m = bt.run(sym, window, interval=interval, start_bar=warmup)
 
         s = df.index[idx].strftime('%Y-%m-%d')
         e = df.index[min(idx + test_bars - 1, len(df) - 1)].strftime('%Y-%m-%d')
@@ -218,6 +219,7 @@ def run_basket(args):
     tsize    = args.trade_size
     mscore   = args.min_score
     n_base   = getattr(args, 'baseline', 50)
+    refresh  = getattr(args, 'refresh', False)
     symbols  = DEFAULT_BASKET
 
     t0 = _time.time()
@@ -237,7 +239,7 @@ def run_basket(args):
 
     for i, sym in enumerate(symbols, 1):
         try:
-            df = fetch_historical_candles(sym, interval=interval, days=days)
+            df = fetch_historical_candles(sym, interval=interval, days=days, refresh=refresh)
         except Exception as e:
             print(f"  {sym:<10} SKIP — {e}")
             continue
@@ -247,14 +249,14 @@ def run_basket(args):
             continue
 
         bt = StrategyBacktester(initial_capital=cap, trade_size_usdt=tsize, min_score=mscore)
-        m  = bt.run(sym, df)
+        m  = bt.run(sym, df, interval=interval)
 
         # Random baseline comparison
         beat_str = ''
         beat_pct = None
         if n_base > 0 and m.get('total_trades', 0) > 0:
             try:
-                base = random_baseline(sym, df, bt.trades, n_base, cap, tsize, mscore)
+                base = random_baseline(sym, df, bt.trades, n_base, cap, tsize, mscore, interval=interval)
                 if base and base.get('runs'):
                     nets    = np.array(base['nets'])
                     actual  = m['net_return_pct']
@@ -339,11 +341,12 @@ def run_monte_carlo(args):
     tsize    = args.trade_size
     mscore   = args.min_score
     n_sims   = getattr(args, 'n_sims', 1000)
+    refresh  = getattr(args, 'refresh', False)
 
     print(f'\n[*] Running base backtest for {sym} ({interval}, {days}d)...')
-    df = fetch_historical_candles(sym, interval=interval, days=days)
+    df = fetch_historical_candles(sym, interval=interval, days=days, refresh=refresh)
     bt = StrategyBacktester(initial_capital=cap, trade_size_usdt=tsize, min_score=mscore)
-    metrics = bt.run(sym, df)
+    metrics = bt.run(sym, df, interval=interval)
 
     trades = bt.trades
     if not trades:
@@ -456,9 +459,10 @@ def run_slippage(args):
     cap      = args.capital
     tsize    = args.trade_size
     mscore   = args.min_score
+    refresh  = getattr(args, 'refresh', False)
 
     print(f'\n[*] Fetching {days} days of {interval} data for {sym}...')
-    df = fetch_historical_candles(sym, interval=interval, days=days)
+    df = fetch_historical_candles(sym, interval=interval, days=days, refresh=refresh)
 
     slippages = [0.00, 0.02, 0.05, 0.08, 0.10, 0.15, 0.20, 0.25, 0.30]
     rows = []
@@ -468,7 +472,7 @@ def run_slippage(args):
             initial_capital=cap, trade_size_usdt=tsize,
             slippage_pct=slip, min_score=mscore,
         )
-        m = bt.run(sym, df)
+        m = bt.run(sym, df, interval=interval)
         rows.append({'slippage': slip, 'metrics': m})
 
     # ── Report ────────────────────────────────────────────────
@@ -608,6 +612,8 @@ def main():
                         help='Trade size per order in USDT (default: 100)')
     shared.add_argument('--min_score', type=float, default=None,
                         help='Entry score threshold (default: from config.py)')
+    shared.add_argument('--refresh', action='store_true',
+                        help='Re-download data even if cached')
 
     # ── Walk-forward ──────────────────────────────────────────
     wf = sub.add_parser('walkforward', parents=[shared],

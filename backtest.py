@@ -35,13 +35,42 @@ from risk_manager import compute_stops, exit_triggers
 
 DATA_DIR = Path("data")
 
-def fetch_historical_candles(symbol: str, interval: str = "15m", days: int = 60) -> pd.DataFrame:
-    """Fetch historical klines from Binance and cache to data/<symbol>_<interval>_<days>d.csv."""
+# Map interval strings to minutes for dynamic calculations
+INTERVAL_MINUTES = {
+    '1m': 1, '3m': 3, '5m': 5, '15m': 15, '30m': 30,
+    '1h': 60, '2h': 120, '4h': 240, '1d': 1440,
+}
+
+
+def _bar_minutes(interval: str) -> int:
+    """Minutes per bar for a given candle interval."""
+    return INTERVAL_MINUTES.get(interval, 15)
+
+
+def fetch_historical_candles(symbol: str, interval: str = "15m", days: int = 60,
+                             refresh: bool = False) -> pd.DataFrame:
+    """Fetch historical klines from Binance and cache to data/<symbol>_<interval>_<days>d.csv.
+
+    Set refresh=True (or pass --refresh on the CLI) to re-download even if a
+    cached file exists.  The cache file records the data date range; when the
+    newest bar in the cache is more than 2 days old the user is warned.
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     cache_file = DATA_DIR / f"{symbol}_{interval}_{days}d.csv"
 
-    if cache_file.exists():
+    if cache_file.exists() and not refresh:
         df = pd.read_csv(cache_file, parse_dates=['open_time'], index_col='open_time')
+        # Warn if cache is stale (newest bar > 2 days old)
+        try:
+            newest = pd.Timestamp(df.index[-1])
+            age_days = (pd.Timestamp.now(tz='UTC') - newest).total_seconds() / 86400.0
+            if age_days > 2:
+                print(f"[!] Cached data for {symbol} is {age_days:.0f} days old "
+                      f"(ends {newest.strftime('%Y-%m-%d')}). Use --refresh to re-download.")
+        except Exception:
+            pass
+        print(f"[*] Using cached {len(df)} bars from {cache_file} "
+              f"({df.index[0].strftime('%Y-%m-%d')} → {df.index[-1].strftime('%Y-%m-%d')})")
         return df
 
     print(f"[*] Downloading {days} days of {interval} data for {symbol} from Binance...")
@@ -65,7 +94,8 @@ def fetch_historical_candles(symbol: str, interval: str = "15m", days: int = 60)
 
     df = df[['open', 'high', 'low', 'close', 'volume', 'quote_vol']]
     df.to_csv(cache_file)
-    print(f"[+] Saved {len(df)} candles to {cache_file}")
+    print(f"[+] Saved {len(df)} candles to {cache_file} "
+          f"({df.index[0].strftime('%Y-%m-%d')} → {df.index[-1].strftime('%Y-%m-%d')})")
     return df
 
 class StrategyBacktester:
@@ -86,11 +116,14 @@ class StrategyBacktester:
         self.period_days = None
 
     def run(self, symbol: str, df: pd.DataFrame, entry_mode: str = 'signal',
-            random_prob: float = 0.0, seed: int = None, _check_entry_bar: bool = True) -> dict:
+            random_prob: float = 0.0, seed: int = None, _check_entry_bar: bool = True,
+            interval: str = '15m', start_bar: int = 55) -> dict:
         """entry_mode='signal' -> the strategy's scoring; 'random' -> enter with probability
         `random_prob` on every eligible bar (baseline with identical exits and costs)."""
         self.trades = []
         self.capital = self.initial_capital
+        self._bar_minutes = _bar_minutes(interval)
+        self._equity_curve = []  # bar-by-bar mark-to-market equity (includes intra-trade)
 
         close = df['close']
         high = df['high']
@@ -101,7 +134,7 @@ class StrategyBacktester:
         try:
             self.period_days = max((df.index[-1] - df.index[0]).total_seconds() / 86400.0, 1.0)
         except Exception:
-            self.period_days = max(len(df) / 96.0, 1.0)
+            self.period_days = max((len(df) * self._bar_minutes) / 1440.0, 1.0)
 
         # Technical Indicators
         ema9 = close.ewm(span=9, adjust=False).mean()
@@ -137,7 +170,8 @@ class StrategyBacktester:
         be_enabled = getattr(cfg, 'ENABLE_BREAK_EVEN_STOP', True)
         trailing_enabled = getattr(cfg, 'SCANNER_TRAILING_STOP', True)
         trailing_offset = getattr(cfg, 'SCANNER_TRAILING_OFFSET', 1.2) / 100.0
-        max_hold_bars = int(getattr(cfg, 'MAX_SCANNER_HOLD_HOURS', 8) * 4)  # 15m bars
+        bars_per_hour = 60 / self._bar_minutes
+        max_hold_bars = int(getattr(cfg, 'MAX_SCANNER_HOLD_HOURS', 8) * bars_per_hour)
 
         def try_exit(i, curr_bar, curr_time):
             """Evaluate exits for the open position on bar i (also used for the ENTRY bar itself)."""
@@ -220,11 +254,18 @@ class StrategyBacktester:
                 })
 
                 position = None
-                cooldown_until_idx = i + 4  # 1 hour cooldown (4 x 15m)
+                cooldown_until_idx = i + int(60 / self._bar_minutes)  # 1-hour cooldown
 
-        for i in range(55, len(df)):
+        for i in range(max(start_bar, 55), len(df)):
             curr_bar = df.iloc[i]
             curr_time = df.index[i]
+
+            # Bar-by-bar equity: mark-to-market including open position
+            if position is not None:
+                unrealised = (curr_bar['close'] - position['entry_price_net']) * position['qty']
+                self._equity_curve.append(self.capital + unrealised)
+            else:
+                self._equity_curve.append(self.capital)
 
             # In trade: check exit
             if position is not None:
@@ -338,6 +379,37 @@ class StrategyBacktester:
             if _check_entry_bar:
                 try_exit(i, curr_bar, curr_time)
 
+        # Force close open position at the end of data if any
+        if position is not None:
+            last_bar = df.iloc[-1]
+            last_time = df.index[-1]
+            exit_market_price = last_bar['close']
+            exit_price_net = exit_market_price * (1 - self.slippage_pct)
+            fee = (position['qty'] * exit_price_net) * self.fee_pct
+            proceeds = (position['qty'] * exit_price_net) - fee
+            self.capital += proceeds
+            pnl_usdt = proceeds - (position['qty'] * position['entry_price_net'])
+            pnl_pct = (pnl_usdt / (position['qty'] * position['entry_price_net'])) * 100.0
+
+            self.trades.append({
+                'symbol': symbol,
+                'entry_time': position['entry_time'],
+                'exit_time': last_time,
+                'bars_held': len(df) - 1 - position['entry_idx'],
+                'entry_price': position['entry_price'],
+                'exit_price': exit_market_price,
+                'exit_reason': 'END_OF_DATA',
+                'pnl_usdt': pnl_usdt,
+                'pnl_pct': pnl_pct,
+                'highest_reached_pct': (position['highest'] - position['entry_price']) / position['entry_price'] * 100.0,
+                'lowest_reached_pct': (position['lowest'] - position['entry_price']) / position['entry_price'] * 100.0,
+                'score': position['score'],
+                'sl_pct': position['sl_pct'],
+                'tp_pct': position['tp_pct'],
+                'capital_after': self.capital
+            })
+            position = None
+
         return self.compute_metrics()
 
     def compute_metrics(self) -> dict:
@@ -365,14 +437,21 @@ class StrategyBacktester:
         # Expectancy = (Win% * AvgWin) - (Loss% * AvgLoss)
         expectancy = ((win_rate / 100.0) * avg_win) - (((100 - win_rate) / 100.0) * avg_loss)
 
-        # Drawdown calculation (closed-trade equity)
-        equity_curve = [self.initial_capital] + df_t['capital_after'].tolist()
-        peaks = pd.Series(equity_curve).cummax()
-        drawdowns = (pd.Series(equity_curve) - peaks) / peaks * 100.0
+        # Drawdown: use bar-by-bar equity (includes intra-trade mark-to-market)
+        # so that every intratrade adverse excursion is captured, not just
+        # closed-trade equity snapshots.
+        if self._equity_curve:
+            eq = pd.Series([self.initial_capital] + self._equity_curve)
+        else:
+            eq = pd.Series([self.initial_capital] + df_t['capital_after'].tolist())
+        peaks = eq.cummax()
+        drawdowns = (eq - peaks) / peaks.replace(0, 1) * 100.0
         max_drawdown = abs(drawdowns.min())
 
-        # Sharpe & Sortino: per-trade ratios scaled by sqrt(trades per year).
-        # Sortino uses the standard downside deviation (RMS of shortfalls below 0 over ALL trades).
+        # Sharpe & Sortino (trade-level approximations).
+        # These are computed from per-trade returns scaled by sqrt(trades/year).
+        # For a proper portfolio-level Sharpe, use periodic (e.g. daily) returns
+        # from the mark-to-market equity curve, including flat periods.
         returns = df_t['pnl_pct'] / 100.0
         mean_ret = returns.mean()
         std_ret = returns.std()
@@ -382,6 +461,8 @@ class StrategyBacktester:
         annual_factor = math.sqrt(trades_per_year)
         sharpe = (mean_ret / std_ret * annual_factor) if (std_ret and std_ret > 0) else 0.0
         sortino = (mean_ret / downside_dev * annual_factor) if downside_dev > 0 else 0.0
+
+        bar_min = getattr(self, '_bar_minutes', 15)
 
         return {
             'initial_capital': self.initial_capital,
@@ -400,12 +481,15 @@ class StrategyBacktester:
             'avg_loss_pct': round(avg_loss, 2),
             'payoff_ratio': round(payoff_ratio, 2),
             'expectancy_pct': round(expectancy, 2),
-            'avg_bars_held': round(df_t['bars_held'].mean(), 1)
+            'avg_bars_held': round(df_t['bars_held'].mean(), 1),
+            'avg_hold_minutes': round(df_t['bars_held'].mean() * bar_min, 1),
+            'bar_minutes': bar_min,
         }
 
 
 def random_baseline(symbol: str, df: pd.DataFrame, actual_trades: list, n_runs: int,
-                    capital: float, trade_size: float, min_score: float = None, seed: int = 42) -> dict:
+                    capital: float, trade_size: float, min_score: float = None, seed: int = 42,
+                    interval: str = '15m') -> dict:
     """Run `n_runs` backtests with RANDOM entries (same exits, fees, slippage), calibrated to take about as
     many trades as the real strategy did. Tells you whether the signal beats coin-flip entries."""
     n_actual = len(actual_trades)
@@ -418,7 +502,7 @@ def random_baseline(symbol: str, df: pd.DataFrame, actual_trades: list, n_runs: 
     nets, exps, counts = [], [], []
     for k in range(n_runs):
         bt = StrategyBacktester(initial_capital=capital, trade_size_usdt=trade_size, min_score=min_score)
-        m = bt.run(symbol, df, entry_mode='random', random_prob=prob, seed=seed + k)
+        m = bt.run(symbol, df, entry_mode='random', random_prob=prob, seed=seed + k, interval=interval)
         if 'error' in m:
             continue
         nets.append(m['net_return_pct'])
@@ -466,7 +550,13 @@ def print_report(symbol: str, metrics: dict):
     print(f" Avg Win / Loss  : {metrics['avg_win_pct']:+.2f}% / -{metrics['avg_loss_pct']:.2f}%")
     print(f" Payoff Ratio    : {metrics['payoff_ratio']:.2f}")
     print(f" Trade Expectancy: {metrics['expectancy_pct']:+.2f}% per trade (net of fees and slippage)")
-    print(f" Avg Hold Time   : {metrics['avg_bars_held'] * 15:.0f} mins ({metrics['avg_bars_held']:.1f} bars)")
+    bar_min = metrics.get('bar_minutes', 15)
+    hold_mins = metrics['avg_bars_held'] * bar_min
+    if hold_mins >= 60:
+        print(f" Avg Hold Time   : {hold_mins / 60:.1f} hours ({metrics['avg_bars_held']:.1f} bars × {bar_min}m)")
+    else:
+        print(f" Avg Hold Time   : {hold_mins:.0f} mins ({metrics['avg_bars_held']:.1f} bars × {bar_min}m)")
+    print(f" Sharpe / Sortino: {metrics['sharpe_ratio']:.2f} / {metrics['sortino_ratio']:.2f}  (trade-level approx.)")
     print("=" * 65 + "\n")
 
 
@@ -498,19 +588,22 @@ def main():
     parser.add_argument("--min_score", type=float, default=None, help="Entry score threshold (default: MIN_SCORE_TO_TRADE from config.py)")
     parser.add_argument("--baseline", type=int, default=0, help="Also run N random-entry baselines with the same exits/costs")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for the baseline")
+    parser.add_argument("--refresh", action='store_true', help="Re-download data even if cached")
     args = parser.parse_args()
 
     try:
-        df = fetch_historical_candles(args.symbol, interval=args.interval, days=args.days)
+        df = fetch_historical_candles(args.symbol, interval=args.interval, days=args.days,
+                                      refresh=args.refresh)
         tester = StrategyBacktester(initial_capital=args.capital, trade_size_usdt=args.trade_size, min_score=args.min_score)
         print_config()
         if args.min_score is not None:
             print(f" (using --min_score {args.min_score})")
-        metrics = tester.run(args.symbol, df)
+        metrics = tester.run(args.symbol, df, interval=args.interval)
         print_report(args.symbol, metrics)
         if args.baseline > 0 and 'error' not in metrics:
             base = random_baseline(args.symbol, df, tester.trades, args.baseline,
-                                   args.capital, args.trade_size, args.min_score, args.seed)
+                                   args.capital, args.trade_size, args.min_score, args.seed,
+                                   interval=args.interval)
             print_baseline(metrics, base)
     except Exception as e:
         print(f"[ERROR] Backtest failed: {e}")

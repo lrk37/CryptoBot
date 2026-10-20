@@ -25,6 +25,7 @@ loss_state.json.tmp
 # Backtest Data & Charts
 data/
 charts/*.png
+validation_results/
 
 # IDE & OS
 .vscode/
