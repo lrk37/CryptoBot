@@ -406,5 +406,83 @@ class TestBacktest(unittest.TestCase):
         self.assertGreater(np.mean(base["counts"]), 0.3 * len(t.trades))
 
 
+# =============================================================== accounting & portfolio tests
+class TestAccountingAndPortfolio(unittest.TestCase):
+    def test_end_of_data_exit_accounting(self):
+        """Verify that positions open at the final bar are closed cleanly at close,
+        and capital reflects only net PnL (not phantom trade size proceeds)."""
+        import backtest
+        n = 80
+        idx = pd.date_range("2026-07-01", periods=n, freq="1h", tz="UTC")
+        base = np.full(n, 100.0)
+        # Flat series where no SL or TP is hit
+        df = pd.DataFrame({
+            "open": base, "high": base + 0.1, "low": base - 0.1, "close": base,
+            "volume": 100.0, "quote_vol": 10000.0
+        }, index=idx)
+        # Enter on bar 70 and hold through bar 79 (end of data)
+        t = backtest.StrategyBacktester(initial_capital=1000.0, trade_size_usdt=100.0)
+        m = t.run("FLAT", df, entry_mode="random", random_prob=1.0, seed=42)
+
+        self.assertGreater(len(t.trades), 0)
+        last_trade = t.trades[-1]
+        self.assertEqual(last_trade["exit_reason"], "END_OF_DATA")
+
+        # Capital must strictly equal initial_capital + total net PnL
+        net_pnl = sum(tr["pnl_usdt"] for tr in t.trades)
+        self.assertAlmostEqual(t.capital, 1000.0 + net_pnl, places=2)
+        self.assertAlmostEqual(m["final_capital"], 1000.0 + net_pnl, places=2)
+
+        # Confirm the old bug (phantom +$100 proceeds) is absent:
+        # PnL on a flat asset after round-trip fees/slippage is negative, so capital < 1000.
+        self.assertLess(t.capital, 1000.0)
+        self.assertLess(m["net_return_pct"], 0.0)
+
+    def test_accounting_invariant_assertion_fails_on_mismatch(self):
+        """Verify that an accounting discrepancy immediately raises an AssertionError."""
+        import backtest
+        t = backtest.StrategyBacktester(initial_capital=1000.0, trade_size_usdt=100.0)
+        t.trades = [{
+            "symbol": "BTCUSDT", "pnl_usdt": 10.0, "pnl_pct": 10.0,
+            "bars_held": 5, "capital_after": 1010.0
+        }]
+        # Actual capital is intentionally set incorrectly to 1050.0
+        t.capital = 1050.0
+
+        with self.assertRaises(AssertionError) as ctx:
+            t.compute_metrics()
+        self.assertIn("Accounting mismatch in StrategyBacktester", str(ctx.exception))
+
+    def test_simulate_portfolio_chronological_and_drawdown(self):
+        """Verify simulate_portfolio runs without NameError, respects max_positions,
+        and computes drawdown properly."""
+        from validate import simulate_portfolio
+        t0 = pd.Timestamp("2026-08-01 10:00:00", tz="UTC")
+        trades = [
+            # Trade 1: 10:00 to 12:00, +$5
+            {"entry_time": t0, "exit_time": t0 + pd.Timedelta(hours=2), "pnl_usdt": 5.0},
+            # Trade 2: 10:30 to 13:00, -$3
+            {"entry_time": t0 + pd.Timedelta(minutes=30), "exit_time": t0 + pd.Timedelta(hours=3), "pnl_usdt": -3.0},
+            # Trade 3: 11:00 to 11:30, +$2 (exits before Trade 1 & 2)
+            {"entry_time": t0 + pd.Timedelta(hours=1), "exit_time": t0 + pd.Timedelta(minutes=90), "pnl_usdt": 2.0},
+            # Trade 4: 11:15 - should be skipped if max_positions=2, or accepted if max_positions=3
+            {"entry_time": t0 + pd.Timedelta(minutes=75), "exit_time": t0 + pd.Timedelta(hours=4), "pnl_usdt": 4.0},
+        ]
+
+        # Test with max_positions=2: at 11:15, Trades 1, 2, and 3 are in the mix
+        res2 = simulate_portfolio(trades, initial_capital=1000.0, trade_size_usdt=100.0, max_positions=2)
+        self.assertEqual(res2["trades_taken"], 3)
+        self.assertEqual(res2["trades_skipped"], 1)
+        self.assertIn("max_drawdown_pct", res2)
+        self.assertIsInstance(res2["max_drawdown_pct"], float)
+
+        # Test with max_positions=4: all trades taken
+        res4 = simulate_portfolio(trades, initial_capital=1000.0, trade_size_usdt=100.0, max_positions=4)
+        self.assertEqual(res4["trades_taken"], 4)
+        self.assertEqual(res4["trades_skipped"], 0)
+        self.assertAlmostEqual(res4["net_profit_usdt"], 8.0, places=2)
+        self.assertAlmostEqual(res4["final_capital"], 1008.0, places=2)
+
+
 if __name__ == "__main__":
     unittest.main()

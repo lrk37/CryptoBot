@@ -220,17 +220,17 @@ def run_walk_forward(args):
         eq_peaks = eq_s.cummax()
         oos_max_dd = float(abs(((eq_s - eq_peaks) / eq_peaks.replace(0, 1) * 100.0).min()))
 
-        print('\n  POOLED OUT-OF-SAMPLE TOTALS (Continuous Account Simulation):')
+        print('\n  POOLED OUT-OF-SAMPLE TOTALS (Fixed-Notional $100/trade Simulation):')
         print(f'    Total OOS Trades : {oos_t} ({oos_w} Wins / {oos_l} Losses | Win Rate: {oos_wr:.1f}%)')
         print(f'    Pooled Profit Fac: {oos_pf:.2f} (Gross Win: ${oos_gp:.2f} / Gross Loss: ${oos_gl:.2f})')
         print(f'    Pooled Expectancy: {oos_ex_pct:+.2f}% / trade (${oos_ex_usdt:+.2f} / trade)')
-        print(f'    Net Realized P&L : ${oos_net:+.2f} ({continuous_ret:+.2f}% continuous account return)')
+        print(f'    Net Realized P&L : ${oos_net:+.2f} ({continuous_ret:+.2f}% cumulative return on ${cap:,.0f} initial capital)')
         print(f'    Max OOS Drawdown : {oos_max_dd:.2f}%')
 
         pooled_summary = {
             'total_trades': oos_t, 'win_rate_pct': round(oos_wr, 2),
             'profit_factor': round(oos_pf, 2), 'expectancy_pct': round(oos_ex_pct, 2),
-            'net_profit_usdt': round(oos_net, 2), 'continuous_return_pct': round(continuous_ret, 2),
+            'net_profit_usdt': round(oos_net, 2), 'cumulative_return_pct': round(continuous_ret, 2),
             'max_drawdown_pct': round(oos_max_dd, 2),
         }
 
@@ -305,15 +305,14 @@ def simulate_portfolio(all_trades: list, initial_capital: float = 1000.0,
     for t in sorted_trades:
         entry_time = t['entry_time']
 
-        # Settle any positions that closed at or before this entry
-        still_open = []
-        for pos in open_positions:
-            if pos['exit_time'] <= entry_time:
-                cash += pos['pnl_usdt']
-                equity_curve.append(cash)
-            else:
-                still_open.append(pos)
-        open_positions = still_open
+        # Settle any positions that closed at or before this entry in strict chronological order
+        exited = [p for p in open_positions if p['exit_time'] <= entry_time]
+        open_positions = [p for p in open_positions if p['exit_time'] > entry_time]
+
+        exited.sort(key=lambda p: p['exit_time'])
+        for pos in exited:
+            cash += pos['pnl_usdt']
+            equity_curve.append(cash)
 
         # Capacity check
         if len(open_positions) < max_positions and cash >= trade_size_usdt:
@@ -322,7 +321,8 @@ def simulate_portfolio(all_trades: list, initial_capital: float = 1000.0,
         else:
             trades_skipped += 1
 
-    # Settle remaining positions
+    # Settle remaining positions in chronological order
+    open_positions.sort(key=lambda p: p['exit_time'])
     for pos in open_positions:
         cash += pos['pnl_usdt']
         equity_curve.append(cash)
@@ -331,7 +331,7 @@ def simulate_portfolio(all_trades: list, initial_capital: float = 1000.0,
     portfolio_return_pct = (net_profit / initial_capital) * 100.0
 
     eq_s = pd.Series(equity_curve)
-    peaks = eq_s.cummax()
+    eq_peaks = eq_s.cummax()
     max_dd = float(abs(((eq_s - eq_peaks) / eq_peaks.replace(0, 1) * 100.0).min()))
 
     return {

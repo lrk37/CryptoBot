@@ -437,10 +437,15 @@ class StrategyBacktester:
         net_profit = gross_profit - gross_loss
         profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float('inf')
 
-        # Accounting Invariant Check: final equity must exactly equal initial_capital + net_profit
+        # Accounting Invariant Assertion: tracked equity must exactly equal initial_capital + net_profit
         expected_capital = round(self.initial_capital + net_profit, 2)
-        if abs(self.capital - expected_capital) > 0.01:
-            self.capital = expected_capital
+        actual_capital = round(self.capital, 2)
+        if abs(actual_capital - expected_capital) > 0.02:
+            raise AssertionError(
+                f"Accounting mismatch in StrategyBacktester: tracked capital=${actual_capital:.2f} "
+                f"does not match initial capital (${self.initial_capital:.2f}) + net P&L (${net_profit:.2f}) "
+                f"= expected ${expected_capital:.2f} (delta: ${actual_capital - expected_capital:+.2f})."
+            )
 
         avg_win = float(wins['pnl_pct'].mean()) if win_count > 0 else 0.0
         avg_loss = float(abs(losses['pnl_pct'].mean())) if loss_count > 0 else 0.0
