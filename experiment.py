@@ -106,7 +106,8 @@ def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
 #  2. STRATEGY SIGNALS (Closed-Bar i-1 Evaluation)
 # ──────────────────────────────────────────────────────────────
 
-def evaluate_signals(df: pd.DataFrame, strategy: str, min_score: float = 60.0) -> pd.Series:
+def evaluate_signals(df: pd.DataFrame, strategy: str, min_score: float = 60.0,
+                     random_prob: float = 0.0, random_seed: int = 0) -> pd.Series:
     """Evaluate strategy entry signal on closed candle i-1.
 
     Returns boolean Series of signal triggers indexed to candle open_time.
@@ -222,6 +223,12 @@ def evaluate_signals(df: pd.DataFrame, strategy: str, min_score: float = 60.0) -
             if adx.iloc[i] < 20.0 and close.iloc[i] < lower_bb.iloc[i] and rsi.iloc[i] < 30.0:
                 signals.iloc[i] = True
 
+    elif strategy == 'random':
+        rng = np.random.default_rng(random_seed)
+        for i in range(55, n):
+            if rng.random() < random_prob:
+                signals.iloc[i] = True
+
     return signals
 
 
@@ -257,7 +264,8 @@ class PortfolioSimulator:
                  max_positions: int = 3,
                  exit_profile: str = 'E3',
                  cost_model: str = 'C0',
-                 interval: str = '1h'):
+                 interval: str = '1h',
+                 min_score: float = 60.0):
         self.initial_capital = initial_capital
         self.cash = initial_capital
         self.order_size = order_size
@@ -267,6 +275,7 @@ class PortfolioSimulator:
         self.fee_pct = self.costs['fee_pct'] / 100.0
         self.slippage_pct = self.costs['slippage_pct'] / 100.0
         self.interval = interval
+        self.min_score = min_score
         self.bar_min = _bar_minutes(interval)
         self.bars_per_hour = 60 / self.bar_min
         self.max_hold_bars = int(self.exit_cfg['max_hold_hours'] * self.bars_per_hour)
@@ -278,13 +287,17 @@ class PortfolioSimulator:
 
     def run(self, symbol_dfs: Dict[str, pd.DataFrame], strategy: str,
             start_dt: Optional[pd.Timestamp] = None,
-            end_dt: Optional[pd.Timestamp] = None) -> dict:
+            end_dt: Optional[pd.Timestamp] = None,
+            random_prob: float = 0.0, random_seed: int = 0) -> dict:
         """Run simulation across aligned time series."""
         # 1. Precalculate indicators and signals for each symbol
         signals_by_sym = {}
         atr_by_sym = {}
-        for sym, df in symbol_dfs.items():
-            signals_by_sym[sym] = evaluate_signals(df, strategy)
+        for idx, (sym, df) in enumerate(symbol_dfs.items()):
+            sym_seed = random_seed + idx * 7919 if strategy == 'random' else 0
+            signals_by_sym[sym] = evaluate_signals(
+                df, strategy, min_score=self.min_score,
+                random_prob=random_prob, random_seed=sym_seed)
             atr_by_sym[sym] = compute_atr(df['high'], df['low'], df['close'], 14)
 
         # 2. Extract and align all unique timestamps
@@ -589,12 +602,21 @@ def run_gate_0() -> bool:
 #  6. 8-FOLD 90-DAY WALK-FORWARD SCHEDULE (2024-2025)
 # ──────────────────────────────────────────────────────────────
 
+# Fixed evaluation boundaries
+EVAL_START = pd.Timestamp('2024-01-01 00:00:00', tz='UTC')
+EVAL_END   = pd.Timestamp('2025-12-31 23:59:59', tz='UTC')
+
+
 def generate_8_folds_2024_2025() -> List[Tuple[pd.Timestamp, pd.Timestamp, str]]:
-    """Generate the 8 pre-registered 90-day folds spanning Jan 1, 2024 to Dec 31, 2025."""
-    start = pd.Timestamp('2024-01-01 00:00:00', tz='UTC')
+    """Generate the 8 pre-registered 90-day folds starting Jan 1, 2024.
+
+    Note: 8 × 90 = 720 days covers Jan 1, 2024 → Dec 20, 2025.
+    The remaining 10 days (Dec 21–31, 2025) are included in the pooled
+    continuous simulation but are not assigned to any individual fold.
+    """
     folds = []
     for i in range(8):
-        f_start = start + pd.Timedelta(days=i * 90)
+        f_start = EVAL_START + pd.Timedelta(days=i * 90)
         f_end = f_start + pd.Timedelta(days=90) - pd.Timedelta(seconds=1)
         folds.append((f_start, f_end, f"Fold {i+1} ({f_start.strftime('%Y-%m-%d')} → {f_end.strftime('%Y-%m-%d')})"))
     return folds
@@ -602,8 +624,11 @@ def generate_8_folds_2024_2025() -> List[Tuple[pd.Timestamp, pd.Timestamp, str]]
 
 def run_candidate_validation(candidate_name: str, strategy: str, timeframe: str,
                              exit_profile: str, cost_model: str,
-                             symbol_dfs: Dict[str, pd.DataFrame]) -> dict:
-    """Run full 8-fold validation for a candidate configuration."""
+                             symbol_dfs: Dict[str, pd.DataFrame],
+                             min_score: float = 60.0,
+                             n_random_baselines: int = 200,
+                             random_seed: int = 42) -> dict:
+    """Run full 8-fold validation + matched random baseline for a candidate."""
     folds = generate_8_folds_2024_2025()
     fold_results = []
     all_trades = []
@@ -612,7 +637,8 @@ def run_candidate_validation(candidate_name: str, strategy: str, timeframe: str,
     for f_start, f_end, label in folds:
         sim = PortfolioSimulator(
             initial_capital=1000.0, order_size=100.0, max_positions=3,
-            exit_profile=exit_profile, cost_model=cost_model, interval=timeframe
+            exit_profile=exit_profile, cost_model=cost_model, interval=timeframe,
+            min_score=min_score
         )
         res = sim.run(symbol_dfs, strategy, start_dt=f_start, end_dt=f_end)
         fold_results.append({
@@ -629,12 +655,13 @@ def run_candidate_validation(candidate_name: str, strategy: str, timeframe: str,
         all_trades.extend(res['trades'])
         daily_equity_curves.update(res['daily_equity'])
 
-    # Full continuous 2-year simulation across all folds
+    # Full continuous 2-year simulation (Jan 1 2024 \u2013 Dec 31 2025, including 10-day tail)
     full_sim = PortfolioSimulator(
         initial_capital=1000.0, order_size=100.0, max_positions=3,
-        exit_profile=exit_profile, cost_model=cost_model, interval=timeframe
+        exit_profile=exit_profile, cost_model=cost_model, interval=timeframe,
+        min_score=min_score
     )
-    pooled_res = full_sim.run(symbol_dfs, strategy, start_dt=folds[0][0], end_dt=folds[-1][1])
+    pooled_res = full_sim.run(symbol_dfs, strategy, start_dt=EVAL_START, end_dt=EVAL_END)
 
     # Weekly block-bootstrap for 95% confidence interval on expectancy
     df_t = pd.DataFrame(all_trades) if all_trades else pd.DataFrame()
@@ -647,6 +674,39 @@ def run_candidate_validation(candidate_name: str, strategy: str, timeframe: str,
             sample = rng.choice(pnls, size=len(pnls), replace=True)
             boot_means.append(float(sample.mean()))
         bootstrap_lower = float(np.percentile(boot_means, 2.5))
+
+    # ── Matched random-entry baseline (same exits, fees, slippage) ────
+    n_actual_signals = sum(
+        int(evaluate_signals(df, strategy, min_score=min_score).sum())
+        for df in symbol_dfs.values()
+    )
+    total_eligible_bars = sum(max(len(df) - 55, 0) for df in symbol_dfs.values())
+    random_prob = min(n_actual_signals / max(total_eligible_bars, 1), 0.5) \
+                  if total_eligible_bars > 0 else 0.02
+
+    random_net_returns = []
+    if n_random_baselines > 0 and random_prob > 0:
+        print(f"    [*] Running {n_random_baselines} matched random baselines "
+              f"(prob={random_prob:.4f}, seed={random_seed})...")
+        for k in range(n_random_baselines):
+            rsim = PortfolioSimulator(
+                initial_capital=1000.0, order_size=100.0, max_positions=3,
+                exit_profile=exit_profile, cost_model=cost_model, interval=timeframe,
+                min_score=0.0
+            )
+            rres = rsim.run(symbol_dfs, 'random',
+                            start_dt=EVAL_START, end_dt=EVAL_END,
+                            random_prob=random_prob, random_seed=random_seed + k)
+            random_net_returns.append(rres['net_return_pct'])
+
+    # Raw p-value: fraction of random baselines that matched or exceeded the candidate
+    if random_net_returns:
+        rnd_arr = np.array(random_net_returns)
+        raw_p_value = float(np.mean(rnd_arr >= pooled_res['net_return_pct']))
+        random_beat_pct = float(np.mean(rnd_arr < pooled_res['net_return_pct'])) * 100.0
+    else:
+        raw_p_value = 1.0
+        random_beat_pct = 0.0
 
     # Profit concentration check
     pos_profits = [f['net_profit_usdt'] for f in fold_results if f['net_profit_usdt'] > 0]
@@ -671,11 +731,26 @@ def run_candidate_validation(candidate_name: str, strategy: str, timeframe: str,
         'timeframe': timeframe,
         'exit_profile': exit_profile,
         'cost_model': cost_model,
+        'min_score': min_score,
+        'eval_start': str(EVAL_START),
+        'eval_end': str(EVAL_END),
+        'folds_cover_days': 720,
+        'tail_gap_days': 10,
         'pooled': pooled_res,
         'folds': fold_results,
         'profitable_folds': f"{profitable_folds}/8",
         'max_fold_concentration_pct': round(max_fold_contrib, 1),
         'expectancy_boot_95_lower': round(bootstrap_lower, 2),
+        'random_baseline': {
+            'n_runs': len(random_net_returns),
+            'seed': random_seed,
+            'entry_prob': round(random_prob, 6),
+            'actual_signals': n_actual_signals,
+            'raw_p_value': round(raw_p_value, 4),
+            'beat_random_pct': round(random_beat_pct, 1),
+            'random_mean_return': round(float(np.mean(random_net_returns)), 2) if random_net_returns else 0.0,
+            'random_p95_return': round(float(np.percentile(random_net_returns, 95)), 2) if random_net_returns else 0.0,
+        },
         'gate1_checks': g1_checks,
         'gate1_decision': 'ADVANCE TO STAGE B' if gate1_passed else 'REJECT',
     }
@@ -708,58 +783,85 @@ def run_stage_a(timeframe: Optional[str] = None):
             except Exception as e:
                 print(f"    [-] Warning: {sym} skipped — {e}")
 
-    # Stage A Configurations:
-    # B15, B60: Breakout + E3 (2:1 R:R common exit)
-    # T15, T60: Trend Following + E3
-    # M15, M60: Mean Reversion + E3
-    # REF15, REF60: Current bot exact config (E5 dynamic exit)
+    # Stage A Configurations: (name, strategy, timeframe, exit, cost, min_score)
+    # B/T/M candidates use min_score=60 (experimental threshold)
+    # REF controls use min_score=75 (matching live bot config.MIN_SCORE_TO_TRADE)
     candidates = []
     if '15m' in tf_list:
         candidates.extend([
-            ('B15', 'breakout', '15m', 'E3', 'C0'),
-            ('T15', 'trend', '15m', 'E3', 'C0'),
-            ('M15', 'mean_reversion', '15m', 'E3', 'C0'),
-            ('REF15', 'current_bot', '15m', 'E5', 'C0'),
+            ('B15', 'breakout', '15m', 'E3', 'C0', 60.0),
+            ('T15', 'trend', '15m', 'E3', 'C0', 60.0),
+            ('M15', 'mean_reversion', '15m', 'E3', 'C0', 60.0),
+            ('REF15', 'current_bot', '15m', 'E5', 'C0', 75.0),
         ])
     if '1h' in tf_list:
         candidates.extend([
-            ('B60', 'breakout', '1h', 'E3', 'C0'),
-            ('T60', 'trend', '1h', 'E3', 'C0'),
-            ('M60', 'mean_reversion', '1h', 'E3', 'C0'),
-            ('REF60', 'current_bot', '1h', 'E5', 'C0'),
+            ('B60', 'breakout', '1h', 'E3', 'C0', 60.0),
+            ('T60', 'trend', '1h', 'E3', 'C0', 60.0),
+            ('M60', 'mean_reversion', '1h', 'E3', 'C0', 60.0),
+            ('REF60', 'current_bot', '1h', 'E5', 'C0', 75.0),
         ])
 
     results = []
-    for cand_name, strat, tf, exit_p, cost_m in candidates:
-        print(f"\n[*] Evaluating Candidate {cand_name} ({strat}, {tf}, {exit_p}, {cost_m})...")
-        res = run_candidate_validation(cand_name, strat, tf, exit_p, cost_m, symbol_dfs_by_tf[tf])
+    for cand_name, strat, tf, exit_p, cost_m, mscore in candidates:
+        print(f"\n[*] Evaluating {cand_name} ({strat}, {tf}, {exit_p}, {cost_m}, score>={mscore:.0f})...")
+        res = run_candidate_validation(cand_name, strat, tf, exit_p, cost_m,
+                                       symbol_dfs_by_tf[tf], min_score=mscore)
         results.append(res)
 
-    # ── Report Table formatted exactly as Section 9 ───────────
-    W = 105
+    # ── Report Table ───────────────────────────────────────────
+    W = 120
     print('\n' + '═' * W)
     print('  STAGE A RESULTS SUMMARY TABLE (Predefined Gate 1 Criteria)')
+    print(f'  Evaluation: {EVAL_START.strftime("%Y-%m-%d")} \u2013 {EVAL_END.strftime("%Y-%m-%d")} | 8 folds (720d) + 10d tail in pooled')
     print('═' * W)
-    hdr = f"  {'Candidate':<10} {'Trades':>6}  {'Win%':>6}  {'PF':>6}  {'Expect':>8}  {'DailySR':>8}  {'MaxDD':>7}  {'Folds':>7}  {'BootLow':>8}  {'Decision':<12}"
+    hdr = f"  {'Candidate':<10} {'Score':>5} {'Trades':>6}  {'Win%':>6}  {'PF':>6}  {'Expect':>8}  {'MaxDD':>7}  {'Folds':>7}  {'BootLow':>8}  {'BeatRnd':>8}  {'Decision':<12}"
     print(hdr)
     print('─' * W)
 
     for r in results:
         p = r['pooled']
         cand = r['candidate']
+        ms = r['min_score']
         t = p['total_trades']
         wr = p['win_rate_pct']
         pf = p['profit_factor']
         ex = p['expectancy_pct']
-        sr = p['daily_sharpe']
         dd = p['max_drawdown_pct']
         folds = r['profitable_folds']
         boot = r['expectancy_boot_95_lower']
+        brnd = r['random_baseline']['beat_random_pct']
         dec = r['gate1_decision']
 
-        marker = '✓' if 'ADVANCE' in dec else '✗'
-        print(f"  {cand:<10} {t:>6}  {wr:>5.1f}%  {pf:>6.2f}  {ex:>+7.2f}%  {sr:>8.2f}  {dd:>6.1f}%  {folds:>7}  {boot:>+7.2f}%  {dec:<12} {marker}")
+        marker = '\u2713' if 'ADVANCE' in dec else '\u2717'
+        print(f"  {cand:<10} {ms:>5.0f} {t:>6}  {wr:>5.1f}%  {pf:>6.2f}  {ex:>+7.2f}%  {dd:>6.1f}%  {folds:>7}  {boot:>+7.2f}%  {brnd:>6.1f}%  {dec:<12} {marker}")
 
+    print('═' * W)
+
+    # ── Holm-Bonferroni Multiple-Comparison Correction ────────
+    raw_pvals = [(r['candidate'], r['random_baseline']['raw_p_value']) for r in results]
+    sorted_pvals = sorted(raw_pvals, key=lambda x: x[1])
+    n_cands = len(sorted_pvals)
+
+    print(f"\n  HOLM-BONFERRONI CORRECTION ({n_cands} candidates, \u03b1=0.05)")
+    print(f"  {'Candidate':<10} {'Raw p':>8}  {'Adj p':>8}  {'Significant':>12}")
+    print('  ' + '\u2500' * 44)
+
+    adjusted_pvals = {}
+    max_adj = 0.0
+    for rank, (cand, pval) in enumerate(sorted_pvals):
+        adj_p = min(pval * (n_cands - rank), 1.0)
+        adj_p = max(adj_p, max_adj)  # enforce monotonicity
+        max_adj = adj_p
+        adjusted_pvals[cand] = adj_p
+        sig = '\u2713 YES' if adj_p < 0.05 else '\u2717 NO'
+        print(f"  {cand:<10} {pval:>8.4f}  {adj_p:>8.4f}  {sig:>12}")
+
+    for r in results:
+        r['random_baseline']['adjusted_p_value'] = round(adjusted_pvals[r['candidate']], 4)
+
+    print(f"\n  Only candidates with adjusted p < 0.05 have statistically significant")
+    print(f"  predictive value after correcting for testing {n_cands} candidates.")
     print('═' * W + '\n')
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
