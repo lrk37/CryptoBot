@@ -463,13 +463,19 @@ class TestAccountingAndPortfolio(unittest.TestCase):
             {"entry_time": t0, "exit_time": t0 + pd.Timedelta(hours=2), "pnl_usdt": 5.0},
             # Trade 2: 10:30 to 13:00, -$3
             {"entry_time": t0 + pd.Timedelta(minutes=30), "exit_time": t0 + pd.Timedelta(hours=3), "pnl_usdt": -3.0},
-            # Trade 3: 11:00 to 11:30, +$2 (exits before Trade 1 & 2)
+            # Trade 3: 11:00 to 11:30, +$2 (skipped under max_positions=2 because Trades 1 & 2 are open)
             {"entry_time": t0 + pd.Timedelta(hours=1), "exit_time": t0 + pd.Timedelta(minutes=90), "pnl_usdt": 2.0},
-            # Trade 4: 11:15 - should be skipped if max_positions=2, or accepted if max_positions=3
-            {"entry_time": t0 + pd.Timedelta(minutes=75), "exit_time": t0 + pd.Timedelta(hours=4), "pnl_usdt": 4.0},
+            # Trade 4: 12:15 - taken under max_positions=2 because Trade 1 exited at 12:00
+            {"entry_time": t0 + pd.Timedelta(minutes=135), "exit_time": t0 + pd.Timedelta(hours=4), "pnl_usdt": 4.0},
         ]
 
-        # Test with max_positions=2: at 11:15, Trades 1, 2, and 3 are in the mix
+        # Test with max_positions=2:
+        # At 10:00: Trade 1 entered (open=1)
+        # At 10:30: Trade 2 entered (open=2)
+        # At 11:00: Trade 3 attempted -> skipped (open=2 >= max_positions=2)
+        # At 12:00: Trade 1 exits -> open drops to 1
+        # At 12:15: Trade 4 entered (open=2)
+        # Total taken: 3 (Trades 1, 2, 4), skipped: 1 (Trade 3)
         res2 = simulate_portfolio(trades, initial_capital=1000.0, trade_size_usdt=100.0, max_positions=2)
         self.assertEqual(res2["trades_taken"], 3)
         self.assertEqual(res2["trades_skipped"], 1)
