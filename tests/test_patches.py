@@ -483,6 +483,28 @@ class TestAccountingAndPortfolio(unittest.TestCase):
         self.assertAlmostEqual(res4["net_profit_usdt"], 8.0, places=2)
         self.assertAlmostEqual(res4["final_capital"], 1008.0, places=2)
 
+    def test_experiment_signals_and_gate0(self):
+        """Verify experiment.py signals and Gate 0 audit pass without error."""
+        import experiment
+        self.assertTrue(experiment.run_gate_0())
+
+        # Test signals on synthetic data
+        n = 100
+        idx = pd.date_range("2024-01-01", periods=n, freq="1h", tz="UTC")
+        base = np.linspace(100, 150, n)
+        df_trend = pd.DataFrame({
+            "open": base, "high": base + 1.0, "low": base - 0.5, "close": base + 0.5,
+            "volume": 1000.0, "quote_vol": 100000.0
+        }, index=idx)
+
+        sig_b = experiment.evaluate_signals(df_trend, "breakout")
+        sig_t = experiment.evaluate_signals(df_trend, "trend")
+        sig_m = experiment.evaluate_signals(df_trend, "mean_reversion")
+
+        self.assertEqual(len(sig_b), n)
+        self.assertEqual(len(sig_t), n)
+        self.assertEqual(len(sig_m), n)
+
 
 if __name__ == "__main__":
     unittest.main()

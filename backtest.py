@@ -47,37 +47,51 @@ def _bar_minutes(interval: str) -> int:
     return INTERVAL_MINUTES.get(interval, 15)
 
 
-def fetch_historical_candles(symbol: str, interval: str = "15m", days: int = 60,
+def fetch_historical_candles(symbol: str, interval: str = "15m", days: int = None,
+                             start_date: str = None, end_date: str = None,
                              refresh: bool = False) -> pd.DataFrame:
-    """Fetch historical klines from Binance and cache to data/<symbol>_<interval>_<days>d.csv.
+    """Fetch historical klines from Binance and cache to data/.
 
-    Set refresh=True (or pass --refresh on the CLI) to re-download even if a
-    cached file exists.  The cache file records the data date range; when the
-    newest bar in the cache is more than 2 days old the user is warned.
+    Supports either:
+    - days=N: fetches past N days ending now
+    - start_date, end_date: fetches exact date range (e.g., '2023-12-01', '2026-01-01')
     """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file = DATA_DIR / f"{symbol}_{interval}_{days}d.csv"
+    if start_date:
+        tag = f"{start_date}_{end_date}" if end_date else f"{start_date}_now"
+        cache_file = DATA_DIR / f"{symbol}_{interval}_{tag}.csv"
+        start_str = f"{start_date} UTC"
+        end_str = f"{end_date} UTC" if end_date else None
+    else:
+        d = days or 60
+        cache_file = DATA_DIR / f"{symbol}_{interval}_{d}d.csv"
+        start_str = f"{d} days ago UTC"
+        end_str = None
 
     if cache_file.exists() and not refresh:
         df = pd.read_csv(cache_file, parse_dates=['open_time'], index_col='open_time')
-        # Warn if cache is stale (newest bar > 2 days old)
-        try:
-            newest = pd.Timestamp(df.index[-1])
-            age_days = (pd.Timestamp.now(tz='UTC') - newest).total_seconds() / 86400.0
-            if age_days > 2:
-                print(f"[!] Cached data for {symbol} is {age_days:.0f} days old "
-                      f"(ends {newest.strftime('%Y-%m-%d')}). Use --refresh to re-download.")
-        except Exception:
-            pass
+        # Warn if cache is stale (newest bar > 2 days old) when fetching relative days
+        if not end_date:
+            try:
+                newest = pd.Timestamp(df.index[-1])
+                age_days = (pd.Timestamp.now(tz='UTC') - newest).total_seconds() / 86400.0
+                if age_days > 2:
+                    print(f"[!] Cached data for {symbol} is {age_days:.0f} days old "
+                          f"(ends {newest.strftime('%Y-%m-%d')}). Use --refresh to re-download.")
+            except Exception:
+                pass
         print(f"[*] Using cached {len(df)} bars from {cache_file} "
               f"({df.index[0].strftime('%Y-%m-%d')} → {df.index[-1].strftime('%Y-%m-%d')})")
         return df
 
-    print(f"[*] Downloading {days} days of {interval} data for {symbol} from Binance...")
+    date_desc = f"{start_str} to {end_str}" if end_str else start_str
+    print(f"[*] Downloading {interval} data for {symbol} ({date_desc}) from Binance...")
     client = Client(getattr(cfg, 'API_KEY', ''), getattr(cfg, 'API_SECRET', ''))
 
-    start_str = f"{days} days ago UTC"
-    raw_klines = client.get_historical_klines(symbol, interval, start_str)
+    if end_str:
+        raw_klines = client.get_historical_klines(symbol, interval, start_str, end_str=end_str)
+    else:
+        raw_klines = client.get_historical_klines(symbol, interval, start_str)
 
     if not raw_klines:
         raise ValueError(f"No kline data returned for {symbol}")
