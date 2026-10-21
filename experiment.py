@@ -634,7 +634,8 @@ def run_candidate_validation(candidate_name: str, strategy: str, timeframe: str,
     all_trades = []
     daily_equity_curves = {}
 
-    for f_start, f_end, label in folds:
+    print(f"    [*] Running 8-fold walk-forward validation...", flush=True)
+    for fold_idx, (f_start, f_end, label) in enumerate(folds, 1):
         sim = PortfolioSimulator(
             initial_capital=1000.0, order_size=100.0, max_positions=3,
             exit_profile=exit_profile, cost_model=cost_model, interval=timeframe,
@@ -654,14 +655,19 @@ def run_candidate_validation(candidate_name: str, strategy: str, timeframe: str,
         })
         all_trades.extend(res['trades'])
         daily_equity_curves.update(res['daily_equity'])
+        print(f"        [Fold {fold_idx}/8] {label.split(' ')[0]} {label.split(' ')[1]}: "
+              f"{res['total_trades']} trades, PF {res['profit_factor']:.2f}, Ret {res['net_return_pct']:+.1f}%", flush=True)
 
-    # Full continuous 2-year simulation (Jan 1 2024 \u2013 Dec 31 2025, including 10-day tail)
+    # Full continuous 2-year simulation (Jan 1 2024 – Dec 31 2025, including 10-day tail)
+    print(f"    [*] Running full 2-year continuous simulation ({EVAL_START.strftime('%Y-%m-%d')} to {EVAL_END.strftime('%Y-%m-%d')})...", flush=True)
     full_sim = PortfolioSimulator(
         initial_capital=1000.0, order_size=100.0, max_positions=3,
         exit_profile=exit_profile, cost_model=cost_model, interval=timeframe,
         min_score=min_score
     )
     pooled_res = full_sim.run(symbol_dfs, strategy, start_dt=EVAL_START, end_dt=EVAL_END)
+    print(f"        Pooled 2-Year: {pooled_res['total_trades']} trades, PF {pooled_res['profit_factor']:.2f}, "
+          f"Exp {pooled_res['expectancy_pct']:+.2f}%, MaxDD {pooled_res['max_drawdown_pct']:.1f}%", flush=True)
 
     # Weekly block-bootstrap for 95% confidence interval on expectancy
     df_t = pd.DataFrame(all_trades) if all_trades else pd.DataFrame()
@@ -687,7 +693,7 @@ def run_candidate_validation(candidate_name: str, strategy: str, timeframe: str,
     random_net_returns = []
     if n_random_baselines > 0 and random_prob > 0:
         print(f"    [*] Running {n_random_baselines} matched random baselines "
-              f"(prob={random_prob:.4f}, seed={random_seed})...")
+              f"(prob={random_prob:.4f}, seed={random_seed})...", flush=True)
         for k in range(n_random_baselines):
             rsim = PortfolioSimulator(
                 initial_capital=1000.0, order_size=100.0, max_positions=3,
@@ -698,6 +704,8 @@ def run_candidate_validation(candidate_name: str, strategy: str, timeframe: str,
                             start_dt=EVAL_START, end_dt=EVAL_END,
                             random_prob=random_prob, random_seed=random_seed + k)
             random_net_returns.append(rres['net_return_pct'])
+            if (k + 1) % 50 == 0 or (k + 1) == n_random_baselines:
+                print(f"        [Random Baseline {k+1}/{n_random_baselines}] completed", flush=True)
 
     # Raw p-value: fraction of random baselines that matched or exceeded the candidate
     if random_net_returns:
