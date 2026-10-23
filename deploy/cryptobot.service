@@ -11,9 +11,9 @@ Restart=always
 RestartSec=10
 EnvironmentFile=/home/ubuntu/CryptoBot/.env
 
-# Standard output and error logging
-StandardOutput=append:/home/ubuntu/CryptoBot/bot.log
-StandardError=append:/home/ubuntu/CryptoBot/bot.log
+# Standard output and error logging (sent to systemd journal; python FileHandler writes to bot.log)
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

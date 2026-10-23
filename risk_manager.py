@@ -359,6 +359,10 @@ class RiskManager:
 
     def check_circuit_breaker(self, current_balance: float) -> bool:
         """Check daily loss circuit breaker. Pass total portfolio value, not just USDT cash."""
+        if current_balance <= 0:
+            log.warning(f"[CIRCUIT BREAKER] Ignoring non-positive portfolio balance ({current_balance})")
+            return self._halted
+
         today = date.today()
         if today != self._today:
             self._today = today
@@ -366,19 +370,18 @@ class RiskManager:
             self._halted = False
             self._save_loss_state()  # F-19: Persist daily balance across restarts
 
-        if self._daily_start_bal is None:
+        if self._daily_start_bal is None or self._daily_start_bal <= 0:
             self._daily_start_bal = current_balance
             self._save_loss_state()
             return False
 
-        if self._daily_start_bal > 0:
-            loss_pct = ((self._daily_start_bal - current_balance) / self._daily_start_bal) * 100.0
-            max_loss = getattr(self.cfg, 'MAX_DAILY_LOSS', 6.0)
-            if loss_pct >= max_loss:
-                if not self._halted:
-                    log.error(f"[CIRCUIT BREAKER] Daily loss {loss_pct:.2f}% >= {max_loss}%. HALTING.")
-                    self._halted = True
-                return True
+        loss_pct = ((self._daily_start_bal - current_balance) / self._daily_start_bal) * 100.0
+        max_loss = getattr(self.cfg, 'MAX_DAILY_LOSS', 6.0)
+        if loss_pct >= max_loss:
+            if not self._halted:
+                log.error(f"[CIRCUIT BREAKER] Daily loss {loss_pct:.2f}% >= {max_loss}%. HALTING.")
+                self._halted = True
+            return True
 
         return False
 

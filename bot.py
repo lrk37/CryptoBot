@@ -90,6 +90,7 @@ class ScannerEngine:
                 pos_qty[s] = p_.quantity
         portfolio_val = self.exchange.get_portfolio_value(symbols=pos_symbols, quantities=pos_qty)
         if self.risk_mgr.check_circuit_breaker(portfolio_val):
+            self.notifier.alert("🛑 Circuit breaker tripped! Daily loss limit reached. Trading halted.")
             return
 
         if self.risk_mgr.open_count() >= getattr(cfg, 'MAX_OPEN_TRADES', 1):
@@ -135,16 +136,16 @@ class ScannerEngine:
                     else:
                         del self._symbol_cooldowns[symbol]
 
-            # High Score Override (>=80) fast-tracks entry
+            # 1. Enforce BTC Market Regime: never enter during a bearish regime
+            if btc_status == "BEARISH":
+                log.info(f"[SCANNER ENGINE] BTC regime BEARISH - skipping entry for {symbol} (score {score:.0f})")
+                continue
+
+            # 2. High Score Override (>=80) fast-tracks entry (only in Bullish BTC regime)
             if score >= high_thresh and getattr(cfg, 'ENABLE_HIGH_SCORE_OVERRIDE', True):
                 log.info(f"[CONFIRMATION BYPASS] {symbol} score {score:.0f} >= {high_thresh:.0f} - fast-tracking entry!")
                 self._execute_entry(res)
                 break
-
-            # Check BTC Regime if not high score
-            if btc_status == "BEARISH":
-                log.info(f"[SCANNER ENGINE] BTC regime BEARISH - skipping entry for {symbol} (score {score:.0f})")
-                continue
 
             # 2-Scan Candle-Based Confirmation System
             if require_confirm:

@@ -292,6 +292,9 @@ class MarketScanner:
             elif 68 < rsi <= 73:
                 rsi_score = 10.0
                 reasons.append(f"RSI strong but extended ({rsi:.1f})")
+            elif 73 < rsi <= 75:
+                rsi_score = 0.0
+                reasons.append(f"RSI approaching overbought ({rsi:.1f})")
             elif rsi > 75:
                 rsi_score = -20.0
                 reasons.append(f"RSI overbought ({rsi:.1f})")

@@ -18,16 +18,26 @@ class TelegramNotifier:
         self.chat_id = cfg.TELEGRAM_CHAT_ID
         self._url = f"https://api.telegram.org/bot{self.token}/sendMessage"
 
-    def send(self, msg, parse_mode=None):
-        if not self.enabled:
-            return None
+    def send(self, msg, parse_mode=None) -> bool:
+        if not self.enabled or not self.token or not self.chat_id:
+            return False
         try:
             payload = {'chat_id': self.chat_id, 'text': msg}
             if parse_mode:
                 payload['parse_mode'] = parse_mode
-            requests.post(self._url, json=payload, timeout=10)
+            resp = requests.post(self._url, json=payload, timeout=10)
+            if resp.status_code != 200:
+                log.warning(f"Telegram API HTTP {resp.status_code}: {resp.text}")
+                # Fallback: if MarkdownV2 formatting caused a 400 error, retry as plain text
+                if parse_mode:
+                    fb_resp = requests.post(self._url, json={'chat_id': self.chat_id, 'text': msg}, timeout=10)
+                    if fb_resp.status_code == 200:
+                        return True
+                return False
+            return True
         except Exception as e:
-            log.warning(f"Telegram error: {e}")
+            log.warning(f"Telegram connection error: {e}")
+            return False
 
     def trade_opened(self, symbol, side, price, qty, sl, tp):
         # F-26: Use code spans for values (no escaping needed inside backticks).
@@ -48,4 +58,8 @@ class TelegramNotifier:
         self.send(msg, parse_mode='MarkdownV2')
 
     def alert(self, msg):
-        self.send(f"\u26a0\ufe0f {msg}")
+        return self.send(f"⚠️ {msg}")
+
+    def error(self, msg):
+        return self.send(f"🚨 *CRITICAL ERROR*:\n{msg}")
+
