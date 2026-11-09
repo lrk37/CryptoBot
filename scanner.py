@@ -61,7 +61,7 @@ class MarketScanner:
 
         try:
             interval = getattr(self.cfg, 'BTC_REGIME_INTERVAL', '1h')
-            limit = getattr(self.cfg, 'BTC_REGIME_EMA_PERIOD', 20) + 10
+            limit = getattr(self.cfg, 'BTC_REGIME_EMA_PERIOD', 20) + 50
             df = self.exchange.get_candles('BTCUSDT', interval=interval, limit=limit)
             if df is None or len(df) < 25:
                 log.warning("[BTC REGIME] Could not fetch BTC candles - assuming BULLISH")
@@ -185,6 +185,7 @@ class MarketScanner:
                 pct_24h = 0.0
 
             # --- TIERED 24h PUMP PENALTY ---
+            strategy_mode = getattr(self.cfg, 'STRATEGY_MODE', 'capitulation')
             parabolic_max = getattr(self.cfg, 'PARABOLIC_PUMP_MAX_PCT', 25.0)
             pump_penalty = 0.0
             if pct_24h > parabolic_max:
@@ -192,26 +193,27 @@ class MarketScanner:
                 return None
             elif pct_24h > 15.0:
                 pump_penalty = -20.0
-            elif pct_24h > 10.0:
+            elif strategy_mode != 'capitulation' and pct_24h > 10.0:
                 pump_penalty = -10.0
-            elif pct_24h > 6.0:
+            elif strategy_mode != 'capitulation' and pct_24h > 6.0:
                 pump_penalty = -5.0
 
             # Calculate indicators on closed bars
             ema9 = close.ewm(span=9, adjust=False).mean()
             ema21 = close.ewm(span=21, adjust=False).mean()
             ema50 = close.ewm(span=50, adjust=False).mean()
+            ema200 = close.ewm(span=200, adjust=False).mean()
 
-            # --- HARD BLOCK 1: EMA Slope Check (EMA9 must not be falling steeply) ---
-            if len(ema9) >= 3:
+            # --- HARD BLOCK 1: EMA Slope Check (Breakout mode only) ---
+            if strategy_mode != 'capitulation' and len(ema9) >= 3:
                 ema9_slope = (ema9.iloc[-1] - ema9.iloc[-3]) / ema9.iloc[-3]
                 if ema9_slope < -0.001:  # Allow flat, block falling
                     log.info(f"[SCANNER] {symbol} skipped - EMA9 slope is falling ({ema9_slope:.4f})")
                     return None
 
-            # --- HARD BLOCK 2: Doji Filter on last closed candle ---
+            # --- HARD BLOCK 2: Doji Filter on last closed candle (Breakout mode only; hammers are valid in capitulation) ---
             closed_range = last_high - last_low
-            if closed_range > 0:
+            if strategy_mode != 'capitulation' and closed_range > 0:
                 body_size = abs(last_close - last_open)
                 body_ratio = body_size / closed_range
                 doji_thresh = getattr(self.cfg, 'DOJI_MAX_BODY_RATIO', 0.15)
@@ -261,7 +263,7 @@ class MarketScanner:
             avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
             avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
             rs = avg_gain / avg_loss.replace(0, np.nan)
-            rsi = (100 - 100 / (1 + rs)).iloc[-1]
+            rsi = float((100 - 100 / (1 + rs)).fillna(50.0).iloc[-1])
 
             # Volume Ratio vs 20-candle MA
             vol_ma = vol.rolling(20).mean().iloc[-1]
@@ -272,61 +274,96 @@ class MarketScanner:
             rsi_score = 0.0
             vol_score = 0.0
             breakout_score = 0.0
+            breakout_atr_ratio = 0.0
             reasons = []
 
-            # 1. EMA Alignment
-            if ema9.iloc[-1] > ema21.iloc[-1] > ema50.iloc[-1]:
-                ema_score = 25.0
-                reasons.append("Perfect EMA alignment (9>21>50)")
-            elif ema9.iloc[-1] > ema21.iloc[-1]:
-                ema_score = 15.0
-                reasons.append("EMA9 > EMA21")
+            if strategy_mode == 'capitulation':
+                bb_mid = close.rolling(20).mean().iloc[-1]
+                bb_std = close.rolling(20).std().iloc[-1]
+                bb_low = bb_mid - 2.0 * bb_std if not np.isnan(bb_std) else last_close
+                stretch_pct = ((ema21.iloc[-1] - last_close) / last_close) * 100.0 if last_close > 0 else 0.0
+                breakout_atr_ratio = (stretch_pct / atr_pct) if atr_pct > 0 else 0.0
 
-            # 2. Smooth Dynamic RSI Scoring Band: reward true breakout momentum (55-68)
-            if 55 <= rsi <= 68:
-                rsi_score = 25.0
-                reasons.append(f"RSI momentum sweet spot ({rsi:.1f})")
-            elif 48 <= rsi < 55:
-                rsi_score = 15.0
-                reasons.append(f"RSI building ({rsi:.1f})")
-            elif 68 < rsi <= 73:
-                rsi_score = 10.0
-                reasons.append(f"RSI strong but extended ({rsi:.1f})")
-            elif 73 < rsi <= 75:
-                rsi_score = 0.0
-                reasons.append(f"RSI approaching overbought ({rsi:.1f})")
-            elif rsi > 75:
-                rsi_score = -20.0
-                reasons.append(f"RSI overbought ({rsi:.1f})")
-            else:
-                rsi_score = -15.0
-                reasons.append(f"RSI weak ({rsi:.1f})")
-
-            # 3. Volume Surge
-            if vol_ratio >= 2.0:
-                vol_score = 25.0
-                reasons.append(f"Huge volume surge ({vol_ratio:.1f}x)")
-            elif vol_ratio >= 1.5:
-                vol_score = 15.0
-                reasons.append(f"Solid volume ({vol_ratio:.1f}x)")
-            elif vol_ratio < 1.0:
-                vol_score = -10.0
-                reasons.append(f"Low volume ({vol_ratio:.1f}x)")
-
-            # 4. Volatility-Adjusted Breakout Quality (20 bars before the breakout candle)
-            recent_20_high = high.iloc[-21:-1].max() if len(high) >= 22 else high.max()
-            breakout_atr_ratio = 0.0
-
-            if last_close > recent_20_high:
-                breakout_dist = last_close - recent_20_high
-                breakout_atr_ratio = (breakout_dist / atr_val) if atr_val > 0 else 0.0
-
-                if breakout_atr_ratio >= 0.2:
-                    breakout_score = 25.0
-                    reasons.append(f"Clean 20-bar breakout (dist={breakout_atr_ratio:.2f} ATR)")
+                is_bull = last_close >= (ema200.iloc[-1] * 0.992)
+                if tf == '15m':
+                    rsi_bull, st_bull, vr_bull = 25.0, 2.0, 1.5
+                    rsi_bear, st_bear, vr_bear = 20.0, 3.2, 2.0
                 else:
-                    breakout_score = 10.0
-                    reasons.append("Minor breakout")
+                    rsi_bull, st_bull, vr_bull = 26.0, 2.0, 1.5
+                    rsi_bear, st_bear, vr_bear = 20.0, 4.0, 2.0
+
+                if last_close <= bb_low and rsi <= rsi_bear and stretch_pct >= st_bear and vol_ratio >= vr_bear:
+                    ema_score = 30.0
+                    rsi_score = 30.0
+                    vol_score = 25.0
+                    reasons.append(f"Extreme capitulation (RSI={rsi:.1f}, Stretch=-{stretch_pct:.2f}%, Vol={vol_ratio:.1f}x)")
+                elif is_bull and last_close <= bb_low and rsi <= rsi_bull and stretch_pct >= st_bull and vol_ratio >= vr_bull:
+                    ema_score = 28.0
+                    rsi_score = 25.0
+                    vol_score = 25.0
+                    reasons.append(f"Bull-regime oversold flush (RSI={rsi:.1f}, Stretch=-{stretch_pct:.2f}%, Vol={vol_ratio:.1f}x)")
+                elif last_close <= bb_low and rsi <= 28.0 and stretch_pct >= 1.5 and vol_ratio >= 1.2:
+                    ema_score = 22.0
+                    rsi_score = 20.0
+                    vol_score = 20.0
+                    reasons.append(f"Moderate oversold flush (RSI={rsi:.1f}, Stretch=-{stretch_pct:.2f}%, Vol={vol_ratio:.1f}x)")
+                else:
+                    ema_score = 10.0
+                    rsi_score = 10.0
+                    reasons.append(f"No capitulation setup (RSI={rsi:.1f}, Stretch=-{stretch_pct:.2f}%)")
+            else:
+                # 1. EMA Alignment
+                if ema9.iloc[-1] > ema21.iloc[-1] > ema50.iloc[-1]:
+                    ema_score = 25.0
+                    reasons.append("Perfect EMA alignment (9>21>50)")
+                elif ema9.iloc[-1] > ema21.iloc[-1]:
+                    ema_score = 15.0
+                    reasons.append("EMA9 > EMA21")
+
+                # 2. Smooth Dynamic RSI Scoring Band: reward true breakout momentum (55-68)
+                if 55 <= rsi <= 68:
+                    rsi_score = 25.0
+                    reasons.append(f"RSI momentum sweet spot ({rsi:.1f})")
+                elif 48 <= rsi < 55:
+                    rsi_score = 15.0
+                    reasons.append(f"RSI building ({rsi:.1f})")
+                elif 68 < rsi <= 73:
+                    rsi_score = 10.0
+                    reasons.append(f"RSI strong but extended ({rsi:.1f})")
+                elif 73 < rsi <= 75:
+                    rsi_score = 0.0
+                    reasons.append(f"RSI approaching overbought ({rsi:.1f})")
+                elif rsi > 75:
+                    rsi_score = -20.0
+                    reasons.append(f"RSI overbought ({rsi:.1f})")
+                else:
+                    rsi_score = -15.0
+                    reasons.append(f"RSI weak ({rsi:.1f})")
+
+                # 3. Volume Surge
+                if vol_ratio >= 2.0:
+                    vol_score = 25.0
+                    reasons.append(f"Huge volume surge ({vol_ratio:.1f}x)")
+                elif vol_ratio >= 1.5:
+                    vol_score = 15.0
+                    reasons.append(f"Solid volume ({vol_ratio:.1f}x)")
+                elif vol_ratio < 1.0:
+                    vol_score = -10.0
+                    reasons.append(f"Low volume ({vol_ratio:.1f}x)")
+
+                # 4. Volatility-Adjusted Breakout Quality (20 bars before the breakout candle)
+                recent_20_high = high.iloc[-21:-1].max() if len(high) >= 22 else high.max()
+
+                if last_close > recent_20_high:
+                    breakout_dist = last_close - recent_20_high
+                    breakout_atr_ratio = (breakout_dist / atr_val) if atr_val > 0 else 0.0
+
+                    if breakout_atr_ratio >= 0.2:
+                        breakout_score = 25.0
+                        reasons.append(f"Clean 20-bar breakout (dist={breakout_atr_ratio:.2f} ATR)")
+                    else:
+                        breakout_score = 10.0
+                        reasons.append("Minor breakout")
 
             # 5. Orderbook Boost
             if ob_score > 0:

@@ -136,8 +136,10 @@ class ScannerEngine:
                     else:
                         del self._symbol_cooldowns[symbol]
 
-            # 1. Enforce BTC Market Regime: never enter during a bearish regime
-            if btc_status == "BEARISH":
+            # 1. Enforce BTC Market Regime: in BEARISH regime, only allow Extreme Capitulation (>= high_thresh)
+            if btc_status == "BEARISH" and not (
+                getattr(cfg, 'STRATEGY_MODE', 'capitulation') == 'capitulation' and score >= high_thresh
+            ):
                 log.info(f"[SCANNER ENGINE] BTC regime BEARISH - skipping entry for {symbol} (score {score:.0f})")
                 continue
 
@@ -297,7 +299,10 @@ class ScannerEngine:
                             self.risk_mgr.close_position(symbol, exit_px, f"OCO_{reason}")
                             with self._state_lock:
                                 self._active_symbols.discard(symbol)
-                                self._symbol_cooldowns[symbol] = time.time() + getattr(cfg, 'SYMBOL_COOLDOWN_SEC', 3600)
+                                cd_sec = getattr(cfg, 'SYMBOL_COOLDOWN_SEC', 3600)
+                                if reason == "STOP_LOSS" and getattr(cfg, 'STRATEGY_MODE', 'capitulation') == 'capitulation':
+                                    cd_sec = max(cd_sec, 14400)
+                                self._symbol_cooldowns[symbol] = time.time() + cd_sec
                             self.notifier.trade_closed(symbol, f"OCO_{reason}", pos.entry_price, exit_px, pnl_pct)
                             continue
                         log.warning(f"[OCO] {symbol}: OCO is no longer open but no filled SELL was found - "
@@ -334,11 +339,13 @@ class ScannerEngine:
             with self._state_lock:
                 self._active_symbols.discard(symbol)
 
-            # F-10: Set Symbol Cooldown under lock
+            # F-10: Set Symbol Cooldown under lock (4h after STOP_LOSS in capitulation mode)
             cooldown_sec = getattr(cfg, 'SYMBOL_COOLDOWN_SEC', 3600)
+            if "STOP_LOSS" in str(reason) and getattr(cfg, 'STRATEGY_MODE', 'capitulation') == 'capitulation':
+                cooldown_sec = max(cooldown_sec, 14400)
             with self._state_lock:
                 self._symbol_cooldowns[symbol] = time.time() + cooldown_sec
-            log.info(f"[COOLDOWN SET] {symbol} placed on 1h cooldown after trade close")
+            log.info(f"[COOLDOWN SET] {symbol} placed on {cooldown_sec // 60}m cooldown after trade close ({reason})")
 
             self.notifier.trade_closed(symbol, reason, pos.entry_price, exit_price, pnl_pct)
 

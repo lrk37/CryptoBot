@@ -275,10 +275,13 @@ class RiskManager:
 
         # F-09: Acquire lock before mutating shared Position state
         with self._lock:
+            state_dirty = False
             if current_price > position.highest_price:
                 position.highest_price = current_price
+                state_dirty = True
             if current_price < position.lowest_price or position.lowest_price == 0.0:
                 position.lowest_price = current_price
+                state_dirty = True
 
             trig = exit_triggers(self.cfg)
             fees_pct = trig['fees_pct']
@@ -290,7 +293,11 @@ class RiskManager:
                     if min_be > position.stop_loss:
                         position.min_be_price = min_be
                         position.stop_loss = min_be
+                        state_dirty = True
                         log.info(f"[BREAK-EVEN] {position.symbol} raised SL to fee-aware break-even {min_be:.6f}")
+
+            if state_dirty:
+                self._save_positions()
 
             # Read position fields under lock for evaluation
             sl = position.stop_loss
@@ -319,6 +326,13 @@ class RiskManager:
             if peak_profit_pct >= fee_adjusted_trigger and drop_pct >= trailing_offset:
                 return "TRAILING_STOP"
 
+        # 3b. Mean-reversion profit-take when price reclaims EMA21 with >= 1.2% gain
+        if kind == "scanner" and getattr(self.cfg, 'STRATEGY_MODE', 'capitulation') == 'capitulation':
+            if entry_price > 0 and ((current_price - entry_price) / entry_price) * 100.0 >= 1.2:
+                if self._closed_above_ema21(symbol):
+                    log.info(f"[EMA21 REVERSION TP] {symbol} reclaimed EMA21 in profit -> closing")
+                    return "TAKE_PROFIT"
+
         # 4. Trend invalidation / max-hold exit (scanner positions only)
         if kind == "scanner":
             max_hold = getattr(self.cfg, 'MAX_SCANNER_HOLD_HOURS', 8) * 3600
@@ -335,6 +349,22 @@ class RiskManager:
                 return "TREND_INVALIDATED"
 
         return "HOLD"
+
+    def _closed_above_ema21(self, symbol: str) -> bool:
+        """True if the last CLOSED candle closed at or above its EMA21."""
+        if not self.exchange:
+            return False
+        try:
+            span = int(getattr(self.cfg, 'EMA_SLOW', 21))
+            interval = getattr(self.cfg, 'SCANNER_INTERVAL', '15m')
+            df = self.exchange.get_candles(symbol, interval=interval, limit=max(60, span * 3))
+            closed = df.iloc[:-1]
+            if len(closed) < span + 2:
+                return False
+            ema = closed['close'].ewm(span=span, adjust=False).mean().iloc[-1]
+            return float(closed['close'].iloc[-1]) >= float(ema)
+        except Exception:
+            return False
 
     def _closed_below_ema21(self, symbol: str) -> bool:
         """True if the last CLOSED 15m candle closed below its EMA21. Any data problem -> False (hold)."""

@@ -154,6 +154,11 @@ class StrategyBacktester:
         ema9 = close.ewm(span=9, adjust=False).mean()
         ema21 = close.ewm(span=21, adjust=False).mean()
         ema50 = close.ewm(span=50, adjust=False).mean()
+        ema200 = close.ewm(span=200, adjust=False).mean()
+        bb_mid = close.rolling(20).mean()
+        bb_std = close.rolling(20).std()
+        bb_low_series = bb_mid - 2.0 * bb_std
+        strategy_mode = getattr(cfg, 'STRATEGY_MODE', 'capitulation')
 
         tr = pd.concat([
             high - low,
@@ -168,7 +173,7 @@ class StrategyBacktester:
         avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
         avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
         rs = avg_gain / avg_loss.replace(0, np.nan)
-        rsi_series = 100 - (100 / (1 + rs))
+        rsi_series = (100 - (100 / (1 + rs))).fillna(50.0)
 
         vol_ma = vol.rolling(20).mean()
 
@@ -195,34 +200,44 @@ class StrategyBacktester:
             low_price = curr_bar['low']
             close_price = curr_bar['close']
 
+            # Snapshot pre-bar stop and peak before updating with current bar's range
+            # (prevents same-bar lookahead where a green candle's high arms BE/trailing
+            # and retroactively stops out against the same candle's starting low/open).
+            prev_sl = position['stop_loss']
+            prev_highest = position['highest']
+
             if high_price > position['highest']:
                 position['highest'] = high_price
             if low_price < position['lowest']:
                 position['lowest'] = low_price
 
-            # Break-even (the raised stop applies within the same bar = worst-case ordering)
+            prev_peak_gain = (prev_highest - position['entry_price']) / position['entry_price']
             peak_gain = (position['highest'] - position['entry_price']) / position['entry_price']
-            if be_enabled and peak_gain >= be_trigger and not position['be_activated']:
-                min_be = position['entry_price'] * (1 + be_stop_pct)
-                if min_be > position['stop_loss']:
-                    position['stop_loss'] = min_be
-                    position['be_activated'] = True
 
             exit_price = None
             reason = None
 
-            if low_price <= position['stop_loss']:                      # 1. Stop loss (checked first: conservative)
-                exit_price = min(position['stop_loss'], curr_bar['open'])
+            if low_price <= prev_sl:                                    # 1. Stop loss active at bar open (conservative)
+                exit_price = min(prev_sl, curr_bar['open'])
                 reason = "STOP_LOSS"
             elif high_price >= position['take_profit']:                 # 2. Take profit
                 exit_price = max(position['take_profit'], curr_bar['open'])
                 reason = "TAKE_PROFIT"
             else:
-                if trailing_enabled and peak_gain >= trail_trigger:     # 3. Trailing stop
-                    trail_level = position['highest'] * (1 - trailing_offset)
+                if trailing_enabled and prev_peak_gain >= trail_trigger:  # 3a. Trailing stop armed on prior bar
+                    trail_level = prev_highest * (1 - trailing_offset)
                     if low_price <= trail_level:
                         exit_price = min(trail_level, curr_bar['open'])
                         reason = "TRAILING_STOP"
+                if exit_price is None and trailing_enabled and peak_gain >= trail_trigger:  # 3b. Same-bar peak reversal by close
+                    curr_trail_level = position['highest'] * (1 - trailing_offset)
+                    if close_price <= curr_trail_level:
+                        exit_price = curr_trail_level
+                        reason = "TRAILING_STOP"
+                if exit_price is None and strategy_mode == 'capitulation' and bars_held >= 1:  # 3c. EMA21 reversion profit-take
+                    if close_price >= ema21.iloc[i] and close_price >= position['entry_price'] * 1.012:
+                        exit_price = close_price
+                        reason = "TAKE_PROFIT"
                 if exit_price is None and bars_held >= max_hold_bars:   # 4. Trend invalidation / hard timeout
                     if bars_held >= 2 * max_hold_bars:
                         exit_price = close_price
@@ -230,6 +245,13 @@ class StrategyBacktester:
                     elif close_price < ema21.iloc[i]:
                         exit_price = close_price
                         reason = "TREND_INVALIDATED"
+
+            # Arm Break-Even at end of bar if position remains open (covers round-trip fees + slippage)
+            if exit_price is None and be_enabled and peak_gain >= be_trigger and not position['be_activated']:
+                min_be = position['entry_price'] * (1 + be_stop_pct + 2 * self.slippage_pct)
+                if min_be > position['stop_loss']:
+                    position['stop_loss'] = min_be
+                    position['be_activated'] = True
 
             if exit_price is not None:
                 # Apply exit slippage & fees
@@ -268,7 +290,10 @@ class StrategyBacktester:
                 })
 
                 position = None
-                cooldown_until_idx = i + int(60 / self._bar_minutes)  # 1-hour cooldown
+                if strategy_mode == 'capitulation' and reason == 'STOP_LOSS':
+                    cooldown_until_idx = i + 16
+                else:
+                    cooldown_until_idx = i + max(4, int(60 / self._bar_minutes))
 
         for i in range(max(start_bar, 55), len(df)):
             curr_bar = df.iloc[i]
@@ -305,60 +330,92 @@ class StrategyBacktester:
                 p_open = open_p.iloc[i-1]
                 p_vol = vol.iloc[i-1]
 
-                # Hard Block: Doji filter
-                c_range = p_high - p_low
-                if c_range > 0 and (abs(p_close - p_open) / c_range) < 0.15:
-                    continue
+                if strategy_mode == 'capitulation':
+                    bb_low_val = bb_low_series.iloc[i-1]
+                    if np.isnan(bb_low_val) or p_close > bb_low_val:
+                        continue
 
-                # Hard Block: EMA9 slope
-                ema9_val = ema9.iloc[i-1]
-                ema9_prev = ema9.iloc[i-3]
-                if (ema9_val - ema9_prev) / ema9_prev < -0.001:
-                    continue
+                    rsi_val = rsi_series.iloc[i-1]
+                    v_ma = vol_ma.iloc[i-1]
+                    v_ratio = p_vol / v_ma if (not np.isnan(v_ma) and v_ma > 0) else 1.0
+                    stretch_pct = ((ema21.iloc[i-1] - p_close) / p_close) * 100.0 if p_close > 0 else 0.0
+                    is_bull = p_close >= (ema200.iloc[i-1] * 0.992)
 
-                # Scoring rules (same as scanner.py, minus order-book / pump-penalty components)
-                score = 0.0
-                # 1. EMA alignment
-                if ema9.iloc[i-1] > ema21.iloc[i-1] > ema50.iloc[i-1]:
-                    score += 25.0
-                elif ema9.iloc[i-1] > ema21.iloc[i-1]:
-                    score += 15.0
-
-                # 2. RSI band: reward true breakout momentum (55-68) instead of sluggish consolidation
-                rsi_val = rsi_series.iloc[i-1]
-                if 55 <= rsi_val <= 68:
-                    score += 25.0
-                elif 48 <= rsi_val < 55:
-                    score += 15.0
-                elif 68 < rsi_val <= 73:
-                    score += 10.0
-                elif rsi_val > 75:
-                    score -= 20.0
-                else:
-                    score -= 15.0
-
-                # 3. Volume surge
-                v_ma = vol_ma.iloc[i-1]
-                v_ratio = p_vol / v_ma if (not np.isnan(v_ma) and v_ma > 0) else 1.0
-                if v_ratio >= 2.0:
-                    score += 25.0
-                elif v_ratio >= 1.5:
-                    score += 15.0
-                elif v_ratio < 1.0:
-                    score -= 10.0
-
-                # 4. Breakout
-                recent_20_h = high.iloc[i-21:i-1].max()
-                if p_close > recent_20_h:
-                    b_dist = p_close - recent_20_h
-                    b_ratio = b_dist / atr_val
-                    if b_ratio >= 0.2:
-                        score += 25.0
+                    if interval == '15m':
+                        rsi_bull, st_bull, vr_bull = 25.0, 2.0, 1.5
+                        rsi_bear, st_bear, vr_bear = 20.0, 3.2, 2.0
                     else:
-                        score += 10.0
+                        rsi_bull, st_bull, vr_bull = 26.0, 2.0, 1.5
+                        rsi_bear, st_bear, vr_bear = 20.0, 4.0, 2.0
 
-                if score < self.min_score:
-                    continue
+                    if rsi_val <= rsi_bear and stretch_pct >= st_bear and v_ratio >= vr_bear:
+                        score = 85.0
+                    elif is_bull and rsi_val <= rsi_bull and stretch_pct >= st_bull and v_ratio >= vr_bull:
+                        score = 78.0
+                    elif rsi_val <= 28.0 and stretch_pct >= 1.5 and v_ratio >= 1.2:
+                        score = 62.0
+                    else:
+                        score = 20.0
+
+                    if score < self.min_score:
+                        continue
+                else:
+                    # Hard Block: Doji filter
+                    c_range = p_high - p_low
+                    if c_range > 0 and (abs(p_close - p_open) / c_range) < 0.15:
+                        continue
+
+                    # Hard Block: EMA9 slope
+                    ema9_val = ema9.iloc[i-1]
+                    ema9_prev = ema9.iloc[i-3]
+                    if (ema9_val - ema9_prev) / ema9_prev < -0.001:
+                        continue
+
+                    # Scoring rules (same as scanner.py, minus order-book / pump-penalty components)
+                    score = 0.0
+                    # 1. EMA alignment
+                    if ema9.iloc[i-1] > ema21.iloc[i-1] > ema50.iloc[i-1]:
+                        score += 25.0
+                    elif ema9.iloc[i-1] > ema21.iloc[i-1]:
+                        score += 15.0
+
+                    # 2. RSI band: reward true breakout momentum (55-68) instead of sluggish consolidation
+                    rsi_val = rsi_series.iloc[i-1]
+                    if 55 <= rsi_val <= 68:
+                        score += 25.0
+                    elif 48 <= rsi_val < 55:
+                        score += 15.0
+                    elif 68 < rsi_val <= 73:
+                        score += 10.0
+                    elif 73 < rsi_val <= 75:
+                        score += 0.0
+                    elif rsi_val > 75:
+                        score -= 20.0
+                    else:
+                        score -= 15.0
+
+                    # 3. Volume surge
+                    v_ma = vol_ma.iloc[i-1]
+                    v_ratio = p_vol / v_ma if (not np.isnan(v_ma) and v_ma > 0) else 1.0
+                    if v_ratio >= 2.0:
+                        score += 25.0
+                    elif v_ratio >= 1.5:
+                        score += 15.0
+                    elif v_ratio < 1.0:
+                        score -= 10.0
+
+                    # 4. Breakout
+                    recent_20_h = high.iloc[i-21:i-1].max()
+                    if p_close > recent_20_h:
+                        b_dist = p_close - recent_20_h
+                        b_ratio = b_dist / atr_val
+                        if b_ratio >= 0.2:
+                            score += 25.0
+                        else:
+                            score += 10.0
+
+                    if score < self.min_score:
+                        continue
 
             # Enter at next bar's open with entry slippage
             entry_market_price = curr_bar['open']

@@ -99,7 +99,7 @@ def run_walk_forward(args):
     df = fetch_historical_candles(sym, interval=interval, days=days, refresh=refresh)
 
     bpd       = _bpd(interval)
-    warmup    = 100                              # bars for indicator convergence
+    warmup    = 200                              # bars for indicator convergence (EMA200/BB/RSI)
     test_bars = test_d * bpd
 
     print(f'[+] {len(df)} bars loaded | {bpd} bars/day | Window: {test_d}d ({test_bars} bars)')
@@ -239,8 +239,12 @@ def run_walk_forward(args):
         profitable = sum(1 for e in agg['ex'] if e > 0)
         consist    = profitable / n
 
+        finite_pf = [x for x in agg['pf'] if np.isfinite(x)]
+        pf_mean = float(np.mean(finite_pf)) if finite_pf else float('inf')
+        pf_std  = float(np.std(finite_pf)) if finite_pf else 0.0
+
         print(f'\n  FOLD-BY-FOLD DISPERSION ({n} folds with trades):')
-        print(f'    Mean PF (folds)  : {np.mean(agg["pf"]):.2f} ± {np.std(agg["pf"]):.2f}')
+        print(f'    Mean PF (folds)  : {pf_mean:.2f} ± {pf_std:.2f}')
         print(f'    Mean Sharpe      : {np.mean(agg["sh"]):.2f} ± {np.std(agg["sh"]):.2f}')
         print(f'    Mean Sortino     : {np.mean(agg["so"]):.2f} ± {np.std(agg["so"]):.2f}')
         print(f'    Mean Expectancy  : {np.mean(agg["ex"]):+.2f}% ± {np.std(agg["ex"]):.2f}%')
@@ -254,9 +258,15 @@ def run_walk_forward(args):
             label = 'LOW ✗   — failing out of sample, no consistent edge'
         print(f'    Consistency      : {label}')
 
-        aggregate = {k: {'mean': round(float(np.mean(v)), 4),
-                         'std':  round(float(np.std(v)), 4)}
-                     for k, v in agg.items() if v}
+        aggregate = {}
+        for k, v in agg.items():
+            if not v:
+                continue
+            vals = [x for x in v if np.isfinite(x)]
+            aggregate[k] = {
+                'mean': round(float(np.mean(vals)), 4) if vals else None,
+                'std':  round(float(np.std(vals)), 4) if vals else None,
+            }
         aggregate['profitable_folds'] = f'{profitable}/{n}'
     else:
         print('\n  No trades in any fold — the strategy took 0 trades.')
@@ -311,11 +321,13 @@ def simulate_portfolio(all_trades: list, initial_capital: float = 1000.0,
 
         exited.sort(key=lambda p: p['exit_time'])
         for pos in exited:
-            cash += pos['pnl_usdt']
-            equity_curve.append(cash)
+            cash += trade_size_usdt + pos['pnl_usdt']
+            open_notional = len(open_positions) * trade_size_usdt
+            equity_curve.append(cash + open_notional)
 
-        # Capacity check
+        # Capacity check (cash reflects unallocated capital)
         if len(open_positions) < max_positions and cash >= trade_size_usdt:
+            cash -= trade_size_usdt
             open_positions.append(t)
             trades_taken += 1
         else:
@@ -323,9 +335,11 @@ def simulate_portfolio(all_trades: list, initial_capital: float = 1000.0,
 
     # Settle remaining positions in chronological order
     open_positions.sort(key=lambda p: p['exit_time'])
-    for pos in open_positions:
-        cash += pos['pnl_usdt']
-        equity_curve.append(cash)
+    while open_positions:
+        pos = open_positions.pop(0)
+        cash += trade_size_usdt + pos['pnl_usdt']
+        open_notional = len(open_positions) * trade_size_usdt
+        equity_curve.append(cash + open_notional)
 
     net_profit = cash - initial_capital
     portfolio_return_pct = (net_profit / initial_capital) * 100.0

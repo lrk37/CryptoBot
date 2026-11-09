@@ -163,6 +163,8 @@ def evaluate_signals(df: pd.DataFrame, strategy: str, min_score: float = 60.0,
                 score += 15.0
             elif 68 < rsi_val <= 73:
                 score += 10.0
+            elif 73 < rsi_val <= 75:
+                score += 0.0
             elif rsi_val > 75:
                 score -= 20.0
             else:
@@ -293,12 +295,20 @@ class PortfolioSimulator:
         # 1. Precalculate indicators and signals for each symbol
         signals_by_sym = {}
         atr_by_sym = {}
+        ema21_by_sym = {}
         for idx, (sym, df) in enumerate(symbol_dfs.items()):
             sym_seed = random_seed + idx * 7919 if strategy == 'random' else 0
             signals_by_sym[sym] = evaluate_signals(
                 df, strategy, min_score=self.min_score,
                 random_prob=random_prob, random_seed=sym_seed)
             atr_by_sym[sym] = compute_atr(df['high'], df['low'], df['close'], 14)
+            ema21_by_sym[sym] = df['close'].ewm(span=21, adjust=False).mean()
+
+        trig = exit_triggers(cfg)
+        be_trigger = trig['be_trigger_pct'] / 100.0
+        trail_trigger = trig['trail_trigger_pct'] / 100.0
+        be_stop_pct = trig['fees_pct'] / 100.0
+        trail_offset = getattr(cfg, 'SCANNER_TRAILING_OFFSET', 1.8) / 100.0
 
         # 2. Extract and align all unique timestamps
         all_times = sorted(set().union(*[df.index for df in symbol_dfs.values()]))
@@ -324,38 +334,55 @@ class PortfolioSimulator:
                 bars_held = pos['bars_held'] + 1
                 pos['bars_held'] = bars_held
 
+                # Snapshot pre-bar stop and peak before updating with current bar's range
+                prev_sl = pos['stop_loss']
+                prev_highest = pos['highest']
+
                 if high > pos['highest']:
                     pos['highest'] = high
                 if low < pos['lowest']:
                     pos['lowest'] = low
 
-                # Break-even & trailing rules (if enabled)
-                if self.exit_cfg['be_enabled']:
-                    peak_gain = (pos['highest'] - pos['entry_price']) / pos['entry_price']
-                    if peak_gain >= 0.042 and not pos['be_activated']:
-                        pos['stop_loss'] = max(pos['stop_loss'], pos['entry_price'] * 1.002)
-                        pos['be_activated'] = True
+                prev_peak_gain = (prev_highest - pos['entry_price']) / pos['entry_price']
+                peak_gain = (pos['highest'] - pos['entry_price']) / pos['entry_price']
 
                 exit_price = None
                 reason = None
 
-                # Conservative intrabar: Stop-loss checked before Take-profit
-                if low <= pos['stop_loss']:
-                    exit_price = min(pos['stop_loss'], bar['open'])
+                # Conservative intrabar: Stop-loss active at bar open checked before Take-profit
+                if low <= prev_sl:
+                    exit_price = min(prev_sl, bar['open'])
                     reason = "STOP_LOSS"
                 elif high >= pos['take_profit']:
                     exit_price = max(pos['take_profit'], bar['open'])
                     reason = "TAKE_PROFIT"
-                elif self.exit_cfg['trail_enabled']:
-                    peak_gain = (pos['highest'] - pos['entry_price']) / pos['entry_price']
-                    if peak_gain >= 0.042:
-                        trail_level = pos['highest'] * (1 - 0.018)
+                else:
+                    if self.exit_cfg['trail_enabled'] and prev_peak_gain >= trail_trigger:
+                        trail_level = prev_highest * (1 - trail_offset)
                         if low <= trail_level:
                             exit_price = min(trail_level, bar['open'])
                             reason = "TRAILING_STOP"
-                elif bars_held >= self.max_hold_bars:
-                    exit_price = close
-                    reason = "HOLD_TIMEOUT"
+                    if exit_price is None and self.exit_cfg['trail_enabled'] and peak_gain >= trail_trigger:
+                        curr_trail_level = pos['highest'] * (1 - trail_offset)
+                        if close <= curr_trail_level:
+                            exit_price = curr_trail_level
+                            reason = "TRAILING_STOP"
+                    if exit_price is None and bars_held >= self.max_hold_bars:
+                        if self.exit_cfg['be_enabled']:  # Current Bot mode: EMA21 check after 8h, hard cap at 16h
+                            if bars_held >= 2 * self.max_hold_bars:
+                                exit_price = close
+                                reason = "HOLD_TIMEOUT"
+                            elif close < ema21_by_sym[sym].loc[curr_time]:
+                                exit_price = close
+                                reason = "TREND_INVALIDATED"
+                        else:
+                            exit_price = close
+                            reason = "HOLD_TIMEOUT"
+
+                # Arm Break-Even at end of bar if position remains open
+                if exit_price is None and self.exit_cfg['be_enabled'] and peak_gain >= be_trigger and not pos['be_activated']:
+                    pos['stop_loss'] = max(pos['stop_loss'], pos['entry_price'] * (1 + be_stop_pct + 2 * self.slippage_pct))
+                    pos['be_activated'] = True
 
                 if exit_price is not None:
                     to_close.append((sym, exit_price, curr_time, reason, bars_held))

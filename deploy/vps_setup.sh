@@ -13,6 +13,9 @@ APP_DIR="$HOME/CryptoBot"
 if [ ! -d "$APP_DIR" ]; then
     echo "Cloning repository from GitHub..."
     git clone https://github.com/lrk37/CryptoBot.git "$APP_DIR"
+else
+    echo "Updating existing repository from GitHub..."
+    cd "$APP_DIR" && git pull origin main
 fi
 cd "$APP_DIR"
 

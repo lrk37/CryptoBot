@@ -83,7 +83,7 @@ def update_forward_returns(exchange):
 
                     # Update 1h return if age >= 3600s
                     if r.get('price_1h') is None and age >= 3600 and base_price > 0:
-                        curr_p = exchange.get_current_price(sym)
+                        curr_p = exchange.get_price(sym)
                         if curr_p and curr_p > 0:
                             r['price_1h'] = curr_p
                             r['pnl_1h_pct'] = round(((curr_p - base_price) / base_price) * 100.0, 3)
@@ -91,18 +91,21 @@ def update_forward_returns(exchange):
 
                     # Update 4h return if age >= 14400s
                     if r.get('price_4h') is None and age >= 14400 and base_price > 0:
-                        curr_p = exchange.get_current_price(sym)
+                        curr_p = exchange.get_price(sym)
                         if curr_p and curr_p > 0:
                             r['price_4h'] = curr_p
                             r['pnl_4h_pct'] = round(((curr_p - base_price) / base_price) * 100.0, 3)
                             updated = True
 
                     new_lines.append(json.dumps(r) + "\n")
-                except Exception:
+                except Exception as line_err:
+                    log.debug(f"[SCAN LOGGER] Row update skipped: {line_err}")
                     new_lines.append(line + "\n")
 
         if updated:
-            with open(SCAN_LOG_FILE, 'w', encoding='utf-8') as f:
+            tmp_file = SCAN_LOG_FILE.with_suffix(".jsonl.tmp")
+            with open(tmp_file, 'w', encoding='utf-8') as f:
                 f.writelines(new_lines)
+            os.replace(tmp_file, SCAN_LOG_FILE)
     except Exception as e:
         log.warning(f"[SCAN LOGGER] Failed updating forward returns: {e}")

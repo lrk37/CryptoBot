@@ -149,11 +149,13 @@ class TestRiskManager(InTempDir):
         self.assertEqual(rm.evaluate(self.pos(9), 100.0), "HOLD")                 # data problem: hold, don't panic-sell
 
     def test_break_even_arms_at_effective_trigger(self):
+        from risk_manager import exit_triggers
         rm, cfg = self.make_rm()
+        trig = exit_triggers(cfg)["be_trigger_pct"]
         p = self.pos(0.1)
-        rm.evaluate(p, 103.9)
+        rm.evaluate(p, 100.0 + trig - 0.2)
         self.assertEqual(p.min_be_price, 0.0)
-        rm.evaluate(p, 104.3)
+        rm.evaluate(p, 100.0 + trig + 0.2)
         self.assertGreater(p.min_be_price, 0.0)
 
     def test_trade_log_has_net_fields(self):
@@ -404,6 +406,28 @@ class TestBacktest(unittest.TestCase):
         base = self.bt.random_baseline("SYN", self.df, t.trades, n_runs=3, capital=1000, trade_size=1000, min_score=60, seed=1)
         self.assertEqual(base["runs"], 3)
         self.assertGreater(np.mean(base["counts"]), 0.3 * len(t.trades))
+
+    def test_green_candle_rallies_to_tp_without_false_be_stopout(self):
+        """A green candle opening at entry ($100) and rallying straight to TP ($107)
+        must hit TAKE_PROFIT, not falsely trigger a same-bar break-even STOP_LOSS at $100."""
+        n = 120
+        idx = pd.date_range("2026-07-01", periods=n, freq="15min", tz="UTC")
+        base = np.full(n, 100.0)
+        df = pd.DataFrame({
+            "open": base, "high": base + 0.5, "low": base - 0.5, "close": base,
+            "volume": 100.0, "quote_vol": 10000.0
+        }, index=idx)
+        # Bar 55: enters at open=100.0, low=100.0 (never drops below entry), rallies to 107.0 (above TP)
+        df.iloc[55, df.columns.get_loc("open")] = 100.0
+        df.iloc[55, df.columns.get_loc("low")] = 100.0
+        df.iloc[55, df.columns.get_loc("high")] = 107.0
+        df.iloc[55, df.columns.get_loc("close")] = 106.5
+
+        t = self.bt.StrategyBacktester(initial_capital=1000, trade_size_usdt=100)
+        t.run("RALLY", df, entry_mode="random", random_prob=1.0, seed=1)
+        self.assertGreater(len(t.trades), 0)
+        self.assertEqual(t.trades[0]["reason"], "TAKE_PROFIT")
+        self.assertGreater(t.trades[0]["pnl_usdt"], 0.0)
 
 
 # =============================================================== accounting & portfolio tests

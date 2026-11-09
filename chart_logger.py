@@ -32,6 +32,9 @@ def _calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['ema21'] = close.ewm(span=21, adjust=False).mean()
     df['ema50'] = close.ewm(span=50, adjust=False).mean()
     df['high20'] = high.shift(1).rolling(window=20).max()
+    bb_mid = close.rolling(20).mean()
+    bb_std = close.rolling(20).std()
+    df['bb_low'] = bb_mid - 2.0 * bb_std
 
     # F-21: Use EWM-based RSI to match scanner and strategy calculations
     delta = close.diff()
@@ -69,12 +72,13 @@ def save_trade_chart(symbol: str, df: pd.DataFrame, entry_price: float, exit_pri
         fig.suptitle(f"{symbol} Trade Result: {pnl_pct:+.2f}% (${pnl_usdt:+.4f}) | Exit: {exit_reason}",
                      color=title_color, fontsize=14, fontweight='bold')
 
-        # Panel 1: Price, EMAs, 20-bar High, SL, TP, Entry, Exit
+        # Panel 1: Price, EMAs, Lower BB, 20-bar High, SL, TP, Entry, Exit
         ax1.plot(df_ind.index, df_ind['close'], label='Price', color='white', linewidth=1.5)
         ax1.plot(df_ind.index, df_ind['ema9'], label='EMA9', color='#00FFFF', linewidth=1)
         ax1.plot(df_ind.index, df_ind['ema21'], label='EMA21', color='#FF00FF', linewidth=1)
         ax1.plot(df_ind.index, df_ind['ema50'], label='EMA50', color='#FFA500', linewidth=1, linestyle=':')
-        ax1.plot(df_ind.index, df_ind['high20'], label='20-bar High', color='#ADFF2F', linewidth=1, linestyle='--')
+        ax1.plot(df_ind.index, df_ind['bb_low'], label='Lower BB(20,2)', color='#00FA9A', linewidth=1, linestyle='--')
+        ax1.plot(df_ind.index, df_ind['high20'], label='20-bar High', color='#ADFF2F', linewidth=0.8, linestyle=':')
 
         ax1.axhline(y=entry_price, color='#FFD700', linestyle='--', label=f'Entry: {entry_price:.4f}')
         ax1.axhline(y=exit_price, color='#00BFFF', linestyle=':', label=f'Exit: {exit_price:.4f}')
