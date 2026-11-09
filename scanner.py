@@ -40,6 +40,7 @@ class ScanResult:
     breakout_score: float = 0.0
     ob_score: float = 0.0
     candidate_type: str = "standard"
+    timeframe: str = "15m"
 
 
 class MarketScanner:
@@ -138,7 +139,7 @@ class MarketScanner:
             if res and res.score >= getattr(self.cfg, 'MIN_SCORE_TO_TRADE', 60):
                 results.append(res)
 
-        results.sort(key=lambda x: (x.score, x.breakout_atr_ratio, x.volume_ratio), reverse=True)
+        results.sort(key=lambda x: x.score, reverse=True)
         top_n = getattr(self.cfg, 'SCANNER_TOP_N', 3)
         final_results = results[:top_n]
 
@@ -150,9 +151,25 @@ class MarketScanner:
         return final_results
 
     def _analyze_symbol(self, symbol: str) -> Optional[ScanResult]:
+        default_tf = getattr(self.cfg, 'SCANNER_INTERVAL', '15m')
+        dual_tf = getattr(self.cfg, 'ENABLE_DUAL_TIMEFRAME', True)
+        one_hour_only = set(getattr(self.cfg, 'ONE_HOUR_ONLY_SYMBOLS', []))
+        min_score = getattr(self.cfg, 'MIN_SCORE_TO_TRADE', 75)
+
+        if dual_tf and symbol in one_hour_only:
+            return self._analyze_symbol_tf(symbol, '1h')
+
+        res = self._analyze_symbol_tf(symbol, default_tf)
+        if dual_tf and default_tf == '15m' and (res is None or res.score < min_score):
+            if res is None or res.pct_change_24h <= -1.5:
+                res_1h = self._analyze_symbol_tf(symbol, '1h')
+                if res_1h and res_1h.score >= min_score:
+                    return res_1h
+        return res
+
+    def _analyze_symbol_tf(self, symbol: str, tf: str) -> Optional[ScanResult]:
         try:
-            tf = getattr(self.cfg, 'SCANNER_INTERVAL', '15m')
-            limit = getattr(self.cfg, 'SCANNER_CANDLE_LIMIT', 100)
+            limit = getattr(self.cfg, 'SCANNER_CANDLE_LIMIT', 250)
             df = self.exchange.get_candles(symbol, interval=tf, limit=limit)
 
             if df is None or len(df) < 50:
@@ -178,9 +195,10 @@ class MarketScanner:
             last_low = low.iloc[-1]
             last_closed_time = int(df_closed.index[-1].timestamp())
 
-            # 24h Percentage Change calculation
-            if len(close) >= 96:
-                pct_24h = ((last_close - close.iloc[-96]) / close.iloc[-96]) * 100.0
+            # 24h Percentage Change calculation (24 bars on 1h, 96 bars on 15m)
+            bars_24h = 24 if tf == '1h' else 96
+            if len(close) >= bars_24h:
+                pct_24h = ((last_close - close.iloc[-bars_24h]) / close.iloc[-bars_24h]) * 100.0
             else:
                 pct_24h = 0.0
 
@@ -395,7 +413,8 @@ class MarketScanner:
                 rsi_score=rsi_score,
                 vol_score=vol_score,
                 breakout_score=breakout_score,
-                ob_score=ob_score
+                ob_score=ob_score,
+                timeframe=tf
             )
 
         except Exception as e:

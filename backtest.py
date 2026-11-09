@@ -177,6 +177,45 @@ class StrategyBacktester:
 
         vol_ma = vol.rolling(20).mean()
 
+        # Optional Dual-Timeframe (1h + 15m) precomputation when running on 15m candles
+        dual_tf = getattr(cfg, 'ENABLE_DUAL_TIMEFRAME', True) and strategy_mode == 'capitulation' and interval == '15m'
+        one_hour_only = set(getattr(cfg, 'ONE_HOUR_ONLY_SYMBOLS', []))
+        df_1h = None
+        ema21_1h_aligned = None
+        if dual_tf and isinstance(df.index, pd.DatetimeIndex):
+            df_1h = df.resample('1h').agg({
+                'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+            }).dropna()
+            if len(df_1h) >= 30:
+                c1 = df_1h['close']
+                h1 = df_1h['high']
+                l1 = df_1h['low']
+                v1 = df_1h['volume']
+                e21_1 = c1.ewm(span=21, adjust=False).mean()
+                e200_1 = c1.ewm(span=200, adjust=False).mean()
+                bb_low_1 = c1.rolling(20).mean() - 2.0 * c1.rolling(20).std()
+                tr1 = pd.concat([h1 - l1, (h1 - c1.shift()).abs(), (l1 - c1.shift()).abs()], axis=1).max(axis=1)
+                atr1 = tr1.rolling(14).mean()
+                d1 = c1.diff()
+                g1 = d1.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+                ls1 = (-d1.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+                rsi1 = (100 - (100 / (1 + g1 / ls1.replace(0, np.nan)))).fillna(50.0)
+                vr1 = v1 / v1.rolling(20).mean().replace(0, np.nan)
+                st1 = ((e21_1 - c1) / c1) * 100.0
+                bull1 = c1 >= (e200_1 * 0.992)
+                s1 = np.where((c1 <= bb_low_1) & (rsi1 <= 20.0) & (st1 >= 4.0) & (vr1 >= 2.0), 85.0,
+                     np.where(bull1 & (c1 <= bb_low_1) & (rsi1 <= 26.0) & (st1 >= 2.0) & (vr1 >= 1.5), 78.0,
+                     np.where((c1 <= bb_low_1) & (rsi1 <= 28.0) & (st1 >= 1.5) & (vr1 >= 1.2), 62.0, 20.0)))
+                df_1h['score'] = s1
+                df_1h['atr'] = atr1
+                df_1h['ema21'] = e21_1
+                # Shift 1h index by +1h before ffill so 15m bars only see already-closed 1h EMA21
+                e21_closed = e21_1.copy()
+                e21_closed.index = e21_closed.index + pd.Timedelta(hours=1)
+                ema21_1h_aligned = e21_closed.reindex(df.index).ffill()
+            else:
+                df_1h = None
+
         position = None
         cooldown_until_idx = 0
         rng = np.random.default_rng(seed) if entry_mode == 'random' else None
@@ -235,7 +274,13 @@ class StrategyBacktester:
                         exit_price = curr_trail_level
                         reason = "TRAILING_STOP"
                 if exit_price is None and strategy_mode == 'capitulation' and bars_held >= 1:  # 3c. EMA21 reversion profit-take
-                    if close_price >= ema21.iloc[i] and close_price >= position['entry_price'] * 1.012:
+                    if position.get('tf') == '1h' and ema21_1h_aligned is not None:
+                        if bars_held >= 4 and getattr(curr_time, 'minute', 45) == 45:
+                            target_ema = ema21_1h_aligned.iloc[i]
+                            if not np.isnan(target_ema) and close_price >= target_ema and close_price >= position['entry_price'] * 1.012:
+                                exit_price = close_price
+                                reason = "TAKE_PROFIT"
+                    elif close_price >= ema21.iloc[i] and close_price >= position['entry_price'] * 1.012:
                         exit_price = close_price
                         reason = "TAKE_PROFIT"
                 if exit_price is None and bars_held >= max_hold_bars:   # 4. Trend invalidation / hard timeout
@@ -319,6 +364,7 @@ class StrategyBacktester:
             if np.isnan(atr_val) or atr_val <= 0:
                 continue
 
+            entry_tf = interval
             if entry_mode == 'random':
                 if rng.random() >= random_prob:
                     continue
@@ -331,31 +377,44 @@ class StrategyBacktester:
                 p_vol = vol.iloc[i-1]
 
                 if strategy_mode == 'capitulation':
-                    bb_low_val = bb_low_series.iloc[i-1]
-                    if np.isnan(bb_low_val) or p_close > bb_low_val:
-                        continue
+                    score = 0.0
+                    # Check 15m setup unless symbol is designated 1h-only
+                    if not (dual_tf and symbol in one_hour_only):
+                        bb_low_val = bb_low_series.iloc[i-1]
+                        if not np.isnan(bb_low_val) and p_close <= bb_low_val:
+                            rsi_val = rsi_series.iloc[i-1]
+                            v_ma = vol_ma.iloc[i-1]
+                            v_ratio = p_vol / v_ma if (not np.isnan(v_ma) and v_ma > 0) else 1.0
+                            stretch_pct = ((ema21.iloc[i-1] - p_close) / p_close) * 100.0 if p_close > 0 else 0.0
+                            is_bull = p_close >= (ema200.iloc[i-1] * 0.992)
 
-                    rsi_val = rsi_series.iloc[i-1]
-                    v_ma = vol_ma.iloc[i-1]
-                    v_ratio = p_vol / v_ma if (not np.isnan(v_ma) and v_ma > 0) else 1.0
-                    stretch_pct = ((ema21.iloc[i-1] - p_close) / p_close) * 100.0 if p_close > 0 else 0.0
-                    is_bull = p_close >= (ema200.iloc[i-1] * 0.992)
+                            if interval == '15m':
+                                rsi_bull, st_bull, vr_bull = 25.0, 2.0, 1.5
+                                rsi_bear, st_bear, vr_bear = 20.0, 3.2, 2.0
+                            else:
+                                rsi_bull, st_bull, vr_bull = 26.0, 2.0, 1.5
+                                rsi_bear, st_bear, vr_bear = 20.0, 4.0, 2.0
 
-                    if interval == '15m':
-                        rsi_bull, st_bull, vr_bull = 25.0, 2.0, 1.5
-                        rsi_bear, st_bear, vr_bear = 20.0, 3.2, 2.0
-                    else:
-                        rsi_bull, st_bull, vr_bull = 26.0, 2.0, 1.5
-                        rsi_bear, st_bear, vr_bear = 20.0, 4.0, 2.0
+                            if rsi_val <= rsi_bear and stretch_pct >= st_bear and v_ratio >= vr_bear:
+                                score = 85.0
+                            elif is_bull and rsi_val <= rsi_bull and stretch_pct >= st_bull and v_ratio >= vr_bull:
+                                score = 78.0
+                            elif rsi_val <= 28.0 and stretch_pct >= 1.5 and v_ratio >= 1.2:
+                                score = 62.0
+                            else:
+                                score = 20.0
 
-                    if rsi_val <= rsi_bear and stretch_pct >= st_bear and v_ratio >= vr_bear:
-                        score = 85.0
-                    elif is_bull and rsi_val <= rsi_bull and stretch_pct >= st_bull and v_ratio >= vr_bull:
-                        score = 78.0
-                    elif rsi_val <= 28.0 and stretch_pct >= 1.5 and v_ratio >= 1.2:
-                        score = 62.0
-                    else:
-                        score = 20.0
+                    # Dual-Timeframe: at the top of each hour, also check the just-closed 1h candle
+                    if score < self.min_score and df_1h is not None and getattr(curr_time, 'minute', -1) == 0:
+                        prev_1h_ts = curr_time - pd.Timedelta(hours=1)
+                        if prev_1h_ts in df_1h.index:
+                            row_1h = df_1h.loc[prev_1h_ts]
+                            s_1h = float(row_1h['score'])
+                            atr_1h = float(row_1h['atr'])
+                            if s_1h >= self.min_score and not np.isnan(atr_1h) and atr_1h > 0:
+                                score = s_1h
+                                atr_val = atr_1h
+                                entry_tf = '1h'
 
                     if score < self.min_score:
                         continue
@@ -442,7 +501,8 @@ class StrategyBacktester:
                 'highest': entry_market_price,
                 'lowest': entry_market_price,
                 'score': score,
-                'be_activated': False
+                'be_activated': False,
+                'tf': entry_tf
             }
 
             # The entry bar's own range counts: we buy at its open, so its low can hit the stop.

@@ -45,6 +45,12 @@ MEME_COIN_SYMBOLS = [
     'DOGEUSDT',
     'PEPEUSDT']
 STRATEGY_MODE = 'capitulation'  # 'capitulation' (Dual-Regime Mean Reversion) or 'breakout'
+ENABLE_DUAL_TIMEFRAME = True
+ONE_HOUR_ONLY_SYMBOLS = [
+    'BTCUSDT',
+    'ETHUSDT',
+    'SOLUSDT',
+    'XRPUSDT']
 SCANNER_INTERVAL = '15m'
 SCANNER_CANDLE_LIMIT = 250
 SCANNER_CACHE_SEC = 60

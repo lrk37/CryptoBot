@@ -309,6 +309,7 @@ class RiskManager:
             kind = position.kind
             open_time = position.open_time
             symbol = position.symbol
+            pos_tf = (position.details or {}).get('timeframe', getattr(self.cfg, 'SCANNER_INTERVAL', '15m'))
 
         # 1. Take Profit
         if current_price >= tp:
@@ -329,7 +330,7 @@ class RiskManager:
         # 3b. Mean-reversion profit-take when price reclaims EMA21 with >= 1.2% gain
         if kind == "scanner" and getattr(self.cfg, 'STRATEGY_MODE', 'capitulation') == 'capitulation':
             if entry_price > 0 and ((current_price - entry_price) / entry_price) * 100.0 >= 1.2:
-                if self._closed_above_ema21(symbol):
+                if self._closed_above_ema21(symbol, interval=pos_tf):
                     log.info(f"[EMA21 REVERSION TP] {symbol} reclaimed EMA21 in profit -> closing")
                     return "TAKE_PROFIT"
 
@@ -343,21 +344,21 @@ class RiskManager:
                 log.info(f"[HOLD TIMEOUT] {symbol} exceeded hard hold limit ({hold_time / 3600:.1f}h > {max_hold * 2 / 3600:.0f}h) -> closing")
                 return "MAX_HOLD_TIMEOUT"
 
-            # After max_hold: close only if the last CLOSED 15m candle finished below its EMA21
-            if hold_time > max_hold and self._closed_below_ema21(symbol):
-                log.info(f"[TREND INVALIDATED] {symbol} held >{max_hold / 3600:.0f}h and last closed 15m candle is below EMA21 -> closing")
+            # After max_hold: close only if the last CLOSED candle finished below its EMA21
+            if hold_time > max_hold and self._closed_below_ema21(symbol, interval=pos_tf):
+                log.info(f"[TREND INVALIDATED] {symbol} held >{max_hold / 3600:.0f}h and last closed {pos_tf} candle is below EMA21 -> closing")
                 return "TREND_INVALIDATED"
 
         return "HOLD"
 
-    def _closed_above_ema21(self, symbol: str) -> bool:
+    def _closed_above_ema21(self, symbol: str, interval: str = None) -> bool:
         """True if the last CLOSED candle closed at or above its EMA21."""
         if not self.exchange:
             return False
         try:
             span = int(getattr(self.cfg, 'EMA_SLOW', 21))
-            interval = getattr(self.cfg, 'SCANNER_INTERVAL', '15m')
-            df = self.exchange.get_candles(symbol, interval=interval, limit=max(60, span * 3))
+            tf = interval or getattr(self.cfg, 'SCANNER_INTERVAL', '15m')
+            df = self.exchange.get_candles(symbol, interval=tf, limit=max(60, span * 3))
             closed = df.iloc[:-1]
             if len(closed) < span + 2:
                 return False
@@ -366,13 +367,14 @@ class RiskManager:
         except Exception:
             return False
 
-    def _closed_below_ema21(self, symbol: str) -> bool:
-        """True if the last CLOSED 15m candle closed below its EMA21. Any data problem -> False (hold)."""
+    def _closed_below_ema21(self, symbol: str, interval: str = None) -> bool:
+        """True if the last CLOSED candle closed below its EMA21. Any data problem -> False (hold)."""
         if not self.exchange:
             return False
         try:
             span = int(getattr(self.cfg, 'EMA_SLOW', 21))
-            df = self.exchange.get_candles(symbol, interval='15m', limit=max(60, span * 3))
+            tf = interval or '15m'
+            df = self.exchange.get_candles(symbol, interval=tf, limit=max(60, span * 3))
             closed = df.iloc[:-1]  # drop the still-forming candle
             if len(closed) < span + 2:
                 return False

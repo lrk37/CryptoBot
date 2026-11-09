@@ -212,7 +212,8 @@ class ScannerEngine:
             'rsi': res.rsi,
             'volume_ratio': res.volume_ratio,
             'breakout_atr_ratio': res.breakout_atr_ratio,
-            'bid_ask_ratio': res.bid_ask_ratio
+            'bid_ask_ratio': res.bid_ask_ratio,
+            'timeframe': getattr(res, 'timeframe', getattr(cfg, 'SCANNER_INTERVAL', '15m'))
         }
 
         pos = self.risk_mgr.open_position(
@@ -244,7 +245,7 @@ class ScannerEngine:
             
             # Save chart snapshot on entry
             try:
-                tf = getattr(cfg, 'SCANNER_INTERVAL', '15m')
+                tf = getattr(res, 'timeframe', getattr(cfg, 'SCANNER_INTERVAL', '15m'))
                 df = self.exchange.get_candles(symbol, interval=tf, limit=50)
                 save_trade_chart(symbol, df, fill_price, fill_price, 0.0, 0.0, "ENTRY", pos.stop_loss, pos.take_profit)
             except Exception as e:
@@ -351,7 +352,7 @@ class ScannerEngine:
 
             # Save chart snapshot on exit
             try:
-                tf = getattr(cfg, 'SCANNER_INTERVAL', '15m')
+                tf = (pos.details or {}).get('timeframe', getattr(cfg, 'SCANNER_INTERVAL', '15m'))
                 df = self.exchange.get_candles(symbol, interval=tf, limit=50)
                 save_trade_chart(symbol, df, pos.entry_price, exit_price, pnl_pct, pnl_usdt, reason, pos.stop_loss, pos.take_profit)
             except Exception as e:
