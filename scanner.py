@@ -138,7 +138,7 @@ class MarketScanner:
             if res and res.score >= getattr(self.cfg, 'MIN_SCORE_TO_TRADE', 60):
                 results.append(res)
 
-        results.sort(key=lambda x: x.score, reverse=True)
+        results.sort(key=lambda x: (x.score, x.breakout_atr_ratio, x.volume_ratio), reverse=True)
         top_n = getattr(self.cfg, 'SCANNER_TOP_N', 3)
         final_results = results[:top_n]
 

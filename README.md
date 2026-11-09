@@ -1,16 +1,17 @@
-# CryptoBot — Quantitative Spot Momentum Engine for Binance
+# CryptoBot — Quantitative Spot Mean-Reversion & Momentum Engine for Binance
 
-**CryptoBot** is a high-performance, quality-focused automated trading bot designed for Binance Spot. It continuously monitors all USDT trading pairs, executes volatility breakouts on closed 15m candles with multi-layer momentum confirmation, and protects capital using native exchange-side OCO stop-loss orders.
+**CryptoBot** is a high-performance, quality-focused automated trading bot designed for Binance Spot. It continuously scans the most liquid USDT trading pairs, identifies high-volume **Dual-Regime Capitulation Reversion** setups (`STRATEGY_MODE = 'capitulation'`) on closed 15m/1h candles, and protects capital using native exchange-side OCO stop-loss orders, dynamic `EMA21` reversion profit-taking, and fee-aware trailing stops.
 
 ---
 
 ## ⚡ Highlights & Key Upgrades
 
-- **Instant Market Scanning**: Replaced sequential HTTP polling with Binance's batch 24h ticker endpoint, reducing full-market scan time from ~145 seconds to **< 0.5 seconds**.
-- **No Mid-Candle Repainting**: All indicator logic (EMA 9/21/50, RSI 14, Volume MA 20, 20-bar breakout) is calculated exclusively on **fully closed candles**, preventing false triggers on intra-candle wicks.
+- **Dual-Regime Capitulation Strategy**: Buys high-volume oversold flushes below the Lower Bollinger Band (`20, 2.0`) when stretched below `EMA21`, using an `EMA200` regime filter (`Score = 78` in Bull Regime, `Score = 85` for Extreme Panic Capitulation in Bear Regime).
+- **Instant Market Scanning**: Uses Binance's batch 24h ticker endpoint to pre-filter the top 50 most liquid USDT pairs (`>= $10M` 24h volume) in **< 0.5 seconds**.
+- **No Mid-Candle Repainting**: All indicator logic (`EMA 9/21/50/200`, `Bollinger Bands 20,2`, `RSI 14`, `Volume MA 20`, `ATR 14`) is calculated exclusively on **fully closed candles**, preventing false triggers on intra-candle wicks.
 - **Native Exchange-Side OCO Protection**: Immediately upon entry, the bot submits a server-side **OCO (One-Cancels-the-Other)** bracket order directly to Binance. If the bot crashes, loses internet, or restarts, your capital remains 100% protected on the exchange.
-- **Favorable Risk/Reward Tuning**: Initial Stop-Loss at 2.0% (or 2.5x ATR) and Take-Profit at 6.0% (or 5x ATR) targeting a **3:1 Reward-to-Risk ratio**, with dynamic break-even activation once profit reaches +2.0%.
-- **Quantitative Backtester (`backtest.py`)**: Includes a complete historical backtesting suite that models realistic taker fees (0.1%), slippage (0.05%), and outputs Sharpe ratio, Sortino ratio, win rate, and max drawdown.
+- **Calibrated Mean-Reversion Exits**: ATR-scaled Stop-Loss (`4.8x ATR`, clamped `1.5%–7.0%`) and Take-Profit (`2.0x ATR`, floored at `1.8%`), plus automatic `EMA21` reclamation profit-taking (`>= +1.2%`), trailing stop (`+1.8%` trigger, `0.7%` offset), and fee-aware break-even (`+2.2%` trigger).
+- **Quantitative Validation Suite (`backtest.py` & `validate.py`)**: Includes walk-forward out-of-sample testing, 15-coin basket validation, Monte Carlo trade resampling, slippage stress-testing, and random-entry baselines.
 - **Production-Ready VPS & Docker Support**: Includes a ready-to-use `Dockerfile`, `docker-compose.yml`, Linux `systemd` service, and 1-click VPS installation script.
 
 ---
@@ -19,16 +20,17 @@
 
 ```mermaid
 flowchart TD
-    A["Binance Spot 24h Ticker Batch (<0.5s)"] --> B["Pre-Filter (Volume >= $5M, Stablecoin Filter)"]
-    B --> C["BTC Market Regime Check (1h EMA20)"]
-    C --> D["Closed Candle Scoring (EMA 9/21/50, RSI, Vol Surge, 20-bar Breakout)"]
-    D --> E{"Score >= 60?"}
+    A["Binance Spot 24h Ticker Batch (<0.5s)"] --> B["Pre-Filter (Top 50 Liquid Pairs >= $10M Vol, Stablecoin Filter)"]
+    B --> C["BTC Market Regime Check (1h EMA200)"]
+    C --> D["Closed Candle Scoring (Lower BB 20,2 + EMA21 Stretch + RSI 14 + Volume Surge)"]
+    D --> E{"Score >= 75?"}
     E -- No --> F["Skip / Log Filter Reason"]
-    E -- Yes --> G["Candle-Based Confirmation (2 distinct closed 15m bars or Score >= 80)"]
-    G --> H["Market Buy via quoteOrderQty"]
+    E -- Yes --> G{"BTC Bullish OR Score >= 80?"}
+    G -- No --> F
+    G -- Yes --> H["Market Buy via quoteOrderQty"]
     H --> I["Submit Native OCO Sell Order on Binance (TP + SL)"]
-    I --> J["Monitor Position (Trailing Stop + Hold Timeout + MFE/MAE Logging)"]
-    J --> K["Save Dark-Themed Technical Chart to charts/"]
+    I --> J["Monitor Position (EMA21 Reversion TP + Trailing Stop + Hold Timeout)"]
+    J --> K["Save Dark-Themed Technical Chart to charts/ & MFE/MAE to trade_log.json"]
 ```
 
 ---
@@ -124,13 +126,13 @@ Every closed trade is saved with auditable metrics to `trade_log.json`:
 
 | Rule | Configuration | Action Taken |
 | :--- | :--- | :--- |
-| **Stop Loss** | `SCANNER_STOP_LOSS_PCT = 2.0%` | Server-side OCO stop order on Binance |
-| **Take Profit** | `SCANNER_TAKE_PROFIT_PCT = 6.0%` | Server-side OCO limit order on Binance |
-| **Break-Even Stop** | `BREAK_EVEN_TRIGGER_PCT = 2.0%` | Raises SL to entry + 0.2% round-trip fees |
-| **Trailing Stop** | `MIN_TRAILING_PROFIT_PCT = 2.5%` | Trailing offset 1.2% behind peak price |
+| **Stop Loss** | `4.8x ATR` (clamped `1.5%–7.0%`) | Server-side OCO stop order on Binance |
+| **Take Profit** | `2.0x ATR` (floored at `1.8%`) + `EMA21` Reversion | Server-side OCO limit order + client-side `EMA21` profit-take |
+| **Break-Even Stop** | `BREAK_EVEN_TRIGGER_PCT = 2.2%` | Raises SL to entry + `0.2%` round-trip fees |
+| **Trailing Stop** | `MIN_TRAILING_PROFIT_PCT = 1.6%` (`+1.8%` trigger) | Trailing offset `0.7%` behind peak price |
 | **Consecutive Losses** | `MAX_CONSECUTIVE_LOSSES = 2` | Pauses new scans for 30 minutes |
 | **Daily Circuit Breaker** | `MAX_DAILY_LOSS = 6.0%` | Halts all trading if portfolio drops 6% in a day |
-| **Symbol Cooldown** | `SYMBOL_COOLDOWN_SEC = 3600` | 1-hour cooldown per coin after trade close |
+| **Symbol Cooldown** | `3600s` (`1h`) normal / `14400s` (`4h`) after SL | Cooldown per coin after trade close |
 
 ---
 
