@@ -39,7 +39,15 @@ class BinanceConnector:
 
         adapter = req_lib.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
         self.client.session.mount('https://', adapter)
-        mode = 'TESTNET' if cfg.USE_TESTNET else 'LIVE'
+        if getattr(cfg, 'USE_TESTNET', False):
+            try:
+                self.market_client = Client('', '', testnet=False)
+                self.market_client.session.mount('https://', adapter)
+            except Exception:
+                self.market_client = self.client
+        else:
+            self.market_client = self.client
+        mode = 'TESTNET (with LIVE Market Data)' if cfg.USE_TESTNET else 'LIVE'
         log.info(f"Binance connected [{mode}]")
 
         self._info_cache = {}
@@ -68,7 +76,7 @@ class BinanceConnector:
                 time.sleep(delay * (i + 1))
 
     def get_candles(self, symbol, interval, limit=100):
-        raw = self._retry(self.client.get_klines, symbol=symbol, interval=interval, limit=limit)
+        raw = self._retry(self.market_client.get_klines, symbol=symbol, interval=interval, limit=limit)
         df = pd.DataFrame(raw, columns=[
             'open_time', 'open', 'high', 'low', 'close', 'volume',
             'close_time', 'quote_vol', 'trades', 'tb_base', 'tb_quote', 'ignore'
@@ -100,7 +108,7 @@ class BinanceConnector:
         """Calculate the ratio of Bid (Buy) volume to Ask (Sell) volume.
         > 1.0 means more buy pressure. < 1.0 means more sell pressure."""
         try:
-            book = self._retry(self.client.get_order_book, symbol=symbol, limit=depth)
+            book = self._retry(self.market_client.get_order_book, symbol=symbol, limit=depth)
             bid_vol = sum(float(b[1]) for b in book.get('bids', []))
             ask_vol = sum(float(a[1]) for a in book.get('asks', []))
             if ask_vol <= 0:
@@ -122,7 +130,7 @@ class BinanceConnector:
     def get_24h_tickers(self) -> Dict[str, dict]:
         """Fetch 24hr ticker data for ALL symbols in a single API call (cost: 40-80 weight)."""
         try:
-            tickers = self._retry(self.client.get_ticker)
+            tickers = self._retry(self.market_client.get_ticker)
             if isinstance(tickers, list):
                 return {t['symbol']: t for t in tickers if 'symbol' in t}
             elif isinstance(tickers, dict) and 'symbol' in tickers:

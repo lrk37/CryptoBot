@@ -74,7 +74,12 @@ def main():
     except BinanceAPIException as e:
         print(f"\n[!] Binance API Error ({e.code}): {e.message}")
         if e.code == -2014 or e.code == -2015:
-            print("    -> Check your API key/secret, or verify your IP whitelist settings on Binance.")
+            if getattr(cfg, 'USE_TESTNET', False):
+                print("    -> TESTNET MODE IS ON: Normal binance.com keys do NOT work on Testnet!")
+                print("    -> Go to https://testnet.binance.vision/ -> Log in with GitHub -> Generate HMAC_SHA256 Key")
+                print("    -> Put those keys in BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_API_SECRET in .env")
+            else:
+                print("    -> Check your API key/secret, or verify your IP whitelist settings on Binance.")
     except Exception as e:
         print(f"\n[!] Connection Failed: {e}")
 

@@ -26,8 +26,8 @@ from dotenv import load_dotenv
 load_dotenv()
 USE_TESTNET = os.getenv('USE_TESTNET', 'False').lower() in ('true', '1', 't')
 if USE_TESTNET:
-    API_KEY = os.getenv('BINANCE_TESTNET_API_KEY', '')
-    API_SECRET = os.getenv('BINANCE_TESTNET_API_SECRET', '')
+    API_KEY = os.getenv('BINANCE_TESTNET_API_KEY', '') or os.getenv('BINANCE_API_KEY', '')
+    API_SECRET = os.getenv('BINANCE_TESTNET_API_SECRET', '') or os.getenv('BINANCE_API_SECRET', '')
 else:
     API_KEY = os.getenv('BINANCE_API_KEY', '')
     API_SECRET = os.getenv('BINANCE_API_SECRET', '')
