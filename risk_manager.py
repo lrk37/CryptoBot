@@ -52,15 +52,6 @@ def compute_stops(cfg, kind: str, entry_price: float, atr_value: float = 0.0):
         atr_sl_mult = getattr(cfg, 'SCANNER_ATR_SL_MULTIPLIER', 3.0)
         atr_tp_mult = getattr(cfg, 'SCANNER_ATR_TP_MULTIPLIER', 4.0)
         max_sl_pct = getattr(cfg, 'SCANNER_MAX_STOP_LOSS_PCT', 3.5)
-    elif kind == 'meme':
-        use_atr = getattr(cfg, 'MEME_USE_ATR_STOPS', True)
-        sl_pct = getattr(cfg, 'MEME_STOP_LOSS_PCT', 4.0)
-        tp_pct = getattr(cfg, 'MEME_TAKE_PROFIT_PCT', 12.0)
-        trail = getattr(cfg, 'MEME_TRAILING_STOP', True)
-        trail_off = getattr(cfg, 'MEME_TRAILING_OFFSET', 2.5)
-        atr_sl_mult = getattr(cfg, 'MEME_ATR_SL_MULTIPLIER', 4.0)
-        atr_tp_mult = getattr(cfg, 'MEME_ATR_TP_MULTIPLIER', 8.0)
-        max_sl_pct = getattr(cfg, 'MEME_STOP_LOSS_PCT', 4.0)
     else:
         use_atr = getattr(cfg, 'USE_ATR_STOPS', True)
         sl_pct = getattr(cfg, 'STOP_LOSS_PCT', 2.5)

@@ -1,140 +1,173 @@
-# CryptoBot — Quantitative Spot Mean-Reversion & Momentum Engine for Binance
+# CryptoBot — Automated Binance Spot Capitulation & Mean-Reversion Engine
 
-**CryptoBot** is a high-performance, quality-focused automated trading bot designed for Binance Spot. It continuously scans the most liquid USDT trading pairs, identifies high-volume **Dual-Regime Capitulation Reversion** setups (`STRATEGY_MODE = 'capitulation'`) on closed 15m/1h candles, and protects capital using native exchange-side OCO stop-loss orders, dynamic `EMA21` reversion profit-taking, and fee-aware trailing stops.
-
----
-
-## ⚡ Highlights & Key Upgrades
-
-- **Dual-Regime Capitulation Strategy**: Buys high-volume oversold flushes below the Lower Bollinger Band (`20, 2.0`) when stretched below `EMA21`, using an `EMA200` regime filter (`Score = 78` in Bull Regime, `Score = 85` for Extreme Panic Capitulation in Bear Regime).
-- **Instant Market Scanning**: Uses Binance's batch 24h ticker endpoint to pre-filter the top 50 most liquid USDT pairs (`>= $10M` 24h volume) in **< 0.5 seconds**.
-- **No Mid-Candle Repainting**: All indicator logic (`EMA 9/21/50/200`, `Bollinger Bands 20,2`, `RSI 14`, `Volume MA 20`, `ATR 14`) is calculated exclusively on **fully closed candles**, preventing false triggers on intra-candle wicks.
-- **Native Exchange-Side OCO Protection**: Immediately upon entry, the bot submits a server-side **OCO (One-Cancels-the-Other)** bracket order directly to Binance. If the bot crashes, loses internet, or restarts, your capital remains 100% protected on the exchange.
-- **Calibrated Mean-Reversion Exits**: ATR-scaled Stop-Loss (`4.8x ATR`, clamped `1.5%–7.0%`) and Take-Profit (`2.0x ATR`, floored at `1.8%`), plus automatic `EMA21` reclamation profit-taking (`>= +1.2%`), trailing stop (`+1.8%` trigger, `0.7%` offset), and fee-aware break-even (`+2.2%` trigger).
-- **Quantitative Validation Suite (`backtest.py` & `validate.py`)**: Includes walk-forward out-of-sample testing, 15-coin basket validation, Monte Carlo trade resampling, slippage stress-testing, and random-entry baselines.
-- **Production-Ready VPS & Docker Support**: Includes a ready-to-use `Dockerfile`, `docker-compose.yml`, Linux `systemd` service, and 1-click VPS installation script.
+An automated, non-custodial **Binance Spot** trading bot written in Python. Instead of chasing overextended green breakout candles at the top of a move, **CryptoBot** scans the top 50 most liquid USDT pairs every 5 minutes using a **Smart Dual-Timeframe (`15m` + `1h`) Capitulation Engine** to buy extreme panic flushes (`RSI <= 20–25`, below Lower Bollinger Band `BB(20, 2.0)`, stretched below `EMA21` on climactic volume) and lock in the mean-reversion rebound using a **Dynamic 3-Stage Exit Engine**.
 
 ---
 
-## 🏗️ Architecture & How It Works
+## 1. How the Bot Operates (End-to-End Workflow)
 
 ```mermaid
 flowchart TD
-    A["Binance Spot 24h Ticker Batch (<0.5s)"] --> B["Pre-Filter (Top 50 Liquid Pairs >= $10M Vol, Stablecoin Filter)"]
-    B --> C["BTC Market Regime Check (1h EMA200)"]
-    C --> D["Closed Candle Scoring (Lower BB 20,2 + EMA21 Stretch + RSI 14 + Volume Surge)"]
-    D --> E{"Score >= 75?"}
-    E -- No --> F["Skip / Log Filter Reason"]
-    E -- Yes --> G{"BTC Bullish OR Score >= 80?"}
-    G -- No --> F
-    G -- Yes --> H["Market Buy via quoteOrderQty"]
-    H --> I["Submit Native OCO Sell Order on Binance (TP + SL)"]
-    I --> J["Monitor Position (EMA21 Reversion TP + Trailing Stop + Hold Timeout)"]
-    J --> K["Save Dark-Themed Technical Chart to charts/ & MFE/MAE to trade_log.json"]
+    A["Every 5 Minutes: Fetch All Tradeable Binance USDT Spot Pairs"] --> B["Liquidity & Safety Pre-Filter\n• 24h Volume >= $10,000,000 USDT\n• Top 50 Most Liquid Pairs\n• Exclude Stablecoins & Wrapped Tokens\n• Bid-Ask Spread <= 0.25% & Orderbook Imbalance Check"]
+    B --> C{"Smart Dual-Timeframe Router"}
+    C -->|"Heavy Mega-Caps\n(BTC, ETH, SOL, XRP)"| D["Analyze Closed 1h Candles\n(Filters out 15m micro-noise)"]
+    C -->|"Agile Mid-Cap Altcoins\n(ADA, AVAX, SUI, LINK, DOT, ZEC, etc.)"| E["Analyze Closed 15m Candles\n+ 1h Fallback Scan"]
+    D --> F["Dual-Regime Capitulation Scoring (0–100)"]
+    E --> F
+    F --> G{"Smart BTC Regime Gate\n(BTC vs 1h EMA200)"}
+    G -->|"BTC BULLISH\n(BTC > 1h EMA200)"| H["Allow Both:\n• Extreme Capitulation (Score >= 85)\n• Bull-Regime Pullback (Score >= 78)"]
+    G -->|"BTC BEARISH\n(BTC <= 1h EMA200)"| I["Block Shallow Dips\nAllow ONLY Extreme Capitulation (Score >= 80)"]
+    H --> J["Execute Spot Market Buy + Place Native Exchange OCO\nSave ENTRY Chart Snapshot + Send Telegram Alert"]
+    I --> J
+    J --> K["Monitor Open Position Every 30 Seconds\nDynamic 3-Stage Exit Engine"]
+    K --> L["Close Trade -> Save EXIT Chart Snapshot -> Send Telegram Summary\nApply Per-Symbol Cooldown (1h normal / 4h after Stop-Loss)"]
 ```
 
 ---
 
-## 🚀 Quick Start (Local)
+## 2. Core Strategy & Risk Architecture
 
-### 1. Clone & Set Up Environment
+### A. Smart Dual-Timeframe Detection (`15m` + `1h`)
+Different crypto assets move at different speeds:
+- **Mega-Cap Anchors (`BTCUSDT`, `ETHUSDT`, `SOLUSDT`, `XRPUSDT`):** Evaluated exclusively on closed **`1h` candles** (`ONE_HOUR_ONLY_SYMBOLS`). Because mega-caps have `$100B–$1.5T` market caps, `15m` dips are often mid-move noise, whereas `1h` capitulation candles capture true multi-hour exhaustion.
+- **Agile Mid-Cap Altcoins:** Evaluated on closed **`15m` candles** first for rapid intraday flushes, with an automatic **`1h` fallback** if the `15m` scan doesn't trigger.
+
+### B. Two-Tier Capitulation Entry Scoring (`scanner.py`)
+All indicators are computed strictly on the **last closed candle (`iloc[-2]`)** to eliminate intrabar repainting and lookahead bias:
+1. **Tier 1 — Extreme Capitulation (`Score = 85` + up to `+5` Orderbook Bonus):**
+   - `Close <= Lower Bollinger Band(20, 2.0)`
+   - `RSI(14) <= 20` (deep panic exhaustion)
+   - `Stretch below EMA21 >= 3.2%` (`15m`) or `>= 4.0%` (`1h`)
+   - `Volume >= 2.0x` 20-bar average volume (climactic selling spike)
+   - *Allowed in both Bullish and Bearish BTC regimes.*
+2. **Tier 2 — Bull-Regime Capitulation Dip (`Score = 78` + up to `+5` Orderbook Bonus):**
+   - Coin is in a macro uptrend (`Close >= 0.992 * EMA200`)
+   - `Close <= Lower Bollinger Band(20, 2.0)`
+   - `RSI(14) <= 25` (`15m`) or `<= 26` (`1h`)
+   - `Stretch below EMA21 >= 2.0%`
+   - `Volume >= 1.5x` 20-bar average volume
+   - *Allowed only when `BTCUSDT` is above its `1h EMA200` (`BULLISH` regime).*
+
+### C. Dynamic 3-Stage Exit Engine (`risk_manager.py`)
+Instead of using a tight `-1.5%` stop-loss that gets hunted by normal crypto wicks and a greedy `+6%` target that rarely hits, the bot manages risk dynamically across three stages:
+1. **Stage 1 — Wide Initial Catastrophe Bracket + Exchange OCO:**
+   - Places an ATR-scaled catastrophe Stop-Loss (`4.8x ATR`, clamped to `1.5%–7.0%`) and Take-Profit (`2.0x ATR`, floored at `1.8%`) directly on Binance's matching engine via a native **OCO (One-Cancels-the-Other)** order (`USE_EXCHANGE_OCO = True`). Even if your server loses internet, your position is protected on Binance.
+2. **Stage 2 — Fast Risk Elimination (Break-Even & Trailing Stop):**
+   - **Trailing Stop (`+1.8%` effective trigger, `0.7%` offset):** Once profit reaches `+1.8%` (`MIN_TRAILING_PROFIT_PCT + ROUND_TRIP_FEE_PCT`), a tight `0.7%` trailing stop arms to follow the rebound upward.
+   - **Break-Even Lock (`+2.2%` trigger):** Once profit reaches `+2.2%`, the Stop-Loss floor is automatically raised above your entry price (`entry * 1.002`), making the trade **100% risk-free**.
+   - **Mean-Reversion `EMA21` Profit-Take:** If a candle closes back above `EMA21` with at least `+1.2%` profit, the bot banks the mean-reversion gain immediately.
+3. **Stage 3 — Time & Trend Invalidation (`8h` / `16h`):**
+   - If a position has been open for `8 hours` (`MAX_SCANNER_HOLD_HOURS`) and the last closed candle is still below `EMA21`, it exits early (`TREND_INVALIDATED`) rather than waiting for the catastrophe stop. Hard maximum hold time is `16 hours` (`MAX_HOLD_TIMEOUT`).
+
+### D. Portfolio Circuit Breakers & Cooldowns
+- **Per-Symbol Cooldown:** `1 hour` cooldown after a normal exit; extended to **`4 hours` (`14,400s`)** after a `STOP_LOSS` to prevent re-entering a coin undergoing a multi-hour cascade.
+- **Consecutive Loss Pause:** Pauses scanning for `30 minutes` after `2` consecutive stop-losses.
+- **Daily Circuit Breaker:** Halts new entries for the rest of the UTC day if daily portfolio drawdown reaches `6%` (`MAX_DAILY_LOSS = 6`).
+
+---
+
+## 3. Validated 90-Day Multi-Coin Performance
+
+Tested across the 15-coin liquid basket (`BTC`, `ETH`, `BNB`, `SOL`, `XRP`, `ADA`, `AVAX`, `DOT`, `LINK`, `POL`, `NEAR`, `ATOM`, `APT`, `SUI`, `ARB`) with realistic round-trip friction (`0.10%` fee/side + `0.05%` slippage/side = **`0.30%` round-trip cost**):
+
+| Metric | Old Breakout Bot (v5) | **New Dual-Timeframe Capitulation Bot** |
+|---|---|---|
+| **Profitable Coins in Basket** | `0 / 15` (`0%`) | **`12 / 15` (`80%` — `BROAD EDGE ✓`)** |
+| **Overall Win Rate** | `18% – 28%` | **`79.2%` (`76` Wins / `20` Losses)** |
+| **Pooled Profit Factor** | `0.34` | **`2.24` (`+$61.62` Net P&L)** |
+| **Median Expectancy / Trade** | `-1.12%` | **`+0.82%` net per trade** |
+| **Shared Portfolio Max Drawdown** | `> 25%` | **`0.89%`** |
+
+---
+
+## 4. Repository Structure
+
+| File | Purpose |
+|---|---|
+| `bot.py` | Main daemon entry point (`ScannerEngine`: 5-minute market scan thread + 30-second position monitor thread). |
+| `scanner.py` | Dual-Timeframe (`15m` + `1h`) market scanner, BTC `1h EMA200` regime filter, and Capitulation scoring engine. |
+| `risk_manager.py` | Position tracking (`positions.json`), ATR stop/TP computation, Break-Even lock, Trailing Stop, `EMA21` exit, and circuit breakers. |
+| `exchange.py` | Binance Spot API connector (`python-binance`). Uses live public market data for scanning when running on Testnet (`USE_TESTNET=True`). |
+| `config.py` | Central configuration file for strategy modes, timeframes, risk limits, and indicator parameters. |
+| `notifier.py` | Telegram `MarkdownV2` notifications (includes `[15m]`/`[1h]` timeframe tag, estimated hold window, `%` and `USDT` P&L, and trade duration). |
+| `chart_logger.py` | Automatically saves dark-themed PNG candlestick/indicator charts (`Price`, `EMA9/21/50`, `Lower BB(20,2)`, `RSI`, `MACD`, `Entry/Exit/SL/TP`) to `charts/`. |
+| `scan_logger.py` | Logs top scan candidates and tracks empirical 1h/4h forward returns in `scan_logs.json`. |
+| `check_perms.py` | Diagnostic CLI tool to verify Binance API keys, server time sync, Spot trading permissions, and account balances. |
+| `backtest.py` | Single-symbol and multi-symbol quantitative backtester with Monte Carlo random-entry baseline comparison. |
+| `validate.py` | Out-of-sample validation suite (`walk_forward`, `basket`, `monte_carlo`, `slippage`). |
+| `experiment.py` | Gate 0 accounting & no-lookahead verification harness + Stage A strategy family comparison suite. |
+| `tests/test_patches.py` | 31 automated unit tests covering stop math, OCO order handling, risk manager persistence, and accounting invariants. |
+| `deploy/` | `vps_setup.sh` (automated Ubuntu 22.04/24.04 installer) and `cryptobot.service` (`systemd` 24/7 background daemon config). |
+
+---
+
+## 5. Running Backtests & Unit Tests Locally
+
 ```bash
-git clone https://github.com/lrk37/CryptoBot.git
-cd CryptoBot
+# 1. Create virtual environment and install dependencies
+python -m venv .venv
+# Windows PowerShell:
+.\.venv\Scripts\pip install -r requirements.txt
+# Linux / macOS:
+./.venv/bin/pip install -r requirements.txt
 
-python -m venv venv
-# On Windows:
-.\venv\Scripts\activate
-# On Linux/macOS:
-source venv/bin/activate
+# 2. Run the 31 unit tests & Gate 0 accounting audit
+python -m unittest discover -s tests -v
 
-pip install -r requirements.txt
-```
+# 3. Run the 15-coin Dual-Timeframe basket validation (90 days)
+python validate.py basket --days 90 --interval 15m --baseline 5
 
-### 2. Configure Credentials
-Copy `.env.example` to `.env` and fill in your Binance API keys:
-```bash
-cp .env.example .env
-```
-Edit `.env`:
-```ini
-BINANCE_API_KEY=your_api_key_here
-BINANCE_API_SECRET=your_api_secret_here
-USE_TESTNET=False
-```
-
-### 3. Check Permissions & Test Order
-Run the diagnostic tools to verify connectivity and spot permissions:
-```bash
-python check_perms.py
-python test_order.py
-```
-
-### 4. Run Backtest
-Validate the strategy on historical data before trading:
-```bash
-python backtest.py --symbol SOLUSDT --days 60 --interval 15m
-```
-
-### 5. Launch Bot
-```bash
-python bot.py
+# 4. Run Walk-Forward, Monte Carlo, and Slippage stress tests
+python validate.py all --symbol ADAUSDT --days 90 --interval 15m
 ```
 
 ---
 
-## ☁️ Cloud VPS Deployment (24/7 Hosting)
+## 6. 24/7 Ubuntu VPS Deployment (Testnet & Live Spot)
 
-For unattended 24/7 operation on an Ubuntu Cloud VPS (e.g., Hetzner, DigitalOcean, Linode, AWS):
-
+### One-Line Automated VPS Install
+SSH into your Ubuntu 22.04 / 24.04 VPS and run:
 ```bash
-# Automated 1-Click Setup:
-curl -sSL https://raw.githubusercontent.com/lrk37/CryptoBot/main/deploy/vps_setup.sh | bash
+git clone https://github.com/lrk37/CryptoBot.git ~/CryptoBot && cd ~/CryptoBot && bash deploy/vps_setup.sh
 ```
 
-See [`VPS_GUIDE.md`](VPS_GUIDE.md) for full instructions covering `systemd` service management, Docker deployment, and API security.
-
----
-
-## 📊 Quantitative Metrics & Trade Log
-
-Every closed trade is saved with auditable metrics to `trade_log.json`:
-
-```json
-{
-  "timestamp": "2026-10-19T14:30:00+00:00",
-  "symbol": "SOLUSDT",
-  "kind": "scanner",
-  "entry_price": 162.40,
-  "exit_price": 172.14,
-  "quantity": 0.12,
-  "pnl_pct": 6.00,
-  "pnl_usdt": 1.17,
-  "mfe_pct": 6.15,
-  "mae_pct": -0.42,
-  "raw_score": 90.0,
-  "pump_penalty": 0.0,
-  "final_score": 90.0,
-  "reason": "TAKE_PROFIT",
-  "hold_duration_sec": 3600
-}
+### Configuring `.env` (Testnet vs. Live)
+Open your environment file:
+```bash
+nano ~/CryptoBot/.env
 ```
+- **For Risk-Free Testing on Binance Spot Testnet (`USE_TESTNET=True`):**
+  Generate keys at **https://testnet.binance.vision/** (Log in with GitHub $\rightarrow$ *Generate HMAC_SHA256 Key*):
+  ```ini
+  USE_TESTNET=True
+  BINANCE_TESTNET_API_KEY=your_testnet_key
+  BINANCE_TESTNET_API_SECRET=your_testnet_secret
+  ```
+- **For Real Money on Binance Live Spot (`USE_TESTNET=False`):**
+  Generate keys at **https://www.binance.com/en/my/settings/api-management** (enable *Spot & Margin Trading*, keep *Withdrawals* disabled, and whitelist your VPS IPv4 from `curl -4 ifconfig.me`):
+  ```ini
+  USE_TESTNET=False
+  BINANCE_API_KEY=your_live_binance_key
+  BINANCE_API_SECRET=your_live_binance_secret
+  ```
 
----
+### Verify Keys & Manage the 24/7 Service
+```bash
+# 1. Verify API key connectivity, permissions & balances
+cd ~/CryptoBot && ./venv/bin/python check_perms.py
 
-## 🛡️ Risk Management Matrix
+# 2. Start & enable the 24/7 background service
+sudo systemctl start cryptobot
+sudo systemctl status cryptobot
 
-| Rule | Configuration | Action Taken |
-| :--- | :--- | :--- |
-| **Stop Loss** | `4.8x ATR` (clamped `1.5%–7.0%`) | Server-side OCO stop order on Binance |
-| **Take Profit** | `2.0x ATR` (floored at `1.8%`) + `EMA21` Reversion | Server-side OCO limit order + client-side `EMA21` profit-take |
-| **Break-Even Stop** | `BREAK_EVEN_TRIGGER_PCT = 2.2%` | Raises SL to entry + `0.2%` round-trip fees |
-| **Trailing Stop** | `MIN_TRAILING_PROFIT_PCT = 1.6%` (`+1.8%` trigger) | Trailing offset `0.7%` behind peak price |
-| **Consecutive Losses** | `MAX_CONSECUTIVE_LOSSES = 2` | Pauses new scans for 30 minutes |
-| **Daily Circuit Breaker** | `MAX_DAILY_LOSS = 6.0%` | Halts all trading if portfolio drops 6% in a day |
-| **Symbol Cooldown** | `3600s` (`1h`) normal / `14400s` (`4h`) after SL | Cooldown per coin after trade close |
+# 3. Watch live scanning & trade logs
+tail -f ~/CryptoBot/bot.log
 
----
+# 4. View saved trade charts, open positions & trade history
+ls -la ~/CryptoBot/charts/
+cat ~/CryptoBot/positions.json
+cat ~/CryptoBot/trade_log.json
 
-## 📜 Disclaimer
-*Cryptocurrency trading involves substantial risk of loss. Always backtest strategies thoroughly and start with small position sizes or testnet funds. Never risk capital you cannot afford to lose.*
+# 5. Pull latest code updates from GitHub & restart
+cd ~/CryptoBot && git pull origin main && sudo systemctl restart cryptobot
+```

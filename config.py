@@ -1,29 +1,27 @@
-# Source Generated with Decompyle++
-# File: config.cpython-311.pyc (Python 3.11)
-
 """
 =============================================================
   CRYPTOBOT — Configuration
 =============================================================
-  ⚠️  WARNING: Crypto trading is VERY risky.
-      You can gain a lot — or lose everything quickly.
+  ⚠️  WARNING: Crypto trading carries significant risk.
       Start on TESTNET. Only risk what you can afford to lose.
 =============================================================
-  CRYPTOBOT UPDATE: Fewer trades, better trades.
-  - BTC regime filter — don't trade against the market
-  - Momentum confirmation delay — 2 consecutive high scans
-  - Score threshold 60 — only strong setups
-  - 15m scanner timeframe — less noise, cleaner breakouts
-  - $5M volume floor — avoid illiquid coins
-  - 6% daily circuit breaker — protect capital
-  - Consecutive loss protection — stop after 2 SLs in a row
-  - Trade logging with expectancy tracking
-  - Sniper disabled — too risky for micro-accounts
+  STRATEGY: Dual-Timeframe Capitulation Mean-Reversion
+  - Smart Dual-Timeframe: 1h for Mega-Caps (BTC, ETH, SOL, XRP),
+    15m + 1h fallback for agile altcoins
+  - Smart BTC Regime Gate (1h EMA200): blocks weak dips in
+    bearish regimes while allowing Extreme Capitulation (Score >= 80)
+  - $10M 24h volume floor & spread/orderbook depth filters
+  - Dynamic 3-Stage Exit: ATR Catastrophe Stop -> Break-Even
+    Lock (+2.2%) -> 0.7% Trailing Stop & EMA21 Reversion Exit
+  - 6% daily circuit breaker & consecutive loss protection
 =============================================================
 """
 import os
 from dotenv import load_dotenv
+
 load_dotenv()
+
+# --- 1. API & Environment Credentials ---
 USE_TESTNET = os.getenv('USE_TESTNET', 'False').lower() in ('true', '1', 't')
 if USE_TESTNET:
     API_KEY = os.getenv('BINANCE_TESTNET_API_KEY', '') or os.getenv('BINANCE_API_KEY', '')
@@ -31,28 +29,21 @@ if USE_TESTNET:
 else:
     API_KEY = os.getenv('BINANCE_API_KEY', '')
     API_SECRET = os.getenv('BINANCE_API_SECRET', '')
-ENABLE_MULTI_PAIR = False
-ENABLE_MEME_COINS = False
-ENABLE_NEW_LISTING = False
+
+# --- 2. Strategy & Dual-Timeframe Scanner Settings ---
 ENABLE_SCANNER = True
-MULTI_PAIR_SYMBOLS = [
-    'BTCUSDT',
-    'ETHUSDT',
-    'SOLUSDT',
-    'BNBUSDT',
-    'ADAUSDT']
-MEME_COIN_SYMBOLS = [
-    'DOGEUSDT',
-    'PEPEUSDT']
 STRATEGY_MODE = 'capitulation'  # 'capitulation' (Dual-Regime Mean Reversion) or 'breakout'
 ENABLE_DUAL_TIMEFRAME = True
 ONE_HOUR_ONLY_SYMBOLS = [
     'BTCUSDT',
     'ETHUSDT',
     'SOLUSDT',
-    'XRPUSDT']
+    'XRPUSDT',
+]
 SCANNER_INTERVAL = '15m'
 SCANNER_CANDLE_LIMIT = 250
+CANDLE_INTERVAL = '15m'
+CANDLE_LIMIT = 250
 SCANNER_CACHE_SEC = 60
 SCANNER_TOP_N = 3
 SCANNER_RESCAN_INTERVAL = 300
@@ -61,6 +52,8 @@ MAX_SCAN_CANDIDATES = 50
 MIN_SCORE_TO_TRADE = 75
 MIN_VOLUME_RATIO = 1.5
 MIN_24H_CHANGE_ABS = 0.5
+
+# --- 3. BTC Market Regime & Confirmation Gate ---
 ENABLE_BTC_REGIME_FILTER = True
 BTC_REGIME_EMA_PERIOD = 200
 BTC_REGIME_INTERVAL = '1h'
@@ -69,80 +62,46 @@ ENABLE_HIGH_SCORE_OVERRIDE = True
 HIGH_SCORE_THRESHOLD = 80
 REQUIRE_CONFIRMATION = False
 CONFIRMATION_SCANS = 2
-CANDLE_INTERVAL = '15m'
-MEME_CANDLE_INTERVAL = '5m'
-CANDLE_LIMIT = 250
+
+# --- 4. Position Sizing & Order Execution ---
 TRADE_BALANCE_PCT = 99
-MEME_TRADE_BALANCE_PCT = 99
-SNIPE_TRADE_BALANCE_PCT = 99
 SCANNER_TRADE_PCT = 99
 MAX_TRADE_USDT = 20
 MIN_NOTIONAL_USDT = 11
 USE_QUOTE_ORDER_QTY = True
 USE_EXCHANGE_OCO = True
 ROUND_TRIP_FEE_PCT = 0.2
+
+# --- 5. Dynamic Stop-Loss, Take-Profit & Trailing Parameters ---
 MIN_SL_PCT = 1.5
 MIN_TP_PCT = 1.8
-STABLECOIN_ATR_THRESHOLD = 0.3
-DOJI_MAX_BODY_RATIO = 0.15
-MIN_ORDERBOOK_RATIO = 0.70
-PARABOLIC_PUMP_MAX_PCT = 25.0
-MAX_SCANNER_HOLD_HOURS = 8
-HOLD_EXIT_LOSS_PCT = -1
-MAX_24H_PUMP_PCT = 8
-ENABLE_BREAK_EVEN_STOP = True
-BREAK_EVEN_TRIGGER_PCT = 2.2
-EMA_FAST = 9
-EMA_SLOW = 21
-RSI_PERIOD = 14
-RSI_BUY = 35
-RSI_SELL = 75
-RSI_CONFIRM_BUY = 38
-RSI_CONFIRM_SELL = 70
-RSI_LOOKBACK = 6
-MEME_RSI_PERIOD = 14
-MEME_RSI_BUY = 30
-MEME_RSI_SELL = 78
-MEME_RSI_CONFIRM_BUY = 35
-MEME_RSI_CONFIRM_SELL = 72
-MEME_EMA_FAST = 9
-MEME_EMA_SLOW = 21
-MEME_RSI_LOOKBACK = 6
-VOLUME_MA_PERIOD = 20
-VOLUME_MULTIPLIER = 1
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
-STOP_LOSS_PCT = 2.0
-TAKE_PROFIT_PCT = 6.0
-TRAILING_STOP = True
-TRAILING_OFFSET = 1.8
-USE_ATR_STOPS = True
-ATR_PERIOD = 14
-ATR_SL_MULTIPLIER = 2.5
-ATR_TP_MULTIPLIER = 5.0
-MEME_STOP_LOSS_PCT = 4
-MEME_TAKE_PROFIT_PCT = 12
-MEME_TRAILING_STOP = True
-MEME_TRAILING_OFFSET = 2.5
-MEME_USE_ATR_STOPS = True
-MEME_ATR_SL_MULTIPLIER = 4
-MEME_ATR_TP_MULTIPLIER = 8
+SCANNER_USE_ATR_STOPS = True
+SCANNER_ATR_SL_MULTIPLIER = 4.8
+SCANNER_ATR_TP_MULTIPLIER = 2.0
 SCANNER_STOP_LOSS_PCT = 4.5
 SCANNER_MAX_STOP_LOSS_PCT = 7.0
 SCANNER_TAKE_PROFIT_PCT = 2.2
 SCANNER_TRAILING_STOP = True
 SCANNER_TRAILING_OFFSET = 0.7
 MIN_TRAILING_PROFIT_PCT = 1.6
-SCANNER_USE_ATR_STOPS = True
-SCANNER_ATR_SL_MULTIPLIER = 4.8
-SCANNER_ATR_TP_MULTIPLIER = 2.0
-SNIPE_QUOTE_ASSET = 'USDT'
-SNIPE_BUY_DELAY_SEC = 3
-SNIPE_TAKE_PROFIT_PCT = 20
-SNIPE_STOP_LOSS_PCT = 10
-SNIPE_SELL_AFTER_MIN = 60
-SNIPE_SCAN_INTERVAL = 30
+ENABLE_BREAK_EVEN_STOP = True
+BREAK_EVEN_TRIGGER_PCT = 2.2
+MAX_SCANNER_HOLD_HOURS = 8
+HOLD_EXIT_LOSS_PCT = -1
+
+# --- 6. Technical Indicator & Safety Filter Thresholds ---
+EMA_FAST = 9
+EMA_SLOW = 21
+RSI_PERIOD = 14
+VOLUME_MA_PERIOD = 20
+ATR_PERIOD = 14
+STABLECOIN_ATR_THRESHOLD = 0.3
+DOJI_MAX_BODY_RATIO = 0.15
+MIN_ORDERBOOK_RATIO = 0.70
+PARABOLIC_PUMP_MAX_PCT = 25.0
+MAX_24H_PUMP_PCT = 8
+
+# Stablecoins & wrapped tokens excluded from scanning
 SNIPE_BLACKLIST = [
     'USDCUSDT',
     'BUSDUSDT',
@@ -158,7 +117,10 @@ SNIPE_BLACKLIST = [
     'EURUSDT',
     'GBPUSDT',
     'WBTCUSDT',
-    'WBETHUSDT']
+    'WBETHUSDT',
+]
+
+# --- 7. Portfolio Risk & Circuit Breaker Limits ---
 MAX_DAILY_LOSS = 6
 MAX_OPEN_TRADES = 1
 MAX_CONSECUTIVE_LOSSES = 2
@@ -171,6 +133,8 @@ RETRY_DELAY = 5
 BALANCE_CACHE_TTL = 10
 POSITIONS_FILE = 'positions.json'
 TRADE_LOG_FILE = 'trade_log.json'
+
+# --- 8. Telegram & Logging ---
 ENABLE_TELEGRAM = os.getenv('ENABLE_TELEGRAM', 'False').lower() in ('true', '1', 't')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
