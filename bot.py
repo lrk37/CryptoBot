@@ -231,7 +231,12 @@ class ScannerEngine:
             # F-11: Add to active symbols under lock
             with self._state_lock:
                 self._active_symbols.add(symbol)
-            self.notifier.trade_opened(symbol, "BUY", fill_price, exec_qty, pos.stop_loss, pos.take_profit)
+            tf = getattr(res, 'timeframe', getattr(cfg, 'SCANNER_INTERVAL', '15m'))
+            max_hold_h = getattr(cfg, 'MAX_SCANNER_HOLD_HOURS', 8)
+            self.notifier.trade_opened(
+                symbol, "BUY", fill_price, exec_qty, pos.stop_loss, pos.take_profit,
+                timeframe=tf, max_hold_hours=max_hold_h
+            )
 
             # Submit native exchange-side OCO stop/profit order
             if getattr(cfg, 'USE_EXCHANGE_OCO', True):
@@ -297,6 +302,8 @@ class ScannerEngine:
                             reason = "TAKE_PROFIT" if fill['type'] in ('LIMIT_MAKER', 'LIMIT') else "STOP_LOSS"
                             log.info(f"[EXCHANGE FILL] {symbol} OCO leg filled ({reason}) at {exit_px:.6f}")
                             pnl_pct = pos.pnl_pct(exit_px)
+                            pnl_usdt = pos.pnl_usdt(exit_px)
+                            dur_sec = time.time() - pos.open_time
                             self.risk_mgr.close_position(symbol, exit_px, f"OCO_{reason}")
                             with self._state_lock:
                                 self._active_symbols.discard(symbol)
@@ -304,7 +311,10 @@ class ScannerEngine:
                                 if reason == "STOP_LOSS" and getattr(cfg, 'STRATEGY_MODE', 'capitulation') == 'capitulation':
                                     cd_sec = max(cd_sec, 14400)
                                 self._symbol_cooldowns[symbol] = time.time() + cd_sec
-                            self.notifier.trade_closed(symbol, f"OCO_{reason}", pos.entry_price, exit_px, pnl_pct)
+                            self.notifier.trade_closed(
+                                symbol, f"OCO_{reason}", pos.entry_price, exit_px, pnl_pct,
+                                duration_sec=dur_sec, pnl_usdt=pnl_usdt
+                            )
                             continue
                         log.warning(f"[OCO] {symbol}: OCO is no longer open but no filled SELL was found - "
                                     f"dropping the OCO link; client-side exits stay active")
@@ -335,6 +345,7 @@ class ScannerEngine:
             pnl_pct = pos.pnl_pct(exit_price)
             pnl_usdt = pos.pnl_usdt(exit_price)
 
+            dur_sec = time.time() - pos.open_time
             self.risk_mgr.close_position(symbol, exit_price, reason)
             # F-11: Remove from active symbols under lock
             with self._state_lock:
@@ -348,7 +359,10 @@ class ScannerEngine:
                 self._symbol_cooldowns[symbol] = time.time() + cooldown_sec
             log.info(f"[COOLDOWN SET] {symbol} placed on {cooldown_sec // 60}m cooldown after trade close ({reason})")
 
-            self.notifier.trade_closed(symbol, reason, pos.entry_price, exit_price, pnl_pct)
+            self.notifier.trade_closed(
+                symbol, reason, pos.entry_price, exit_price, pnl_pct,
+                duration_sec=dur_sec, pnl_usdt=pnl_usdt
+            )
 
             # Save chart snapshot on exit
             try:

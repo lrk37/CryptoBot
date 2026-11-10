@@ -39,22 +39,36 @@ class TelegramNotifier:
             log.warning(f"Telegram connection error: {e}")
             return False
 
-    def trade_opened(self, symbol, side, price, qty, sl, tp):
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        if seconds < 60:
+            return f"{seconds}s"
+        if seconds < 3600:
+            return f"{seconds // 60}m {seconds % 60}s"
+        hours = seconds // 3600
+        mins = (seconds % 3600) // 60
+        return f"{hours}h {mins}m"
+
+    def trade_opened(self, symbol, side, price, qty, sl, tp, timeframe: str = None, max_hold_hours: int = 8):
         # F-26: Use code spans for values (no escaping needed inside backticks).
         # Only escape text outside code spans.
         side_esc = _escape_md2(side)
-        sym_esc = _escape_md2(symbol)
-        msg = (f"\U0001f7e2 *{side_esc}* `{symbol}`\n"
+        tf_tag = f" \\[`{timeframe}`\\]" if timeframe else ""
+        msg = (f"\U0001f7e2 *{side_esc}* `{symbol}`{tf_tag}\n"
                f"Price: `{price:.6f}` \\| Qty: `{qty}`\n"
-               f"SL: `{sl:.6f}` \\| TP: `{tp:.6f}`")
+               f"SL: `{sl:.6f}` \\| TP: `{tp:.6f}`\n"
+               f"\u23f1 Est\\. Hold: `30m - 3h` \\(Max `{max_hold_hours}h`\\)")
         self.send(msg, parse_mode='MarkdownV2')
 
-    def trade_closed(self, symbol, reason, entry, close, pnl):
+    def trade_closed(self, symbol, reason, entry, close, pnl, duration_sec: float = None, pnl_usdt: float = None):
         e = '\u2705' if pnl >= 0 else '\U0001f534'
         rsn = _escape_md2(reason)
+        pnl_str = f"`{pnl:+.2f}%` \\(`{pnl_usdt:+.2f} USDT`\\)" if pnl_usdt is not None else f"`{pnl:+.2f}%`"
+        dur_line = f"\n\u23f1 Duration: `{self._format_duration(duration_sec)}`" if duration_sec is not None else ""
         msg = (f"{e} *CLOSED* `{symbol}` \\- {rsn}\n"
                f"Entry: `{entry:.6f}` \\-> Exit: `{close:.6f}`\n"
-               f"PnL: `{pnl:+.2f}%`")
+               f"PnL: {pnl_str}{dur_line}")
         self.send(msg, parse_mode='MarkdownV2')
 
     def alert(self, msg):
