@@ -177,18 +177,11 @@ class ScannerEngine:
         price = res.close_price
 
         bal = self.exchange.get_usdt_balance()
-        max_open = max(1, int(getattr(cfg, 'MAX_OPEN_TRADES', 2)))
-        open_cnt = self.risk_mgr.open_count()
-        remaining_slots = max(1, max_open - open_cnt)
-        # F-18: Split free USDT evenly across remaining open trade slots so 2-slot compounding works seamlessly
-        trade_pct = getattr(cfg, 'SCANNER_TRADE_PCT', 98) / 100.0
-        slot_bal = (bal * trade_pct) / remaining_slots
-        max_usdt = (
-            getattr(cfg, 'TESTNET_MAX_TRADE_USDT', 25.0)
-            if getattr(cfg, 'USE_TESTNET', False)
-            else getattr(cfg, 'MAX_TRADE_USDT', 150.0)
-        )
-        usdt_amount = min(slot_bal, max_usdt)
+        max_usdt = getattr(cfg, 'MAX_TRADE_USDT', 20.0)
+        # F-18: Use SCANNER_TRADE_PCT config instead of hardcoded 0.99
+        trade_pct = getattr(cfg, 'SCANNER_TRADE_PCT', 99) / 100.0
+        usable_bal = bal * trade_pct if bal < max_usdt else max_usdt
+        usdt_amount = min(usable_bal, max_usdt)
 
         if usdt_amount < getattr(cfg, 'MIN_NOTIONAL_USDT', 11.0):
             log.warning(f"[ENTRY FAILED] Insufficient balance for {symbol}: ${usdt_amount:.2f}")
