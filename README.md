@@ -8,7 +8,7 @@ An automated, non-custodial **Binance Spot** trading bot written in Python. Inst
 
 ```mermaid
 flowchart TD
-    A["Every 5 Minutes: Fetch All Tradeable Binance USDT Spot Pairs"] --> B["Liquidity & Safety Pre-Filter\n• 24h Volume >= $10,000,000 USDT\n• Top 50 Most Liquid Pairs\n• Exclude Stablecoins & Wrapped Tokens\n• Bid-Ask Spread <= 0.25% & Orderbook Imbalance Check"]
+    A["Every 5 Minutes: Fetch All Tradeable Binance USDT Spot Pairs"] --> B["Liquidity & Safety Pre-Filter\n• 24h Volume >= $10,000,000 USDT (Top 50 Pairs)\n• 24h Safe-Range: -18% <= 24h Change <= +25%\n• Exclude Stablecoins & Wrapped Tokens\n• Bid-Ask Spread <= 0.25% & Orderbook Imbalance Check"]
     B --> C{"Smart Dual-Timeframe Router"}
     C -->|"Heavy Mega-Caps\n(BTC, ETH, SOL, XRP)"| D["Analyze Closed 1h Candles\n(Filters out 15m micro-noise)"]
     C -->|"Agile Mid-Cap Altcoins\n(ADA, AVAX, SUI, LINK, DOT, ZEC, etc.)"| E["Analyze Closed 15m Candles\n+ 1h Fallback Scan"]
@@ -20,7 +20,7 @@ flowchart TD
     H --> J["Execute Spot Market Buy + Place Native Exchange OCO\nSave ENTRY Chart Snapshot + Send Telegram Alert"]
     I --> J
     J --> K["Monitor Open Position Every 30 Seconds\nDynamic 3-Stage Exit Engine"]
-    K --> L["Close Trade -> Save EXIT Chart Snapshot -> Send Telegram Summary\nApply Per-Symbol Cooldown (1h normal / 4h after Stop-Loss)"]
+    K --> L["Close Trade -> Save EXIT Chart Snapshot -> Send Telegram Summary\nApply Per-Symbol Cooldown (1h normal / 12h LowProfitPairs lockout after Stop-Loss)"]
 ```
 
 ---
@@ -55,12 +55,13 @@ Instead of using a tight `-1.5%` stop-loss that gets hunted by normal crypto wic
 2. **Stage 2 — Fast Risk Elimination (Break-Even & Trailing Stop):**
    - **Trailing Stop (`+1.8%` effective trigger, `0.7%` offset):** Once profit reaches `+1.8%` (`MIN_TRAILING_PROFIT_PCT + ROUND_TRIP_FEE_PCT`), a tight `0.7%` trailing stop arms to follow the rebound upward.
    - **Break-Even Lock (`+2.2%` trigger):** Once profit reaches `+2.2%`, the Stop-Loss floor is automatically raised above your entry price (`entry * 1.002`), making the trade **100% risk-free**.
-   - **Mean-Reversion `EMA21` Profit-Take:** If a candle closes back above `EMA21` with at least `+1.2%` profit, the bot banks the mean-reversion gain immediately.
+   - **Time-Decaying `EMA21` Profit-Take (`minimal_roi` style):** If a candle closes back above `EMA21` with `>= +1.2%` profit in the first 45m (`2h` on `1h` trades) — or `>= +0.55%` profit after 45m (`2h` on `1h` trades) once `EMA21` has drifted lower — the bot banks the mean-reversion gain immediately.
 3. **Stage 3 — Time & Trend Invalidation (`8h` / `16h`):**
    - If a position has been open for `8 hours` (`MAX_SCANNER_HOLD_HOURS`) and the last closed candle is still below `EMA21`, it exits early (`TREND_INVALIDATED`) rather than waiting for the catastrophe stop. Hard maximum hold time is `16 hours` (`MAX_HOLD_TIMEOUT`).
 
-### D. Portfolio Circuit Breakers & Cooldowns
-- **Per-Symbol Cooldown:** `1 hour` cooldown after a normal exit; extended to **`4 hours` (`14,400s`)** after a `STOP_LOSS` to prevent re-entering a coin undergoing a multi-hour cascade.
+### D. Portfolio Circuit Breakers & Protections
+- **24h Safe-Dump & Parabolic Guard:** Blocks coins that have crashed more than `-18%` in 24h (`MAX_24H_DUMP_PCT = -18.0`, protecting against hacks/delistings/falling knives) or pumped more than `+25%` (`PARABOLIC_PUMP_MAX_PCT = 25.0`).
+- **Per-Symbol Cooldown (`LowProfitPairs` Protection):** `1 hour` cooldown after a normal exit; extended to **`12 hours` (`43,200s`)** after a `STOP_LOSS` to prevent re-entering a bleeding coin on the same day.
 - **Consecutive Loss Pause:** Pauses scanning for `30 minutes` after `2` consecutive stop-losses.
 - **Daily Circuit Breaker:** Halts new entries for the rest of the UTC day if daily portfolio drawdown reaches `6%` (`MAX_DAILY_LOSS = 6`).
 
@@ -72,10 +73,10 @@ Tested across the 15-coin liquid basket (`BTC`, `ETH`, `BNB`, `SOL`, `XRP`, `ADA
 
 | Metric | Old Breakout Bot (v5) | **New Dual-Timeframe Capitulation Bot** |
 |---|---|---|
-| **Profitable Coins in Basket** | `0 / 15` (`0%`) | **`12 / 15` (`80%` — `BROAD EDGE ✓`)** |
-| **Overall Win Rate** | `18% – 28%` | **`79.2%` (`76` Wins / `20` Losses)** |
-| **Pooled Profit Factor** | `0.34` | **`2.24` (`+$61.62` Net P&L)** |
-| **Median Expectancy / Trade** | `-1.12%` | **`+0.82%` net per trade** |
+| **Profitable Coins in Basket** | `0 / 15` (`0%`) | **`14 / 15` (`93%` — `BROAD EDGE ✓`)** |
+| **Overall Win Rate** | `18% – 28%` | **`84.5%` (`82` Wins / `15` Losses across `97` trades)** |
+| **Pooled Profit Factor** | `0.34` | **`3.05` (`+$73.75` Net P&L)** |
+| **Median Expectancy / Trade** | `-1.12%` | **`+0.87%` net per trade** |
 | **Shared Portfolio Max Drawdown** | `> 25%` | **`0.89%`** |
 
 ---

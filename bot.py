@@ -309,7 +309,7 @@ class ScannerEngine:
                                 self._active_symbols.discard(symbol)
                                 cd_sec = getattr(cfg, 'SYMBOL_COOLDOWN_SEC', 3600)
                                 if reason == "STOP_LOSS" and getattr(cfg, 'STRATEGY_MODE', 'capitulation') == 'capitulation':
-                                    cd_sec = max(cd_sec, 14400)
+                                    cd_sec = max(cd_sec, 43200)
                                 self._symbol_cooldowns[symbol] = time.time() + cd_sec
                             self.notifier.trade_closed(
                                 symbol, f"OCO_{reason}", pos.entry_price, exit_px, pnl_pct,
@@ -351,10 +351,10 @@ class ScannerEngine:
             with self._state_lock:
                 self._active_symbols.discard(symbol)
 
-            # F-10: Set Symbol Cooldown under lock (4h after STOP_LOSS in capitulation mode)
+            # F-10: Set Symbol Cooldown under lock (12h LowProfitPairs lockout after STOP_LOSS in capitulation mode)
             cooldown_sec = getattr(cfg, 'SYMBOL_COOLDOWN_SEC', 3600)
             if "STOP_LOSS" in str(reason) and getattr(cfg, 'STRATEGY_MODE', 'capitulation') == 'capitulation':
-                cooldown_sec = max(cooldown_sec, 14400)
+                cooldown_sec = max(cooldown_sec, 43200)
             with self._state_lock:
                 self._symbol_cooldowns[symbol] = time.time() + cooldown_sec
             log.info(f"[COOLDOWN SET] {symbol} placed on {cooldown_sec // 60}m cooldown after trade close ({reason})")

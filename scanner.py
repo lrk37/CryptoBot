@@ -202,12 +202,16 @@ class MarketScanner:
             else:
                 pct_24h = 0.0
 
-            # --- TIERED 24h PUMP PENALTY ---
+            # --- TIERED 24h PUMP & CRASH GUARD ---
             strategy_mode = getattr(self.cfg, 'STRATEGY_MODE', 'capitulation')
             parabolic_max = getattr(self.cfg, 'PARABOLIC_PUMP_MAX_PCT', 25.0)
+            max_dump = getattr(self.cfg, 'MAX_24H_DUMP_PCT', -18.0)
             pump_penalty = 0.0
             if pct_24h > parabolic_max:
                 log.info(f"[SCANNER] {symbol} hard-blocked (parabolic 24h pump = {pct_24h:+.1f}% > {parabolic_max:.0f}%)")
+                return None
+            if strategy_mode == 'capitulation' and pct_24h < max_dump:
+                log.info(f"[SCANNER] {symbol} hard-blocked (falling-knife 24h dump = {pct_24h:+.1f}% < {max_dump:.1f}%)")
                 return None
             elif pct_24h > 15.0:
                 pump_penalty = -20.0

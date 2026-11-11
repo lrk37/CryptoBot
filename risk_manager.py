@@ -318,11 +318,14 @@ class RiskManager:
             if peak_profit_pct >= fee_adjusted_trigger and drop_pct >= trailing_offset:
                 return "TRAILING_STOP"
 
-        # 3b. Mean-reversion profit-take when price reclaims EMA21 with >= 1.2% gain
+        # 3b. Mean-reversion profit-take when price reclaims EMA21 (time-decaying threshold: +1.2% early -> +0.55% after 45m/2h)
         if kind == "scanner" and getattr(self.cfg, 'STRATEGY_MODE', 'capitulation') == 'capitulation':
-            if entry_price > 0 and ((current_price - entry_price) / entry_price) * 100.0 >= 1.2:
+            hold_sec = time.time() - open_time
+            decay_sec = 7200 if pos_tf == '1h' else 2700
+            min_ema_profit_pct = 0.55 if hold_sec >= decay_sec else 1.2
+            if entry_price > 0 and ((current_price - entry_price) / entry_price) * 100.0 >= min_ema_profit_pct:
                 if self._closed_above_ema21(symbol, interval=pos_tf):
-                    log.info(f"[EMA21 REVERSION TP] {symbol} reclaimed EMA21 in profit -> closing")
+                    log.info(f"[EMA21 REVERSION TP] {symbol} reclaimed EMA21 in profit (>= {min_ema_profit_pct:.2f}%) -> closing")
                     return "TAKE_PROFIT"
 
         # 4. Trend invalidation / max-hold exit (scanner positions only)

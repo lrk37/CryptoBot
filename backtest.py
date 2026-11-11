@@ -277,12 +277,16 @@ class StrategyBacktester:
                     if position.get('tf') == '1h' and ema21_1h_aligned is not None:
                         if bars_held >= 4 and getattr(curr_time, 'minute', 45) == 45:
                             target_ema = ema21_1h_aligned.iloc[i]
-                            if not np.isnan(target_ema) and close_price >= target_ema and close_price >= position['entry_price'] * 1.012:
+                            req_mult = 1.0055 if bars_held >= 8 else 1.012
+                            if not np.isnan(target_ema) and close_price >= target_ema and close_price >= position['entry_price'] * req_mult:
                                 exit_price = close_price
                                 reason = "TAKE_PROFIT"
-                    elif close_price >= ema21.iloc[i] and close_price >= position['entry_price'] * 1.012:
-                        exit_price = close_price
-                        reason = "TAKE_PROFIT"
+                    else:
+                        decay_bars = 2 if interval == '1h' else 3
+                        req_mult = 1.0055 if bars_held >= decay_bars else 1.012
+                        if close_price >= ema21.iloc[i] and close_price >= position['entry_price'] * req_mult:
+                            exit_price = close_price
+                            reason = "TAKE_PROFIT"
                 if exit_price is None and bars_held >= max_hold_bars:   # 4. Trend invalidation / hard timeout
                     if bars_held >= 2 * max_hold_bars:
                         exit_price = close_price
@@ -336,7 +340,7 @@ class StrategyBacktester:
 
                 position = None
                 if strategy_mode == 'capitulation' and reason == 'STOP_LOSS':
-                    cooldown_until_idx = i + 16
+                    cooldown_until_idx = i + (12 if interval == '1h' else 48)
                 else:
                     cooldown_until_idx = i + max(4, int(60 / self._bar_minutes))
 
@@ -377,6 +381,13 @@ class StrategyBacktester:
                 p_vol = vol.iloc[i-1]
 
                 if strategy_mode == 'capitulation':
+                    bars_24h = 24 if interval == '1h' else 96
+                    max_dump = getattr(cfg, 'MAX_24H_DUMP_PCT', -18.0)
+                    if i - 1 >= bars_24h and close.iloc[i - 1 - bars_24h] > 0:
+                        pct_24h = ((p_close - close.iloc[i - 1 - bars_24h]) / close.iloc[i - 1 - bars_24h]) * 100.0
+                        if pct_24h < max_dump or pct_24h > getattr(cfg, 'PARABOLIC_PUMP_MAX_PCT', 25.0):
+                            continue
+
                     score = 0.0
                     # Check 15m setup unless symbol is designated 1h-only
                     if not (dual_tf and symbol in one_hour_only):
