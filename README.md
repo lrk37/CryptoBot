@@ -16,7 +16,7 @@ flowchart TD
     E --> F
     F --> G{"Smart BTC Regime Gate\n(BTC vs 1h EMA200)"}
     G -->|"BTC BULLISH\n(BTC > 1h EMA200)"| H["Allow Both:\n• Extreme Capitulation (Score >= 85)\n• Bull-Regime Pullback (Score >= 78)"]
-    G -->|"BTC BEARISH\n(BTC <= 1h EMA200)"| I["Block Shallow Dips\nAllow ONLY Extreme Capitulation (Score >= 80)"]
+    G -->|"BTC BEARISH\n(BTC <= 1h EMA200)"| I["Block Shallow Dips\nAllow ONLY Extreme Capitulation (Score >= 85)"]
     H --> J["Execute Spot Market Buy + Place Native Exchange OCO\nSave ENTRY Chart Snapshot + Send Telegram Alert"]
     I --> J
     J --> K["Monitor Open Position Every 30 Seconds\nDynamic 3-Stage Exit Engine"]

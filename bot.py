@@ -248,10 +248,10 @@ class ScannerEngine:
                 except Exception as e:
                     log.warning(f"[OCO EXCEPTION] Could not place OCO: {e}")
             
-            # Save chart snapshot on entry
+            # Save chart snapshot on entry (fetch 100 bars so 50-bar chart has warmed-up indicators)
             try:
                 tf = getattr(res, 'timeframe', getattr(cfg, 'SCANNER_INTERVAL', '15m'))
-                df = self.exchange.get_candles(symbol, interval=tf, limit=50)
+                df = self.exchange.get_candles(symbol, interval=tf, limit=100)
                 save_trade_chart(symbol, df, fill_price, fill_price, 0.0, 0.0, "ENTRY", pos.stop_loss, pos.take_profit)
             except Exception as e:
                 log.warning(f"[CHART LOGGER] Entry chart failed: {e}")
@@ -364,10 +364,10 @@ class ScannerEngine:
                 duration_sec=dur_sec, pnl_usdt=pnl_usdt
             )
 
-            # Save chart snapshot on exit
+            # Save chart snapshot on exit (fetch 100 bars so 50-bar chart has warmed-up indicators)
             try:
                 tf = (pos.details or {}).get('timeframe', getattr(cfg, 'SCANNER_INTERVAL', '15m'))
-                df = self.exchange.get_candles(symbol, interval=tf, limit=50)
+                df = self.exchange.get_candles(symbol, interval=tf, limit=100)
                 save_trade_chart(symbol, df, pos.entry_price, exit_price, pnl_pct, pnl_usdt, reason, pos.stop_loss, pos.take_profit)
             except Exception as e:
                 log.warning(f"[CHART LOGGER] Exit chart failed: {e}")

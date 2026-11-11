@@ -258,6 +258,9 @@ class MarketScanner:
                 ob_score = 6.0
             elif ob_ratio >= 1.0:
                 ob_score = 3.0
+            if strategy_mode == 'capitulation':
+                # Cap orderbook bonus at +5 so Tier 2 (base 78 -> max 83) never crosses Tier 1 threshold (85)
+                ob_score = min(ob_score, 5.0)
 
             # Calculate ATR & Volatility
             tr = pd.concat([
@@ -296,6 +299,16 @@ class MarketScanner:
             reasons = []
 
             if strategy_mode == 'capitulation':
+                # Guard against chasing late in the forming candle after the bounce already happened
+                live_close = float(df['close'].iloc[-1])
+                live_high = float(df['high'].iloc[-1])
+                if last_close > 0 and (live_close > last_close * 1.0035 or live_high >= last_close * 1.008):
+                    log.info(
+                        f"[SCANNER] {symbol} ({tf}) skipped - forming candle already bounced "
+                        f"(closed={last_close:.4f}, live={live_close:.4f}, high={live_high:.4f})"
+                    )
+                    return None
+
                 bb_mid = close.rolling(20).mean().iloc[-1]
                 bb_std = close.rolling(20).std().iloc[-1]
                 bb_low = bb_mid - 2.0 * bb_std if not np.isnan(bb_std) else last_close

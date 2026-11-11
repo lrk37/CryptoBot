@@ -62,7 +62,7 @@ def save_trade_chart(symbol: str, df: pd.DataFrame, entry_price: float, exit_pri
 
     try:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
-        df_ind = _calculate_indicators(df)
+        df_ind = _calculate_indicators(df).tail(50)
         
         plt.style.use('dark_background')
         fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 8), sharex=True,
