@@ -890,6 +890,120 @@ class TestBotMonitor(InTempDir):
         self.assertAlmostEqual(row["quantity"], 0.6, places=6)
         self.assertAlmostEqual(row["exit_price"], 105.0, places=4)
 
+    def test_monitor_does_not_clear_in_flight_submitting_buy_race(self):
+        """Concurrent _reconcile_pending_buys() during in-flight buy submission must never wipe
+        pending_buys even if Binance does not yet know the order (-2013)."""
+        import threading
+        from binance.exceptions import BinanceAPIException
+        from scanner import ScanResult
+
+        buy_calls = []
+        get_order_calls = []
+        state_during_buy = {}
+
+        def make_not_found():
+            err = BinanceAPIException.__new__(BinanceAPIException)
+            Exception.__init__(err, "Order does not exist")
+            err.code = -2013
+            return err
+
+        fc, conn, rm, nt, eng, cfg = self._make_live_stack()
+        fc.price = 20.0
+
+        def fake_get_order(symbol, origClientOrderId):
+            get_order_calls.append(origClientOrderId)
+            # Before Binance registers the timed-out order on the very first timeout reconciliation check,
+            # simulate -2013 if in-flight; after submission completes, simulate Binance having accepted it!
+            if state_during_buy.get("submitted"):
+                return {
+                    "symbol": symbol, "clientOrderId": origClientOrderId,
+                    "status": "FILLED", "executedQty": "1.0",
+                    "cummulativeQuoteQty": "20.0", "updateTime": 1_700_000_000_000,
+                }
+            raise make_not_found()
+
+        def fake_market_buy(**kw):
+            buy_calls.append(kw)
+            # Persist shows state == 'SUBMITTING' BEFORE HTTP call completes
+            state_during_buy["disk_state"] = read_json("scanner_state.json")["pending_buys"]["BBBUSDT"]["state"]
+            # Trigger concurrent monitor reconciliation from another thread while buy is STILL in flight
+            t = threading.Thread(target=eng._reconcile_pending_buys)
+            t.start()
+            t.join(timeout=2)
+            state_during_buy["after_race_pending"] = eng._pending_buy_count()
+            # Simulate order actually reaching Binance and timing out on HTTP response
+            state_during_buy["submitted"] = True
+            raise RuntimeError("Read timed out after Binance accepted order")
+
+        fc.order_market_buy = fake_market_buy
+        fc.get_order = fake_get_order
+
+        res = ScanResult(
+            symbol="BBBUSDT", score=85.0, raw_score=80.0, pump_penalty=0.0,
+            ema_score=25.0, rsi_score=25.0, vol_score=25.0, breakout_score=5.0, ob_score=5.0,
+            close_price=20.0, rsi=18.0, volume_ratio=2.5, breakout_atr_ratio=0.0,
+            bid_ask_ratio=1.4, atr=0.5, pct_change_24h=-5.0,
+            reason="CAPITULATION", last_closed_time=1000, timeframe="15m"
+        )
+        eng._execute_entry(res)
+
+        self.assertEqual(state_during_buy["disk_state"], "SUBMITTING")
+        self.assertEqual(state_during_buy["after_race_pending"], 1)  # monitor MUST NOT have wiped it mid-flight
+        self.assertEqual(len(buy_calls), 1)
+        # Reconciled cleanly once fake_market_buy timed out and get_order found the FILLED order
+        self.assertEqual(eng._pending_buy_count(), 0)
+        self.assertTrue(rm.has_position("BBBUSDT"))
+
+    def test_crash_after_open_position_before_clearing_pending_buy_preserves_oco_sync(self):
+        """Position must be persisted in positions.json BEFORE clearing pending_buys; on restart with both
+        present and no OCO yet, _reconcile_pending_buys clears pending_buys and preserves oco_needs_sync."""
+        from scanner import ScanResult
+
+        fc, conn, rm, nt, eng, cfg = self._make_live_stack()
+        fc.price = 20.0
+        saw_pending_during_open = []
+        orig_open = rm.open_position
+
+        def spy_open_position(*a, **kw):
+            # When open_position() executes, scanner_state.json MUST still retain pending_buys["BBBUSDT"]
+            saw_pending_during_open.append("BBBUSDT" in read_json("scanner_state.json")["pending_buys"])
+            return orig_open(*a, **kw)
+
+        rm.open_position = spy_open_position
+        fc.order_market_buy = lambda **kw: {
+            "symbol": kw["symbol"], "clientOrderId": kw["newClientOrderId"],
+            "status": "FILLED", "executedQty": "1.0", "cummulativeQuoteQty": "20.0",
+        }
+        # Simulate crash right AFTER open_position saved positions.json, BEFORE _clear_pending_buy cleared disk
+        orig_clear = eng._clear_pending_buy
+        eng._clear_pending_buy = lambda s: (_ for _ in ()).throw(RuntimeError("simulated power loss"))
+
+        res = ScanResult(
+            symbol="BBBUSDT", score=85.0, raw_score=80.0, pump_penalty=0.0,
+            ema_score=25.0, rsi_score=25.0, vol_score=25.0, breakout_score=5.0, ob_score=5.0,
+            close_price=20.0, rsi=18.0, volume_ratio=2.5, breakout_atr_ratio=0.0,
+            bid_ask_ratio=1.4, atr=0.5, pct_change_24h=-5.0,
+            reason="CAPITULATION", last_closed_time=1000, timeframe="15m"
+        )
+        with self.assertRaises(RuntimeError):
+            eng._execute_entry(res)
+
+        self.assertEqual(saw_pending_during_open, [True])
+        # Both positions.json and scanner_state.json exist on disk after the simulated crash
+        self.assertIn("BBBUSDT", read_json(cfg.POSITIONS_FILE))
+        self.assertIn("BBBUSDT", read_json("scanner_state.json")["pending_buys"])
+
+        # Restart process cleanly: loads both files, reconciles, clears pending_buys, places protective OCO
+        from risk_manager import RiskManager
+        rm2 = RiskManager(cfg)
+        rm2.set_exchange(conn)
+        eng2 = self.bot.ScannerEngine(conn, rm2, nt)
+        eng2._monitor_tick()
+
+        self.assertEqual(eng2._pending_buy_count(), 0)
+        self.assertTrue(rm2.has_position("BBBUSDT"))
+        self.assertEqual(rm2.get_position("BBBUSDT").details.get("oco_order_list_id"), 7)
+
 
 # =============================================================== backtester
 class TestBacktest(unittest.TestCase):

@@ -45,15 +45,16 @@ class ScannerEngine:
         self.scanner = MarketScanner(exchange, cfg)
         self._running = False
 
-        # F-10/F-11: Reentrant lock for shared mutable state + lock for pending order reconciliation
+        # F-10/F-11: Reentrant locks for shared mutable state & pending order lifecycle
         self._state_lock = threading.RLock()
-        self._order_reconcile_lock = threading.Lock()
+        self._order_reconcile_lock = threading.RLock()
         self._active_symbols = set()
         self._symbol_cooldowns: dict[str, float] = {}
 
         self._prev_high_scores: dict[str, dict] = {}
         self._curr_high_scores: dict[str, dict] = {}
         self._pending_buys: dict[str, dict] = {}
+        self._in_flight_buys: set[str] = set()
 
         self._load_scanner_state()
 
@@ -211,6 +212,11 @@ class ScannerEngine:
                 pass
         return self.exchange.market_sell(symbol, sell_qty)
 
+    def _clear_pending_buy(self, symbol: str):
+        with self._state_lock:
+            self._pending_buys.pop(symbol, None)
+        self._save_scanner_state()
+
     def _reconcile_pending_buys(self):
         """Reconcile any persisted unresolved entry clientOrderIds before scanning or allowing new entries."""
         if not hasattr(self.exchange, 'reconcile_client_order_strict'):
@@ -219,39 +225,46 @@ class ScannerEngine:
             with self._state_lock:
                 pending_items = list(self._pending_buys.items())
             for symbol, meta in pending_items:
+                with self._state_lock:
+                    if symbol in self._in_flight_buys:
+                        log.info(f"[PENDING BUY] {symbol} initial submission in progress; skipping reconciliation")
+                        continue
                 client_oid = (meta or {}).get('client_oid')
                 if not client_oid:
-                    with self._state_lock:
-                        self._pending_buys.pop(symbol, None)
-                    self._save_scanner_state()
+                    self._clear_pending_buy(symbol)
                     continue
                 if self.risk_mgr.has_position(symbol):
+                    existing_pos = self.risk_mgr.get_position(symbol)
+                    if existing_pos and existing_pos.details.get('oco_order_list_id') is None and getattr(cfg, 'USE_EXCHANGE_OCO', True):
+                        existing_pos.details['oco_needs_sync'] = True
+                        self.risk_mgr.persist_positions()
                     with self._state_lock:
-                        self._pending_buys.pop(symbol, None)
-                    self._save_scanner_state()
+                        self._active_symbols.add(symbol)
+                    self._clear_pending_buy(symbol)
                     continue
 
                 state, order = self.exchange.reconcile_client_order_strict(symbol, client_oid)
                 if state == 'NOT_FOUND':
                     log.info(f"[PENDING BUY] {symbol} {client_oid} confirmed not found (-2013); clearing pending entry")
-                    with self._state_lock:
-                        self._pending_buys.pop(symbol, None)
-                    self._save_scanner_state()
+                    self._clear_pending_buy(symbol)
                 elif state == 'FOUND' and order is not None:
                     if not self._order_is_terminal(order):
+                        with self._state_lock:
+                            if symbol in self._pending_buys:
+                                self._pending_buys[symbol]['state'] = 'PENDING'
+                                self._save_scanner_state()
                         log.warning(
                             f"[PENDING BUY] {symbol} {client_oid} still non-terminal "
                             f"(status={order.get('status')}); keeping pending lock"
                         )
                         continue
-                    with self._state_lock:
-                        self._pending_buys.pop(symbol, None)
-                    self._save_scanner_state()
-                    self._finalize_buy_order(symbol, order, meta)
+                    # Finalize and persist RiskManager position FIRST before clearing pending_buys
+                    self._finalize_buy_order(symbol, order, meta, clear_pending=True)
                 else:
                     log.warning(f"[PENDING BUY] {symbol} {client_oid} could not be verified ({state}); keeping lock")
 
-    def _finalize_buy_order(self, symbol: str, order: dict, meta: dict):
+    def _finalize_buy_order(self, symbol: str, order: dict, meta: dict, clear_pending: bool = False) -> bool:
+        """Persist position in RiskManager first, clear pending_buy only once durable, then notify/OCO/chart."""
         fill_price = self.exchange.avg_fill_price(order)
         if fill_price <= 0:
             fill_price = float(meta.get('price') or 0.0)
@@ -262,14 +275,24 @@ class ScannerEngine:
                 f"[ENTRY ABORTED] Market buy for {symbol} returned 0 executed qty "
                 f"(status={order.get('status', 'UNKNOWN')}); refusing to open phantom position."
             )
-            return
+            if clear_pending:
+                self._clear_pending_buy(symbol)
+            return True
 
         if self.risk_mgr.has_position(symbol):
             log.warning(f"[ENTRY SKIPPED] Position already tracked for {symbol}")
-            return
+            if clear_pending:
+                self._clear_pending_buy(symbol)
+            return True
 
         tx_ms = order.get('transactTime') or order.get('updateTime') or order.get('time')
         entry_ts = (float(tx_ms) / 1000.0) if tx_ms else None
+
+        details = dict(meta.get('scan_details') or {})
+        if getattr(cfg, 'USE_EXCHANGE_OCO', True):
+            details.setdefault('oco_needs_sync', True)
+        if meta.get('client_oid'):
+            details['entry_client_oid'] = meta['client_oid']
 
         pos = self.risk_mgr.open_position(
             symbol=symbol,
@@ -279,54 +302,63 @@ class ScannerEngine:
             atr_value=float(meta.get('atr') or 0.0),
             entry_reason=str(meta.get('reason') or "SCANNER"),
             entry_score=float(meta.get('score') or 0.0),
-            details=dict(meta.get('scan_details') or {}),
+            details=details,
         )
 
-        if pos:
-            if entry_ts and entry_ts > 0:
-                pos.open_time = entry_ts
-                self.risk_mgr.persist_positions()
-            with self._state_lock:
-                self._active_symbols.add(symbol)
-            tf = meta.get('timeframe', getattr(cfg, 'SCANNER_INTERVAL', '15m'))
-            max_hold_h = getattr(cfg, 'MAX_SCANNER_HOLD_HOURS', 8)
+        if not pos and not self.risk_mgr.has_position(symbol):
+            log.error(f"[ENTRY PERSIST ERROR] RiskManager refused/failed opening position for {symbol}; retaining pending buy record")
+            return False
+
+        if pos and entry_ts and entry_ts > 0:
+            pos.open_time = entry_ts
+            self.risk_mgr.persist_positions()
+
+        # Position is now durably persisted in positions.json — safe to clear pending buy lock
+        if clear_pending:
+            self._clear_pending_buy(symbol)
+
+        with self._state_lock:
+            self._active_symbols.add(symbol)
+        tf = meta.get('timeframe', getattr(cfg, 'SCANNER_INTERVAL', '15m'))
+        max_hold_h = getattr(cfg, 'MAX_SCANNER_HOLD_HOURS', 8)
+        target_pos = pos or self.risk_mgr.get_position(symbol)
+        if target_pos:
             self.notifier.trade_opened(
-                symbol, "BUY", fill_price, exec_qty, pos.stop_loss, pos.take_profit,
-                timeframe=tf, max_hold_hours=max_hold_h, open_time=pos.open_time
+                symbol, "BUY", fill_price, exec_qty, target_pos.stop_loss, target_pos.take_profit,
+                timeframe=tf, max_hold_hours=max_hold_h, open_time=target_pos.open_time
             )
 
             # Submit native exchange-side OCO stop/profit order
             if getattr(cfg, 'USE_EXCHANGE_OCO', True):
                 try:
-                    oco = self.exchange.create_oco_sell(symbol, exec_qty, pos.take_profit, pos.stop_loss)
+                    oco = self.exchange.create_oco_sell(symbol, exec_qty, target_pos.take_profit, target_pos.stop_loss)
                     if oco and oco.get('orderListId') is not None:
-                        pos.details['oco_order_list_id'] = oco.get('orderListId')
-                        pos.details['oco_stop_loss'] = pos.stop_loss
-                        pos.details['oco_needs_sync'] = False
+                        target_pos.details['oco_order_list_id'] = oco.get('orderListId')
+                        target_pos.details['oco_stop_loss'] = target_pos.stop_loss
+                        target_pos.details['oco_needs_sync'] = False
                         self.risk_mgr.persist_positions()
                     else:
-                        pos.details['oco_needs_sync'] = True
+                        target_pos.details['oco_needs_sync'] = True
                         self.risk_mgr.persist_positions()
                 except Exception as e:
-                    pos.details['oco_needs_sync'] = True
+                    target_pos.details['oco_needs_sync'] = True
                     self.risk_mgr.persist_positions()
                     log.warning(f"[OCO EXCEPTION] Could not place OCO: {e}")
 
             # Save chart snapshot on entry (fetch 100 bars so 50-bar chart has warmed-up indicators)
             try:
                 df = self.exchange.get_candles(symbol, interval=tf, limit=100)
-                save_trade_chart(symbol, df, fill_price, fill_price, 0.0, 0.0, "ENTRY", pos.stop_loss, pos.take_profit)
+                save_trade_chart(
+                    symbol, df, fill_price, fill_price, 0.0, 0.0,
+                    "ENTRY", target_pos.stop_loss, target_pos.take_profit
+                )
             except Exception as e:
                 log.warning(f"[CHART LOGGER] Entry chart failed: {e}")
+        return True
 
     def _execute_entry(self, res: ScanResult):
         symbol = res.symbol
         price = res.close_price
-
-        with self._state_lock:
-            if symbol in self._pending_buys:
-                log.warning(f"[ENTRY DEFERRED] Unresolved buy order already tracked for {symbol}")
-                return
 
         bal = self.exchange.get_usdt_balance()
         max_usdt = getattr(cfg, 'MAX_TRADE_USDT', 20.0)
@@ -365,63 +397,83 @@ class ScannerEngine:
             'created_at': time.time(),
         }
 
-        buy_oid = (
-            self.exchange.new_client_order_id(symbol, 'BUY')
-            if hasattr(self.exchange, 'new_client_order_id')
-            else None
-        )
-        if buy_oid:
-            meta['client_oid'] = buy_oid
+        buy_oid = None
+        with self._order_reconcile_lock:
             with self._state_lock:
-                self._pending_buys[symbol] = meta
-            self._save_scanner_state()
-
-        order = self._call_market_buy(symbol, usdt_amount=usdt_amount, client_oid=buy_oid)
-        if not order:
-            if buy_oid and not getattr(self.exchange, 'last_order_confirmed_unsent', False) and hasattr(self.exchange, 'reconcile_client_order_strict'):
-                state, rec = self.exchange.reconcile_client_order_strict(symbol, buy_oid)
-                if state == 'NOT_FOUND':
-                    with self._state_lock:
-                        self._pending_buys.pop(symbol, None)
-                    self._save_scanner_state()
-                    log.error(f"[ENTRY FAILED] Market buy failed for {symbol}")
+                if symbol in self._pending_buys or symbol in self._in_flight_buys:
+                    log.warning(f"[ENTRY DEFERRED] Unresolved buy order already tracked for {symbol}")
                     return
-                if state == 'FOUND' and rec is not None:
-                    order = rec
-                else:
-                    log.warning(
-                        f"[ENTRY UNCERTAIN] Market buy {buy_oid} for {symbol} could not be confirmed; "
-                        f"keeping persisted pending_buy for next reconciliation tick."
-                    )
+                if self.risk_mgr.has_position(symbol):
+                    log.warning(f"[ENTRY DEFERRED] Position already tracked for {symbol}")
                     return
-            else:
-                if buy_oid:
-                    with self._state_lock:
-                        self._pending_buys.pop(symbol, None)
+                if hasattr(self.exchange, 'new_client_order_id'):
+                    buy_oid = self.exchange.new_client_order_id(symbol, 'BUY')
+                    meta['client_oid'] = buy_oid
+                    meta['state'] = 'SUBMITTING'
+                    self._pending_buys[symbol] = meta
+                    self._in_flight_buys.add(symbol)
                     self._save_scanner_state()
-                log.error(f"[ENTRY FAILED] Market buy failed for {symbol}")
-                return
 
-        if not self._order_is_terminal(order):
+        try:
+            order = self._call_market_buy(symbol, usdt_amount=usdt_amount, client_oid=buy_oid)
+
+            with self._order_reconcile_lock:
+                if not order:
+                    if (
+                        buy_oid
+                        and not getattr(self.exchange, 'last_order_confirmed_unsent', False)
+                        and hasattr(self.exchange, 'reconcile_client_order_strict')
+                    ):
+                        state, rec = self.exchange.reconcile_client_order_strict(symbol, buy_oid)
+                        if state == 'NOT_FOUND':
+                            self._clear_pending_buy(symbol)
+                            log.error(f"[ENTRY FAILED] Market buy failed for {symbol}")
+                            return
+                        if state == 'FOUND' and rec is not None:
+                            order = rec
+                        else:
+                            with self._state_lock:
+                                if symbol in self._pending_buys:
+                                    self._pending_buys[symbol]['state'] = 'PENDING'
+                                    self._save_scanner_state()
+                            log.warning(
+                                f"[ENTRY UNCERTAIN] Market buy {buy_oid} for {symbol} could not be confirmed; "
+                                f"keeping persisted pending_buy for next reconciliation tick."
+                            )
+                            return
+                    else:
+                        if buy_oid:
+                            self._clear_pending_buy(symbol)
+                        log.error(f"[ENTRY FAILED] Market buy failed for {symbol}")
+                        return
+
+                if not self._order_is_terminal(order):
+                    if buy_oid:
+                        with self._state_lock:
+                            if symbol in self._pending_buys:
+                                self._pending_buys[symbol]['state'] = 'PENDING'
+                                self._save_scanner_state()
+                        log.warning(
+                            f"[ENTRY UNRESOLVED] Market buy {buy_oid} for {symbol} still non-terminal "
+                            f"(status={order.get('status')}, executedQty={order.get('executedQty', 0)}); "
+                            f"deferring position open until reconciled terminal."
+                        )
+                    else:
+                        log.error(
+                            f"[ENTRY ABORTED] Market buy for {symbol} returned non-terminal status="
+                            f"{order.get('status', 'UNKNOWN')} without reconciliation support."
+                        )
+                    return
+
+                self._finalize_buy_order(symbol, order, meta, clear_pending=bool(buy_oid))
+        finally:
             if buy_oid:
-                log.warning(
-                    f"[ENTRY UNRESOLVED] Market buy {buy_oid} for {symbol} still non-terminal "
-                    f"(status={order.get('status')}, executedQty={order.get('executedQty', 0)}); "
-                    f"deferring position open until reconciled terminal."
-                )
-            else:
-                log.error(
-                    f"[ENTRY ABORTED] Market buy for {symbol} returned non-terminal status="
-                    f"{order.get('status', 'UNKNOWN')} without reconciliation support."
-                )
-            return
-
-        if buy_oid:
-            with self._state_lock:
-                self._pending_buys.pop(symbol, None)
-            self._save_scanner_state()
-
-        self._finalize_buy_order(symbol, order, meta)
+                with self._order_reconcile_lock:
+                    with self._state_lock:
+                        self._in_flight_buys.discard(symbol)
+                        if symbol in self._pending_buys and self._pending_buys[symbol].get('state') == 'SUBMITTING':
+                            self._pending_buys[symbol]['state'] = 'PENDING'
+                            self._save_scanner_state()
 
     def _rotate_scores(self):
         self._prev_high_scores = self._curr_high_scores.copy()
@@ -641,12 +693,11 @@ class ScannerEngine:
             )
             return 'BLOCKED'
 
-        pos.details.pop('pending_sell_client_oid', None)
-        pos.details.pop('pending_sell_reason', None)
-        pos.details.pop('pending_sell_qty', None)
-
         exec_qty = self._extract_order_exec_qty(order)
         if exec_qty <= 0:
+            pos.details.pop('pending_sell_client_oid', None)
+            pos.details.pop('pending_sell_reason', None)
+            pos.details.pop('pending_sell_qty', None)
             if pos.details.get('oco_order_list_id') is None and getattr(cfg, 'USE_EXCHANGE_OCO', True):
                 pos.details['oco_needs_sync'] = True
             self.risk_mgr.persist_positions()
@@ -797,13 +848,12 @@ class ScannerEngine:
                 self.risk_mgr.complete_exit(symbol)
                 return
 
-            if sell_oid:
-                pos.details.pop('pending_sell_client_oid', None)
-                pos.details.pop('pending_sell_reason', None)
-                pos.details.pop('pending_sell_qty', None)
-
             exec_qty = self._extract_order_exec_qty(order)
             if not order or exec_qty <= 0:
+                if sell_oid:
+                    pos.details.pop('pending_sell_client_oid', None)
+                    pos.details.pop('pending_sell_reason', None)
+                    pos.details.pop('pending_sell_qty', None)
                 if had_oco:
                     pos.details['oco_needs_sync'] = True
                 self.risk_mgr.persist_positions()

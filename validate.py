@@ -23,6 +23,7 @@ Modes:
 """
 
 import argparse
+from datetime import datetime, timezone
 import json
 import math
 import sys
@@ -643,8 +644,24 @@ def run_basket(args):
     print(f'\n  Elapsed: {_elapsed(t0)}')
     print('═' * W + '\n')
 
+    data_start = None
+    data_end = None
+    for df_sym in symbol_dfs.values():
+        if df_sym is not None and not df_sym.empty:
+            s_ts = df_sym.index[0]
+            e_ts = df_sym.index[-1]
+            if data_start is None or s_ts < data_start:
+                data_start = s_ts
+            if data_end is None or e_ts > data_end:
+                data_end = e_ts
+
     _save(f'basket_{interval}_{days}d', {
         'interval': interval, 'days': days, 'n_symbols': len(symbols),
+        'generated_at_utc': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'data_window': {
+            'start': str(data_start) if data_start is not None else None,
+            'end': str(data_end) if data_end is not None else None,
+        },
         'results': results, 'signal_breadth': basket_summary,
         'portfolio_simulation': portfolio_summary,
     })

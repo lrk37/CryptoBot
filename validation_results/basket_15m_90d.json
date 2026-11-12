@@ -2,6 +2,11 @@
   "interval": "15m",
   "days": 90,
   "n_symbols": 15,
+  "generated_at_utc": "2026-11-12T22:25:28Z",
+  "data_window": {
+    "start": "2026-08-14 22:30:00+00:00",
+    "end": "2026-11-12 22:15:00+00:00"
+  },
   "results": [
     {
       "symbol": "BTCUSDT",
@@ -276,7 +281,7 @@
         "avg_hold_minutes": 171.0,
         "bar_minutes": 15
       },
-      "beat_random_pct": 40.0
+      "beat_random_pct": 60.0
     },
     {
       "symbol": "ATOMUSDT",
@@ -301,7 +306,7 @@
         "avg_hold_minutes": 192.9,
         "bar_minutes": 15
       },
-      "beat_random_pct": 40.0
+      "beat_random_pct": 80.0
     },
     {
       "symbol": "APTUSDT",

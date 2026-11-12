@@ -105,7 +105,7 @@ Simulating the live 1-position-at-a-time constraint chronologically across all 1
 | `backtest.py` | Single-symbol and multi-symbol quantitative backtester with Monte Carlo random-entry baseline comparison. |
 | `validate.py` | Out-of-sample validation suite (`walk_forward`, `basket` with Mark-to-Market portfolio drawdown including exit-candle lows/MAE, `monte_carlo`, `slippage`). |
 | `experiment.py` | Gate 0 accounting & no-lookahead verification harness + Stage A strategy family comparison suite. |
-| `tests/test_patches.py` | 52 automated unit tests (run via `.github/workflows/ci.yml` on push/PR) covering idempotent/persistent `clientOrderId` order lifecycle, remainder cancellation on `PARTIALLY_FILLED`, deferred close on OCO cancellation failure, `orderListId`-scoped OCO fill reconciliation, partial-sell & dust reconciliation, persistent OCO break-even retries, spread/regime filters, DST timestamps, and MTM drawdown invariants. |
+| `tests/test_patches.py` | 54 automated unit tests (run via `.github/workflows/ci.yml` on push/PR) covering idempotent/persistent `clientOrderId` order lifecycle, race-safe `SUBMITTING` lock & crash-safe buy finalization, remainder cancellation on `PARTIALLY_FILLED`, deferred close on OCO cancellation failure, `orderListId`-scoped OCO fill reconciliation, partial-sell & dust reconciliation, persistent OCO break-even retries, spread/regime filters, DST timestamps, and MTM drawdown invariants. |
 | `deploy/` | `vps_setup.sh` (automated Ubuntu 22.04/24.04 installer) and `cryptobot.service` (`systemd` 24/7 background daemon config). |
 
 ---
@@ -120,7 +120,7 @@ python -m venv .venv
 # Linux / macOS:
 ./.venv/bin/pip install -r requirements.txt
 
-# 2. Run the 52 unit tests & Gate 0 accounting audit
+# 2. Run the 54 unit tests & Gate 0 accounting audit
 python -m unittest discover -s tests -v
 
 # 3. Run the 15-coin Dual-Timeframe basket validation (90 days)
