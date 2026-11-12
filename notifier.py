@@ -3,6 +3,10 @@ import logging
 import re
 import time
 from datetime import datetime, timezone, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
 import requests
 
 log = logging.getLogger(__name__)
@@ -18,6 +22,7 @@ class TelegramNotifier:
         self.enabled = cfg.ENABLE_TELEGRAM
         self.token = cfg.TELEGRAM_TOKEN
         self.chat_id = cfg.TELEGRAM_CHAT_ID
+        self.tz_name = getattr(cfg, 'DISPLAY_TIMEZONE', 'Europe/Belgrade')
         self.tz_offset_hours = int(getattr(cfg, 'DISPLAY_TZ_OFFSET_HOURS', 1))
         self._url = f"https://api.telegram.org/bot{self.token}/sendMessage"
 
@@ -55,6 +60,16 @@ class TelegramNotifier:
 
     def _format_ts(self, epoch_sec: float = None) -> str:
         ts = epoch_sec if epoch_sec is not None else time.time()
+        if ZoneInfo is not None and self.tz_name:
+            try:
+                tz = ZoneInfo(self.tz_name)
+                dt = datetime.fromtimestamp(ts, tz=tz)
+                off_sec = int(dt.utcoffset().total_seconds()) if dt.utcoffset() else self.tz_offset_hours * 3600
+                off_h = off_sec // 3600
+                sign = f"+{off_h}" if off_h >= 0 else str(off_h)
+                return f"{dt.strftime('%Y-%m-%d %H:%M:%S')} (UTC{sign})"
+            except Exception:
+                pass
         tz = timezone(timedelta(hours=self.tz_offset_hours))
         dt = datetime.fromtimestamp(ts, tz=tz)
         sign = f"+{self.tz_offset_hours}" if self.tz_offset_hours >= 0 else str(self.tz_offset_hours)

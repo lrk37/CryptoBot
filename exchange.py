@@ -76,19 +76,73 @@ class BinanceConnector:
                     raise
                 time.sleep(delay * (i + 1))
 
+    def _reconcile_order(self, symbol: str, client_oid: str):
+        """Query Binance for an order by origClientOrderId and reconcile its execution state.
+
+        - Returns the order if any quantity has executed (FILLED, PARTIALLY_FILLED, or EXPIRED/CANCELED with fills).
+        - If the order is still NEW with 0 executed quantity, waits briefly, re-checks, and cancels it
+          so an unfilled market order is never mistaken for a completed fill.
+        """
+        if not hasattr(self.client, 'get_order'):
+            return None
+        try:
+            existing = self.client.get_order(symbol=symbol, origClientOrderId=client_oid)
+        except Exception:
+            return None
+        if not existing:
+            return None
+
+        status = existing.get('status', '')
+        exec_qty = float(existing.get('executedQty', 0) or 0)
+        if exec_qty > 0 or status in ('FILLED', 'PARTIALLY_FILLED'):
+            return existing
+
+        if status in ('NEW', 'PENDING_NEW'):
+            # Market order accepted but 0 qty filled so far; poll once then cancel if still unfilled
+            poll_delay = min(max(float(getattr(self.cfg, 'RETRY_DELAY', 0.2)), 0.0), 0.5)
+            if poll_delay > 0:
+                time.sleep(poll_delay)
+            try:
+                existing = self.client.get_order(symbol=symbol, origClientOrderId=client_oid) or existing
+                status = existing.get('status', '')
+                exec_qty = float(existing.get('executedQty', 0) or 0)
+                if exec_qty > 0 or status in ('FILLED', 'PARTIALLY_FILLED'):
+                    return existing
+                if hasattr(self.client, 'cancel_order'):
+                    try:
+                        self.client.cancel_order(symbol=symbol, origClientOrderId=client_oid)
+                    except Exception:
+                        pass
+                    existing = self.client.get_order(symbol=symbol, origClientOrderId=client_oid) or existing
+            except Exception:
+                pass
+            return existing
+
+        # Terminal states with 0 fills (CANCELED / EXPIRED / REJECTED)
+        return existing
+
+    def _new_client_order_id(self, symbol: str, side: str) -> str:
+        sym_clean = ''.join(ch for ch in symbol if ch.isalnum())[:10]
+        return f"cb-{side.lower()[:1]}-{sym_clean}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:4]}"
+
     def _submit_order_idempotent(self, fn, symbol: str, side: str, **kwargs):
         """Submit a market order with a unique newClientOrderId and reconcile before retrying.
 
-        Prevents duplicate buys/sells if a network timeout occurs after Binance accepted the order.
+        Prevents duplicate buys/sells if a network timeout occurs after Binance accepted the order,
+        and ensures NEW/EXPIRED orders are reconciled by actual executedQty.
         """
         retries = getattr(self.cfg, 'MAX_RETRIES', 3)
         delay = getattr(self.cfg, 'RETRY_DELAY', 2)
-        sym_clean = ''.join(ch for ch in symbol if ch.isalnum())[:10]
-        client_oid = f"cb-{side.lower()[:1]}-{sym_clean}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:4]}"
+        client_oid = self._new_client_order_id(symbol, side)
 
         for i in range(retries):
             try:
-                return fn(symbol=symbol, newClientOrderId=client_oid, **kwargs)
+                order = fn(symbol=symbol, newClientOrderId=client_oid, **kwargs)
+                if order and order.get('status') in ('NEW', 'PENDING_NEW') and float(order.get('executedQty', 0) or 0) <= 0:
+                    reconciled = self._reconcile_order(symbol, client_oid)
+                    if reconciled is not None:
+                        order = reconciled
+                return order
             except TypeError:
                 # Fallback for simplified test doubles that do not accept newClientOrderId
                 return fn(symbol=symbol, **kwargs)
@@ -96,26 +150,40 @@ class BinanceConnector:
                 code = getattr(e, 'code', None)
                 if code in NON_RETRYABLE_CODES or isinstance(e, BinanceOrderException):
                     raise
-                if hasattr(self.client, 'get_order'):
-                    try:
-                        existing = self.client.get_order(symbol=symbol, origClientOrderId=client_oid)
-                        if existing and existing.get('status') in ('FILLED', 'PARTIALLY_FILLED', 'NEW'):
-                            log.warning(f"[ORDER RECONCILED] {symbol} {side} {client_oid} already accepted on Binance; returning existing order")
-                            return existing
-                    except Exception:
-                        pass
+                existing = self._reconcile_order(symbol, client_oid)
+                if existing is not None:
+                    exec_qty = float(existing.get('executedQty', 0) or 0)
+                    status = existing.get('status', '')
+                    if exec_qty > 0:
+                        log.warning(
+                            f"[ORDER RECONCILED] {symbol} {side} {client_oid} executed {exec_qty} "
+                            f"(status={status}); returning reconciled order"
+                        )
+                        return existing
+                    if status in ('NEW', 'PENDING_NEW'):
+                        # Order still open on Binance and could not be cancelled — do NOT submit another order
+                        return existing
+                    if status in ('CANCELED', 'EXPIRED', 'REJECTED'):
+                        # Confirmed terminal with 0 fills; only retry with a fresh clientOrderId
+                        client_oid = self._new_client_order_id(symbol, side)
                 if i == retries - 1:
                     raise
                 time.sleep(delay * (i + 1))
             except Exception:
-                if hasattr(self.client, 'get_order'):
-                    try:
-                        existing = self.client.get_order(symbol=symbol, origClientOrderId=client_oid)
-                        if existing and existing.get('status') in ('FILLED', 'PARTIALLY_FILLED', 'NEW'):
-                            log.warning(f"[ORDER RECONCILED] {symbol} {side} {client_oid} already accepted on Binance after timeout; returning existing order")
-                            return existing
-                    except Exception:
-                        pass
+                existing = self._reconcile_order(symbol, client_oid)
+                if existing is not None:
+                    exec_qty = float(existing.get('executedQty', 0) or 0)
+                    status = existing.get('status', '')
+                    if exec_qty > 0:
+                        log.warning(
+                            f"[ORDER RECONCILED] {symbol} {side} {client_oid} executed {exec_qty} "
+                            f"(status={status}) after timeout; returning reconciled order"
+                        )
+                        return existing
+                    if status in ('NEW', 'PENDING_NEW'):
+                        return existing
+                    if status in ('CANCELED', 'EXPIRED', 'REJECTED'):
+                        client_oid = self._new_client_order_id(symbol, side)
                 if i == retries - 1:
                     raise
                 time.sleep(delay * (i + 1))
@@ -137,9 +205,9 @@ class BinanceConnector:
         return float(t['price'])
 
     def get_spread_pct(self, symbol):
-        """Get bid-ask spread as percentage. Used to skip illiquid coins."""
+        """Get bid-ask spread as percentage. Uses live public market data when on Testnet."""
         try:
-            book = self._retry(self.client.get_order_book, symbol=symbol, limit=5)
+            book = self._retry(self.market_client.get_order_book, symbol=symbol, limit=5)
             best_bid = float(book['bids'][0][0]) if book.get('bids') else 0
             best_ask = float(book['asks'][0][0]) if book.get('asks') else 0
             if best_ask <= 0 or best_bid <= 0:
@@ -156,8 +224,8 @@ class BinanceConnector:
             book = self._retry(self.market_client.get_order_book, symbol=symbol, limit=depth)
             bid_vol = sum(float(b[1]) for b in book.get('bids', []))
             ask_vol = sum(float(a[1]) for a in book.get('asks', []))
-            if ask_vol <= 0:
-                return 1.0
+            if ask_vol <= 0 or bid_vol <= 0:
+                return 0.0
             return bid_vol / ask_vol
         except Exception as e:
             log.warning(f"Orderbook imbalance check failed for {symbol}: {e}")
@@ -347,6 +415,17 @@ class BinanceConnector:
                 return float(f.get('minNotional', f.get('notional', 11.0)))
         return 11.0
 
+    def is_sellable_qty(self, symbol: str, quantity: float, ref_price: float = 0.0) -> bool:
+        """Return True if `quantity` satisfies Binance LOT_SIZE stepSize/minQty and MIN_NOTIONAL."""
+        rounded = self._round_lot(symbol, quantity)
+        if rounded <= 0:
+            return False
+        if rounded < self._get_min_qty(symbol):
+            return False
+        if ref_price > 0 and rounded * ref_price < self._get_min_notional(symbol):
+            return False
+        return True
+
     def market_buy(self, symbol, quantity=0, usdt_amount=0):
         """Place a market buy order."""
         use_quote = getattr(self.cfg, 'USE_QUOTE_ORDER_QTY', False)
@@ -442,19 +521,22 @@ class BinanceConnector:
         return float(order.get('price', 0.0))
 
     def cancel_open_orders(self, symbol):
-        """Cancel all open orders for a symbol (e.g. before closing a position)."""
+        """Cancel all open orders for a symbol (e.g. before closing a position or syncing OCO).
+
+        Returns True if open orders were cancelled (or none existed), False on API failure.
+        """
         try:
-            res = self._retry(self.client.cancel_open_orders, symbol=symbol)
+            self._retry(self.client.cancel_open_orders, symbol=symbol)
             log.info(f"[ORDERS] Cancelled open orders for {symbol}")
-            return res
+            return True
         except BinanceAPIException as e:
             if e.code == -2011:  # Unknown order / no open orders
-                return None
+                return True
             log.warning(f"Failed to cancel open orders for {symbol}: {e}")
-            return None
+            return False
         except Exception as e:
             log.warning(f"Failed to cancel open orders for {symbol}: {e}")
-            return None
+            return False
 
     def get_open_orders(self, symbol):
         """Fetch open orders for a symbol."""
@@ -498,7 +580,13 @@ class BinanceConnector:
         quote = float(o.get('cummulativeQuoteQty', 0) or 0)
         if executed <= 0 or quote <= 0:
             return None
-        return {'price': quote / executed, 'qty': executed, 'type': o.get('type'), 'order_id': o.get('orderId')}
+        return {
+            'price': quote / executed,
+            'qty': executed,
+            'type': o.get('type'),
+            'order_id': o.get('orderId'),
+            'time': ts / 1000.0 if ts > 0 else None,
+        }
 
     def create_oco_sell(self, symbol, quantity, take_profit, stop_loss):
         """Place an OCO (One-Cancels-the-Other) sell order on Binance to protect the position."""

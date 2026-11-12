@@ -198,7 +198,14 @@ class ScannerEngine:
 
         exec_qty = self.exchange.net_executed_qty(order, symbol)  # net of commission paid in the coin
         if exec_qty <= 0:
-            exec_qty = usdt_amount / fill_price
+            log.error(
+                f"[ENTRY ABORTED] Market buy for {symbol} returned 0 executed qty "
+                f"(status={order.get('status', 'UNKNOWN')}); refusing to open phantom position."
+            )
+            return
+
+        tx_ms = order.get('transactTime') or order.get('updateTime') or order.get('time')
+        entry_ts = (float(tx_ms) / 1000.0) if tx_ms else None
 
         # Extract breakdown scores
         scan_details = {
@@ -228,6 +235,9 @@ class ScannerEngine:
         )
 
         if pos:
+            if entry_ts and entry_ts > 0:
+                pos.open_time = entry_ts
+                self.risk_mgr.persist_positions()
             # F-11: Add to active symbols under lock
             with self._state_lock:
                 self._active_symbols.add(symbol)
@@ -242,11 +252,17 @@ class ScannerEngine:
             if getattr(cfg, 'USE_EXCHANGE_OCO', True):
                 try:
                     oco = self.exchange.create_oco_sell(symbol, exec_qty, pos.take_profit, pos.stop_loss)
-                    if oco:
+                    if oco and oco.get('orderListId') is not None:
                         pos.details['oco_order_list_id'] = oco.get('orderListId')
                         pos.details['oco_stop_loss'] = pos.stop_loss
+                        pos.details['oco_needs_sync'] = False
+                        self.risk_mgr.persist_positions()
+                    else:
+                        pos.details['oco_needs_sync'] = True
                         self.risk_mgr.persist_positions()
                 except Exception as e:
+                    pos.details['oco_needs_sync'] = True
+                    self.risk_mgr.persist_positions()
                     log.warning(f"[OCO EXCEPTION] Could not place OCO: {e}")
             
             # Save chart snapshot on entry (fetch 100 bars so 50-bar chart has warmed-up indicators)
@@ -300,11 +316,12 @@ class ScannerEngine:
                         fill = self.exchange.get_last_sell_fill(symbol, int(pos.open_time * 1000) - 60_000)
                         if fill:
                             exit_px = fill['price']
+                            fill_ts = fill.get('time') or time.time()
                             reason = "TAKE_PROFIT" if fill['type'] in ('LIMIT_MAKER', 'LIMIT') else "STOP_LOSS"
                             log.info(f"[EXCHANGE FILL] {symbol} OCO leg filled ({reason}) at {exit_px:.6f}")
                             pnl_pct = pos.pnl_pct(exit_px)
                             pnl_usdt = pos.pnl_usdt(exit_px)
-                            dur_sec = time.time() - pos.open_time
+                            dur_sec = max(0.0, fill_ts - pos.open_time)
                             self.risk_mgr.close_position(symbol, exit_px, f"OCO_{reason}")
                             with self._state_lock:
                                 self._active_symbols.discard(symbol)
@@ -314,12 +331,13 @@ class ScannerEngine:
                                 self._symbol_cooldowns[symbol] = time.time() + cd_sec
                             self.notifier.trade_closed(
                                 symbol, f"OCO_{reason}", pos.entry_price, exit_px, pnl_pct,
-                                duration_sec=dur_sec, pnl_usdt=pnl_usdt, open_time=pos.open_time
+                                duration_sec=dur_sec, pnl_usdt=pnl_usdt, open_time=pos.open_time, close_time=fill_ts
                             )
                             continue
                         log.warning(f"[OCO] {symbol}: OCO is no longer open but no filled SELL was found - "
                                     f"dropping the OCO link; client-side exits stay active")
                         pos.details.pop('oco_order_list_id', None)
+                        pos.details.pop('oco_stop_loss', None)
                         self.risk_mgr.persist_positions()
             except Exception as e:
                 log.warning(f"[MONITOR OCO CHECK] {symbol}: {e}")
@@ -329,31 +347,52 @@ class ScannerEngine:
             if action != "HOLD":
                 log.info(f"[MONITOR EXIT TRIGGERED] {symbol} -> {action} at {curr_price:.6f}")
                 self._close_position(symbol, pos, curr_price, action)
-            elif (
-                pos.stop_loss > prev_sl
-                and pos.details.get('oco_order_list_id') is not None
-                and getattr(cfg, 'USE_EXCHANGE_OCO', True)
-            ):
-                self._sync_oco_stop(symbol, pos, curr_price)
+            elif getattr(cfg, 'USE_EXCHANGE_OCO', True):
+                oco_id = pos.details.get('oco_order_list_id')
+                oco_sl = float(pos.details.get('oco_stop_loss', 0.0) or 0.0)
+                stop_changed = (pos.stop_loss > prev_sl) or (
+                    oco_id is not None and oco_sl > 0 and abs(pos.stop_loss - oco_sl) > 1e-9
+                )
+                if stop_changed and (oco_id is not None or pos.details.get('oco_needs_sync')):
+                    pos.details['oco_needs_sync'] = True
+                if pos.details.get('oco_needs_sync'):
+                    self._sync_oco_stop(symbol, pos, curr_price)
 
     def _sync_oco_stop(self, symbol, pos, curr_price):
-        """Re-submit exchange-side OCO when local stop_loss moves up (e.g. Break-Even activation)."""
+        """Re-submit exchange-side OCO when local stop_loss moves up (e.g. Break-Even), retrying across ticks until confirmed."""
         if curr_price <= pos.stop_loss * 1.002 or curr_price >= pos.take_profit * 0.998:
+            pos.details['oco_needs_sync'] = True
+            self.risk_mgr.persist_positions()
+            log.info(f"[OCO SYNC DEFERRED] {symbol} price {curr_price:.6f} too close to SL/TP; will retry on next monitor tick")
             return
         try:
-            self.exchange.cancel_open_orders(symbol)
+            if pos.details.get('oco_order_list_id') is not None:
+                cancelled = self.exchange.cancel_open_orders(symbol)
+                if cancelled is False:
+                    pos.details['oco_needs_sync'] = True
+                    self.risk_mgr.persist_positions()
+                    log.warning(f"[OCO SYNC] {symbol} cancellation failed; keeping existing OCO id and retrying next tick")
+                    return
+                pos.details.pop('oco_order_list_id', None)
+                pos.details['oco_needs_sync'] = True
+                self.risk_mgr.persist_positions()
+
             actual_qty = self.exchange.get_asset_balance_fresh(symbol)
             oco_qty = min(actual_qty, pos.quantity) if actual_qty > 0 else pos.quantity
             oco = self.exchange.create_oco_sell(symbol, oco_qty, pos.take_profit, pos.stop_loss)
-            if oco:
+            if oco and oco.get('orderListId') is not None:
                 pos.details['oco_order_list_id'] = oco.get('orderListId')
                 pos.details['oco_stop_loss'] = pos.stop_loss
+                pos.details['oco_needs_sync'] = False
                 log.info(f"[OCO SYNC] {symbol} exchange OCO stop updated to {pos.stop_loss:.6f}")
             else:
                 pos.details.pop('oco_order_list_id', None)
-                log.warning(f"[OCO SYNC] {symbol} OCO replacement returned None; client-side stop remains active")
+                pos.details['oco_needs_sync'] = True
+                log.warning(f"[OCO SYNC] {symbol} OCO replacement returned None; will retry on next monitor tick")
             self.risk_mgr.persist_positions()
         except Exception as e:
+            pos.details['oco_needs_sync'] = True
+            self.risk_mgr.persist_positions()
             log.warning(f"[OCO SYNC ERROR] {symbol}: {e}")
 
     def _close_position(self, symbol, pos, curr_price, reason):
@@ -362,17 +401,31 @@ class ScannerEngine:
 
         try:
             # Cancel open orders (OCO) on Binance so balance is unlocked for selling
-            self.exchange.cancel_open_orders(symbol)
+            had_oco = pos.details.get('oco_order_list_id') is not None
+            cancelled = self.exchange.cancel_open_orders(symbol)
+            if cancelled is not False and had_oco:
+                pos.details.pop('oco_order_list_id', None)
+                pos.details.pop('oco_stop_loss', None)
 
             actual_qty = self.exchange.get_asset_balance_fresh(symbol)
             # Sell the POSITION, never more: free balance may include unrelated holdings of the same coin
             sell_qty = min(actual_qty, pos.quantity) if actual_qty > 0 else pos.quantity
             order = self.exchange.market_sell(symbol, sell_qty)
 
-            if not order or float(order.get('executedQty', sell_qty) or 0) <= 0:
-                if pos.details and 'oco_order_list_id' in pos.details:
-                    pos.details.pop('oco_order_list_id', None)
-                    self.risk_mgr.persist_positions()
+            if order:
+                if 'executedQty' in order:
+                    exec_qty = float(order.get('executedQty') or 0)
+                elif order.get('fills'):
+                    exec_qty = sum(float(f.get('qty', 0) or 0) for f in order['fills'])
+                else:
+                    exec_qty = 0.0
+            else:
+                exec_qty = 0.0
+
+            if not order or exec_qty <= 0:
+                if had_oco:
+                    pos.details['oco_needs_sync'] = True
+                self.risk_mgr.persist_positions()
                 log.error(
                     f"[CLOSE ABORTED] Market sell failed or executed 0 qty for {symbol}; "
                     f"keeping position open for retry on next monitor tick."
@@ -381,10 +434,33 @@ class ScannerEngine:
                 return
 
             exit_price = self.exchange.avg_fill_price(order) or curr_price
+
+            # Reconcile partial fills: keep remaining position open when it is still sellable on Binance
+            remaining = pos.quantity - exec_qty
+            if exec_qty < pos.quantity * 0.99 and remaining > 1e-8:
+                sellable_rem = (
+                    self.exchange.is_sellable_qty(symbol, remaining, exit_price)
+                    if hasattr(self.exchange, 'is_sellable_qty')
+                    else True
+                )
+                if sellable_rem:
+                    if had_oco:
+                        pos.details['oco_needs_sync'] = True
+                    self.risk_mgr.partial_close_position(symbol, exec_qty, exit_price, reason)
+                    return
+                log.info(
+                    f"[DUST REMAINDER] {symbol}: sold {exec_qty} / {pos.quantity}; "
+                    f"remainder {remaining:.8f} below exchange minQty/minNotional — finalizing close."
+                )
+
+            # Full fill: compute realized P&L on actual executed quantity
+            pos.quantity = exec_qty
             pnl_pct = pos.pnl_pct(exit_price)
             pnl_usdt = pos.pnl_usdt(exit_price)
 
-            dur_sec = time.time() - pos.open_time
+            tx_ms = order.get('transactTime') or order.get('updateTime') or order.get('time')
+            close_ts = (float(tx_ms) / 1000.0) if tx_ms else time.time()
+            dur_sec = max(0.0, close_ts - pos.open_time)
             self.risk_mgr.close_position(symbol, exit_price, reason)
             # F-11: Remove from active symbols under lock
             with self._state_lock:
@@ -400,7 +476,7 @@ class ScannerEngine:
 
             self.notifier.trade_closed(
                 symbol, reason, pos.entry_price, exit_price, pnl_pct,
-                duration_sec=dur_sec, pnl_usdt=pnl_usdt, open_time=pos.open_time
+                duration_sec=dur_sec, pnl_usdt=pnl_usdt, open_time=pos.open_time, close_time=close_ts
             )
 
             # Save chart snapshot on exit (fetch 100 bars so 50-bar chart has warmed-up indicators)

@@ -232,6 +232,44 @@ class RiskManager:
                 self._save_loss_state()
                 self._log_trade(pos, exit_price, exit_reason)
 
+    def partial_close_position(self, symbol: str, sold_qty: float, exit_price: float, exit_reason: str) -> Optional[Position]:
+        """Record realized P&L on a partially filled sell order and retain the remaining position."""
+        with self._lock:
+            pos = self._positions.get(symbol)
+            self._exiting_symbols.discard(symbol)
+            if not pos or sold_qty <= 0:
+                return pos
+            sold_qty = min(sold_qty, pos.quantity)
+            sold_slice = Position(
+                symbol=pos.symbol,
+                entry_price=pos.entry_price,
+                quantity=sold_qty,
+                stop_loss=pos.stop_loss,
+                take_profit=pos.take_profit,
+                trailing=pos.trailing,
+                trailing_offset=pos.trailing_offset,
+                highest_price=pos.highest_price,
+                lowest_price=pos.lowest_price,
+                kind=pos.kind,
+                open_time=pos.open_time,
+                min_be_price=pos.min_be_price,
+                entry_reason=pos.entry_reason,
+                entry_score=pos.entry_score,
+                details=dict(pos.details or {}),
+            )
+            if exit_price > 0:
+                self._log_trade(sold_slice, exit_price, f"PARTIAL_{exit_reason}")
+            pos.quantity = max(round(pos.quantity - sold_qty, 8), 0.0)
+            if pos.details:
+                pos.details.pop('oco_order_list_id', None)
+                pos.details.pop('oco_stop_loss', None)
+            self._save_positions()
+            log.warning(
+                f"[PARTIAL CLOSE] {symbol}: sold {sold_qty} @ {exit_price:.6f}, "
+                f"remaining qty={pos.quantity} retained in RiskManager"
+            )
+            return pos
+
     def get_position(self, symbol: str) -> Optional[Position]:
         with self._lock:
             return self._positions.get(symbol)

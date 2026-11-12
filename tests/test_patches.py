@@ -277,6 +277,30 @@ class TestExchange(unittest.TestCase):
         self.assertEqual(order["status"], "FILLED")
         self.assertEqual(order["clientOrderId"], buy_calls[0]["newClientOrderId"])
 
+    def test_idempotent_order_reconciles_expired_with_partial_fill(self):
+        """If an order times out and Binance reports status=EXPIRED with executedQty > 0,
+        _submit_order_idempotent must return that partial fill and NOT submit a second order."""
+        buy_calls = []
+        def fake_market_buy(**kw):
+            buy_calls.append(kw)
+            raise RuntimeError("Read timed out")
+        def fake_get_order(symbol, origClientOrderId):
+            return {
+                "symbol": symbol,
+                "clientOrderId": origClientOrderId,
+                "status": "EXPIRED",
+                "executedQty": "0.6",
+                "cummulativeQuoteQty": "12.0"
+            }
+        self.fake.order_market_buy = fake_market_buy
+        self.fake.get_order = fake_get_order
+        self.ex.max_retries = 3
+        order = self.ex.market_buy("AAAUSDT", 20.0)
+        self.assertIsNotNone(order)
+        self.assertEqual(len(buy_calls), 1)
+        self.assertEqual(order["status"], "EXPIRED")
+        self.assertAlmostEqual(float(order["executedQty"]), 0.6)
+
 
 # =============================================================== scanner
 class TestScanner(unittest.TestCase):
@@ -355,17 +379,29 @@ class FakeBotExchange:
         self.strict_calls = 0
         self.price = 100.0
         self.sell_return = "default"
+        self.buy_return = "default"
+        self.cancel_return = True
+        self.oco_return = "default"
         self.oco_created = []
+    def get_usdt_balance(self): return 100.0
     def get_price(self, s): return self.price
     def get_open_orders_strict(self, s):
         self.strict_calls += 1
         return self.open_orders
     def get_last_sell_fill(self, s, since_ms): return self.fill
-    def cancel_open_orders(self, s): pass
+    def cancel_open_orders(self, s): return self.cancel_return
     def get_asset_balance_fresh(self, s): return self.free
     def create_oco_sell(self, s, q, tp, sl):
         self.oco_created.append((s, q, tp, sl))
+        if self.oco_return != "default":
+            return self.oco_return
         return {"orderListId": 99}
+    def market_buy(self, s, quantity=0, usdt_amount=0):
+        if self.buy_return != "default":
+            return self.buy_return
+        return {"status": "FILLED", "executedQty": "1.0", "cummulativeQuoteQty": "20.0", "fills": []}
+    def net_executed_qty(self, order, symbol):
+        return float(order.get("executedQty", 0) or 0) if order else 0.0
     def market_sell(self, s, q):
         self.sold.append(q)
         if self.sell_return != "default":
@@ -462,6 +498,117 @@ class TestBotMonitor(InTempDir):
         self.assertEqual(sym, "AAAUSDT")
         self.assertAlmostEqual(sl, 100.3, places=3)
         self.assertEqual(self.pos.details["oco_order_list_id"], 99)
+
+    def test_partial_sell_retains_remaining_position_and_logs_realized_slice(self):
+        """If market_sell partially executes (0.6 of 1.0), keep 0.4 open and log PARTIAL_ realized PnL."""
+        self.ex.sell_return = {"fills": [{"price": "100", "qty": "0.6"}], "executedQty": "0.6"}
+        self.eng._close_position("AAAUSDT", self.pos, 100.0, "STOP_LOSS")
+        self.assertTrue(self.rm.has_position("AAAUSDT"))
+        self.assertAlmostEqual(self.rm.get_position("AAAUSDT").quantity, 0.4, places=6)
+        self.assertEqual(len(self.nt.closed), 0)
+        row = read_json(self.bot.cfg.TRADE_LOG_FILE)[-1]
+        self.assertEqual(row["reason"], "PARTIAL_STOP_LOSS")
+        self.assertAlmostEqual(row["quantity"], 0.6, places=6)
+
+    def test_partial_sell_dust_remainder_finalizes_cleanly(self):
+        """If LOT_SIZE rounding leaves unsellable dust (e.g. 0.00986 out of 0.13986 with stepSize=0.01),
+        is_sellable_qty returns False so the position closes cleanly without an infinite dust loop."""
+        self.pos.quantity = 0.13986
+        self.ex.is_sellable_qty = lambda s, q, px: q >= 0.01
+        self.ex.sell_return = {"fills": [{"price": "100", "qty": "0.13"}], "executedQty": "0.13"}
+        self.eng._close_position("AAAUSDT", self.pos, 100.0, "TAKE_PROFIT")
+        self.assertFalse(self.rm.has_position("AAAUSDT"))
+        row = read_json(self.bot.cfg.TRADE_LOG_FILE)[-1]
+        self.assertEqual(row["reason"], "TAKE_PROFIT")
+        self.assertAlmostEqual(row["quantity"], 0.13, places=6)
+
+    def test_entry_aborts_on_unfilled_new_order(self):
+        """Market buy returning status=NEW with executedQty=0 must never create a phantom position."""
+        from scanner import ScanResult
+        self.ex.buy_return = {"status": "NEW", "executedQty": "0.0", "cummulativeQuoteQty": "0.0", "fills": []}
+        res = ScanResult(
+            symbol="BBBUSDT", score=85.0, raw_score=80.0, pump_penalty=0.0,
+            ema_score=25.0, rsi_score=25.0, vol_score=25.0, breakout_score=5.0, ob_score=5.0,
+            close_price=50.0, rsi=18.0, volume_ratio=2.5, breakout_atr_ratio=0.0,
+            bid_ask_ratio=1.4, atr=1.0, pct_change_24h=-5.0,
+            reason="CAPITULATION", last_closed_time=1000, timeframe="15m"
+        )
+        self.eng._execute_entry(res)
+        self.assertFalse(self.rm.has_position("BBBUSDT"))
+
+    def test_oco_replacement_and_cancellation_failure_retries_next_tick(self):
+        """If OCO cancellation or replacement fails, oco_needs_sync stays True and retries on the next tick."""
+        self.pos.details["oco_order_list_id"] = 5
+        self.pos.take_profit = 110.0
+        self.ex.open_orders = [{"orderId": 1}, {"orderId": 2}]
+        self.ex.price = 103.0  # triggers Break-Even
+
+        # Tick 1: cancel_open_orders fails -> keeps old OCO id 5 and marks oco_needs_sync=True
+        self.ex.cancel_return = False
+        self.tick()
+        self.assertEqual(self.pos.details.get("oco_order_list_id"), 5)
+        self.assertTrue(self.pos.details.get("oco_needs_sync"))
+        self.assertEqual(len(self.ex.oco_created), 0)
+
+        # Tick 2: cancel succeeds, but create_oco_sell returns None -> oco_needs_sync stays True
+        self.ex.cancel_return = True
+        self.ex.oco_return = None
+        self.tick()
+        self.assertIsNone(self.pos.details.get("oco_order_list_id"))
+        self.assertTrue(self.pos.details.get("oco_needs_sync"))
+        self.assertEqual(len(self.ex.oco_created), 1)
+
+        # Tick 3: create_oco_sell succeeds -> oco_order_list_id=99 and oco_needs_sync=False
+        self.ex.oco_return = {"orderListId": 99}
+        self.tick()
+        self.assertEqual(self.pos.details.get("oco_order_list_id"), 99)
+        self.assertFalse(self.pos.details.get("oco_needs_sync"))
+        self.assertEqual(len(self.ex.oco_created), 2)
+
+    def test_oco_sync_deferred_near_stop_or_tp_retries_next_tick(self):
+        """If price is too close to SL/TP when Break-Even arms, OCO sync is deferred and retried on the next tick."""
+        self.pos.details["oco_order_list_id"] = 5
+        self.pos.take_profit = 103.1
+        self.ex.open_orders = [{"orderId": 1}, {"orderId": 2}]
+
+        # Tick 1: price is 103.0 (within 0.2% of TP 103.1, below TP so action=="HOLD") -> Break-Even arms, OCO sync deferred
+        self.ex.price = 103.0
+        self.tick()
+        self.assertEqual(len(self.ex.oco_created), 0)
+        self.assertTrue(self.pos.details.get("oco_needs_sync"))
+        self.assertEqual(self.pos.details.get("oco_order_list_id"), 5)
+
+        # Tick 2: price settles to 102.6 (safe distance from TP 103.1 and above trailing stop 102.28; stop_loss doesn't change on tick 2)
+        self.ex.price = 102.6
+        self.tick()
+        self.assertEqual(len(self.ex.oco_created), 1)
+        self.assertEqual(self.pos.details.get("oco_order_list_id"), 99)
+        self.assertFalse(self.pos.details.get("oco_needs_sync"))
+
+    def test_telegram_timestamps_and_execution_times(self):
+        """Verify TelegramNotifier formats timestamps in Europe/Belgrade (CET UTC+1 / CEST UTC+2)
+        and uses actual Binance execution timestamps."""
+        from notifier import TelegramNotifier
+        cfg = make_cfg(ENABLE_TELEGRAM=True, TELEGRAM_TOKEN="t", TELEGRAM_CHAT_ID="c",
+                       DISPLAY_TIMEZONE="", DISPLAY_TZ_OFFSET_HOURS=1)
+        nt = TelegramNotifier(cfg)
+        sent = []
+        nt.send = lambda msg, parse_mode=None: sent.append(msg) or True
+        nt.trade_opened("AAAUSDT", "BUY", 100.0, 1.0, 95.0, 105.0, timeframe="15m", open_time=0.0)
+        self.assertIn("1970-01-01 01:00:00 (UTC+1)", sent[-1])
+        nt.trade_closed("AAAUSDT", "TAKE_PROFIT", 100.0, 102.0, 2.0, duration_sec=3600, pnl_usdt=2.0,
+                        open_time=0.0, close_time=3600.0)
+        self.assertIn("1970-01-01 01:00:00 (UTC+1)", sent[-1])
+        self.assertIn("1970-01-01 02:00:00 (UTC+1)", sent[-1])
+
+        # Verify DST-aware Europe/Belgrade (2026-07-01 12:00:00 UTC -> 14:00:00 CEST / UTC+2;
+        # 2026-11-12 12:00:00 UTC -> 13:00:00 CET / UTC+1)
+        nt_dst = TelegramNotifier(make_cfg(ENABLE_TELEGRAM=True, TELEGRAM_TOKEN="t", TELEGRAM_CHAT_ID="c",
+                                           DISPLAY_TIMEZONE="Europe/Belgrade", DISPLAY_TZ_OFFSET_HOURS=1))
+        summer_ts = pd.Timestamp("2026-07-01 12:00:00", tz="UTC").timestamp()
+        winter_ts = pd.Timestamp("2026-11-12 12:00:00", tz="UTC").timestamp()
+        self.assertIn("2026-07-01 14:00:00 (UTC+2)", nt_dst._format_ts(summer_ts))
+        self.assertIn("2026-11-12 13:00:00 (UTC+1)", nt_dst._format_ts(winter_ts))
 
 
 # =============================================================== backtester
@@ -614,6 +761,41 @@ class TestAccountingAndPortfolio(unittest.TestCase):
         self.assertEqual(res4["trades_skipped"], 0)
         self.assertAlmostEqual(res4["net_profit_usdt"], 8.0, places=2)
         self.assertAlmostEqual(res4["final_capital"], 1008.0, places=2)
+
+        # Verify bar-by-bar mark-to-market captures intra-trade unrealized drawdown
+        # even when a trade ultimately recovers to flat (pnl_usdt = 0.0).
+        idx = pd.date_range("2026-08-01 10:00:00", periods=4, freq="1h", tz="UTC")
+        df_mtm = pd.DataFrame({
+            "open":  [100.0, 100.0, 100.0, 100.0],
+            "high":  [100.0, 100.0, 100.0, 100.0],
+            "low":   [100.0,  80.0,  95.0, 100.0],  # -20% intratrade drop on bar 1
+            "close": [100.0,  85.0,  98.0, 100.0],
+            "volume": [10.0, 10.0, 10.0, 10.0],
+            "quote_vol": [1000.0, 1000.0, 1000.0, 1000.0],
+        }, index=idx)
+        mtm_trade = [{
+            "symbol": "TESTUSDT",
+            "entry_time": idx[0],
+            "exit_time": idx[3],
+            "entry_price": 100.0,
+            "pnl_usdt": 0.0,
+            "mae_pct": -20.0,
+        }]
+        res_mtm = simulate_portfolio(mtm_trade, initial_capital=1000.0, trade_size_usdt=100.0,
+                                     max_positions=1, symbol_dfs={"TESTUSDT": df_mtm})
+        self.assertAlmostEqual(res_mtm["max_drawdown_pct"], 2.0, places=2)  # 20% of $100 = $20 / $1000 = 2.0%
+
+    def test_sanitize_json_removes_infinity_and_nan(self):
+        """Ensure validate._save writes strict RFC 8259 JSON without bare Infinity/NaN."""
+        from validate import _sanitize_json
+        raw = {"pf": float("inf"), "neg": float("-inf"), "bad": float("nan"), "ok": [1.5, float("inf")]}
+        clean = _sanitize_json(raw)
+        dumped = json.dumps(clean, allow_nan=False)
+        parsed = json.loads(dumped)
+        self.assertIsNone(parsed["pf"])
+        self.assertIsNone(parsed["neg"])
+        self.assertIsNone(parsed["bad"])
+        self.assertEqual(parsed["ok"], [1.5, None])
 
     def test_experiment_signals_and_gate0(self):
         """Verify experiment.py signals and Gate 0 audit pass without error."""

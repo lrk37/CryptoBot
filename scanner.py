@@ -65,8 +65,11 @@ class MarketScanner:
             ema_period = getattr(self.cfg, 'BTC_REGIME_EMA_PERIOD', 200)
             limit = ema_period + 50
             df = self.exchange.get_candles('BTCUSDT', interval=interval, limit=limit)
-            if df is None or len(df) < 26:
-                log.warning("[BTC REGIME] Could not fetch sufficient BTC candles - failing closed (BEARISH)")
+            if df is None or len(df) < ema_period + 1:
+                log.warning(
+                    f"[BTC REGIME] Insufficient BTC candles ({0 if df is None else len(df)} < {ema_period + 1}) "
+                    f"- failing closed (BEARISH)"
+                )
                 return "BEARISH"
 
             # Exclude still-forming candle so regime is evaluated strictly on completed candles

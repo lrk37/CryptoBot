@@ -58,12 +58,29 @@ def _bpd(interval: str) -> int:
     return 1440 // INTERVAL_MINUTES.get(interval, 15)
 
 
+def _sanitize_json(obj):
+    """Recursively replace non-finite floats (inf, -inf, nan) with None for strict RFC 8259 JSON."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, (np.floating,)):
+        val = float(obj)
+        return val if math.isfinite(val) else None
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, dict):
+        return {k: _sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_json(v) for v in obj]
+    return obj
+
+
 def _save(name: str, data: dict):
-    """Persist results to JSON."""
+    """Persist results to strict RFC 8259 JSON (no bare Infinity/NaN literals)."""
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     fp = RESULTS_DIR / f'{name}.json'
+    clean = _sanitize_json(data)
     with open(fp, 'w') as f:
-        json.dump(data, f, indent=2, default=str)
+        json.dump(clean, f, indent=2, default=str, allow_nan=False)
     print(f'[+] Results saved → {fp}')
 
 
@@ -288,13 +305,16 @@ def run_walk_forward(args):
 # ══════════════════════════════════════════════════════════════
 
 def simulate_portfolio(all_trades: list, initial_capital: float = 1000.0,
-                       trade_size_usdt: float = 100.0, max_positions: int = 3) -> dict:
+                       trade_size_usdt: float = 100.0, max_positions: int = 3,
+                       symbol_dfs: dict = None) -> dict:
     """Chronologically simulate a combined portfolio across multiple coins with shared capital.
 
     Enforces:
     - Shared cash balance
     - Maximum concurrent open positions (default 3)
     - True chronological event ordering (cash freed only after position exit)
+    - Intra-trade mark-to-market drawdown accounting (via bar-by-bar lows/closes when symbol_dfs
+      is provided, plus each taken trade's Maximum Adverse Excursion mae_pct)
     """
     if not all_trades:
         return {
@@ -308,9 +328,26 @@ def simulate_portfolio(all_trades: list, initial_capital: float = 1000.0,
 
     cash = initial_capital
     open_positions = []
+    taken_trades = []
     trades_taken = 0
     trades_skipped = 0
     equity_curve = [initial_capital]
+
+    def _mae_unrealized(pos_dict) -> float:
+        mae = float(pos_dict.get('mae_pct', pos_dict.get('lowest_reached_pct', 0.0)) or 0.0)
+        return min(0.0, trade_size_usdt * (mae / 100.0))
+
+    def _settle_position(pos_dict, remaining_open):
+        nonlocal cash
+        # Record intra-trade mark-to-market trough before settling the trade
+        open_notional_before = (len(remaining_open) + 1) * trade_size_usdt
+        worst_unrealized = _mae_unrealized(pos_dict) + sum(_mae_unrealized(o) for o in remaining_open)
+        equity_curve.append(cash + open_notional_before + worst_unrealized)
+
+        # Settle realized PnL at exit
+        cash += trade_size_usdt + pos_dict['pnl_usdt']
+        open_notional_after = len(remaining_open) * trade_size_usdt
+        equity_curve.append(cash + open_notional_after)
 
     for t in sorted_trades:
         entry_time = t['entry_time']
@@ -320,15 +357,15 @@ def simulate_portfolio(all_trades: list, initial_capital: float = 1000.0,
         open_positions = [p for p in open_positions if p['exit_time'] > entry_time]
 
         exited.sort(key=lambda p: p['exit_time'])
-        for pos in exited:
-            cash += trade_size_usdt + pos['pnl_usdt']
-            open_notional = len(open_positions) * trade_size_usdt
-            equity_curve.append(cash + open_notional)
+        while exited:
+            pos = exited.pop(0)
+            _settle_position(pos, exited + open_positions)
 
         # Capacity check (cash reflects unallocated capital)
         if len(open_positions) < max_positions and cash >= trade_size_usdt:
             cash -= trade_size_usdt
             open_positions.append(t)
+            taken_trades.append(t)
             trades_taken += 1
         else:
             trades_skipped += 1
@@ -337,9 +374,78 @@ def simulate_portfolio(all_trades: list, initial_capital: float = 1000.0,
     open_positions.sort(key=lambda p: p['exit_time'])
     while open_positions:
         pos = open_positions.pop(0)
-        cash += trade_size_usdt + pos['pnl_usdt']
-        open_notional = len(open_positions) * trade_size_usdt
-        equity_curve.append(cash + open_notional)
+        _settle_position(pos, open_positions)
+
+    # Bar-by-bar mark-to-market equity curve when candle DataFrames are provided
+    if symbol_dfs and taken_trades and any(symbol_dfs.get(tr.get('symbol')) is not None for tr in taken_trades):
+        mtm_points = [initial_capital]
+        running_cash = initial_capital
+        active = []
+        pending = list(taken_trades)
+        last_close = {}
+        ts_set = set()
+        for tr in taken_trades:
+            ts_set.add(tr['entry_time'])
+            ts_set.add(tr['exit_time'])
+            sym_df = symbol_dfs.get(tr.get('symbol'))
+            if sym_df is not None:
+                sub = sym_df.loc[(sym_df.index >= tr['entry_time']) & (sym_df.index <= tr['exit_time'])]
+                ts_set.update(sub.index.tolist())
+
+        for ts in sorted(ts_set):
+            # Settle positions exiting at or before ts
+            still_open = []
+            for p in active:
+                if p['exit_time'] <= ts:
+                    running_cash += trade_size_usdt + p['pnl_usdt']
+                else:
+                    still_open.append(p)
+            active = still_open
+
+            while pending and pending[0]['entry_time'] <= ts:
+                nt = pending.pop(0)
+                if nt['exit_time'] > ts:
+                    running_cash -= trade_size_usdt
+                    active.append(nt)
+                    sym = nt.get('symbol')
+                    if sym and sym not in last_close:
+                        last_close[sym] = float(nt.get('entry_price') or 0.0)
+                else:
+                    # 0-bar trade entered and exited on ts: capture worst adverse excursion then settle PnL
+                    mae = _mae_unrealized(nt)
+                    if mae < 0:
+                        mtm_points.append(running_cash + mae)
+                    running_cash += nt['pnl_usdt']
+
+            if active:
+                low_val = running_cash
+                close_val = running_cash
+                for p in active:
+                    sym = p.get('symbol')
+                    entry_px = float(p.get('entry_price') or 0.0)
+                    sym_df = symbol_dfs.get(sym) if sym else None
+                    if sym_df is not None and entry_px > 0 and ts in sym_df.index:
+                        row = sym_df.loc[ts]
+                        if isinstance(row, pd.DataFrame):
+                            row = row.iloc[0]
+                        bar_low = float(row['low'])
+                        bar_close = float(row['close'])
+                        last_close[sym] = bar_close
+                        low_val += trade_size_usdt * (bar_low / entry_px)
+                        close_val += trade_size_usdt * (bar_close / entry_px)
+                    elif entry_px > 0 and sym in last_close and last_close[sym] > 0:
+                        px = last_close[sym]
+                        low_val += trade_size_usdt * (px / entry_px)
+                        close_val += trade_size_usdt * (px / entry_px)
+                    else:
+                        low_val += trade_size_usdt
+                        close_val += trade_size_usdt
+                mtm_points.append(low_val)
+                mtm_points.append(close_val)
+            else:
+                mtm_points.append(running_cash)
+
+        equity_curve = mtm_points
 
     net_profit = cash - initial_capital
     portfolio_return_pct = (net_profit / initial_capital) * 100.0
@@ -391,6 +497,7 @@ def run_basket(args):
     results = []
     agg = dict(pf=[], sh=[], so=[], ex=[], ret=[])
     all_basket_trades = []
+    symbol_dfs = {}
 
     for i, sym in enumerate(symbols, 1):
         try:
@@ -403,6 +510,7 @@ def run_basket(args):
             print(f"  {sym:<10} SKIP — insufficient data ({len(df)} bars)")
             continue
 
+        symbol_dfs[sym] = df
         bt = StrategyBacktester(initial_capital=cap, trade_size_usdt=tsize, min_score=mscore)
         m  = bt.run(sym, df, interval=interval)
 
@@ -462,10 +570,11 @@ def run_basket(args):
         b_net = b_gp - b_gl
         b_pf = (b_gp / b_gl) if b_gl > 0 else float('inf')
 
-        # Run true portfolio simulation (shared capital, max 3 positions)
+        # Run true portfolio simulation (shared capital, max concurrent positions)
         max_pos = int(getattr(cfg, 'MAX_OPEN_TRADES', 3)) or 3
         port = simulate_portfolio(all_basket_trades, initial_capital=cap,
-                                  trade_size_usdt=tsize, max_positions=max_pos)
+                                  trade_size_usdt=tsize, max_positions=max_pos,
+                                  symbol_dfs=symbol_dfs)
 
         print(f'\n  CROSS-ASSET SIGNAL BREADTH ({n} symbols with trades):')
         print(f'    Symbols +Expectancy: {pos_exp}/{n} ({pos_exp / n * 100:.0f}%)')

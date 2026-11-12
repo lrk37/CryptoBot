@@ -71,13 +71,21 @@ Instead of using a tight `-1.5%` stop-loss that gets hunted by normal crypto wic
 
 Tested across the 15-coin liquid basket (`BTC`, `ETH`, `BNB`, `SOL`, `XRP`, `ADA`, `AVAX`, `DOT`, `LINK`, `POL`, `NEAR`, `ATOM`, `APT`, `SUI`, `ARB`) with realistic round-trip friction (`0.10%` fee/side + `0.05%` slippage/side = **`0.30%` round-trip cost**):
 
+### A. Cross-Asset Signal Breadth (Independent Symbol Backtests)
 | Metric | Old Breakout Bot (v5) | **New Dual-Timeframe Capitulation Bot** |
 |---|---|---|
 | **Profitable Coins in Basket** | `0 / 15` (`0%`) | **`14 / 15` (`93%` — `BROAD EDGE ✓`)** |
 | **Overall Win Rate** | `18% – 28%` | **`84.5%` (`82` Wins / `15` Losses across `97` trades)** |
-| **Pooled Profit Factor** | `0.34` | **`3.05` (`+$73.75` Net P&L)** |
+| **Pooled Profit Factor** | `0.34` | **`3.05` (`+$73.75` unconstrained net P&L)** |
 | **Median Expectancy / Trade** | `-1.12%` | **`+0.87%` net per trade** |
-| **Shared Portfolio Max Drawdown** | `> 25%` | **`0.89%`** |
+
+### B. Shared-Capital Portfolio Simulation (`MAX_OPEN_TRADES = 1`, `$1,000` Capital, `$100` / Trade)
+Simulating the live 1-position-at-a-time constraint chronologically across all 15 coins with bar-by-bar Mark-to-Market drawdown accounting ([`validation_results/basket_15m_90d.json`](validation_results/basket_15m_90d.json)):
+- **Trades Executed:** `33` taken (`64` concurrent signals skipped due to `MAX_OPEN_TRADES = 1`)
+- **Portfolio Net Return:** **`+1.24%`** (`+$12.40` -> `$1,012.40` final equity; note `$100` / trade = `10%` position sizing)
+- **Mark-to-Market Max Drawdown:** **`1.24%`** (vs `0.89%` realized-only)
+
+> *Note: OHLCV backtests omit live L2 spread (`<= 0.25%`), order-book depth imbalance, and cross-pair BTC `1h EMA200` filtering.*
 
 ---
 
@@ -86,18 +94,18 @@ Tested across the 15-coin liquid basket (`BTC`, `ETH`, `BNB`, `SOL`, `XRP`, `ADA
 | File | Purpose |
 |---|---|
 | `bot.py` | Main daemon entry point (`ScannerEngine`: 5-minute market scan thread + 30-second position monitor thread). |
-| `scanner.py` | Dual-Timeframe (`15m` + `1h`) market scanner, BTC `1h EMA200` regime filter, and Capitulation scoring engine. |
-| `risk_manager.py` | Position tracking (`positions.json`), ATR stop/TP computation, Break-Even lock, Trailing Stop, `EMA21` exit, and circuit breakers. |
-| `exchange.py` | Binance Spot API connector (`python-binance`). Uses idempotent `newClientOrderId` order reconciliation and live public market data for scanning when running on Testnet (`USE_TESTNET=True`). |
+| `scanner.py` | Dual-Timeframe (`15m` + `1h`) market scanner, closed-candle BTC `1h EMA200` regime filter (fail-closed), spread filter (`<= 0.25%`), and Capitulation scoring engine. |
+| `risk_manager.py` | Position tracking (`positions.json`), partial-fill reconciliation, ATR stop/TP computation, Break-Even lock, Trailing Stop, `EMA21` exit, and UTC circuit breakers. |
+| `exchange.py` | Binance Spot API connector (`python-binance`). Uses idempotent `newClientOrderId` order reconciliation (`NEW`/`EXPIRED`/timeout recovery) and live public market data for scanning when running on Testnet (`USE_TESTNET=True`). |
 | `config.py` | Central configuration file for strategy modes, timeframes, risk limits, and indicator parameters (defaults safely to `USE_TESTNET=True`). |
-| `notifier.py` | Telegram `MarkdownV2` notifications (includes `UTC+1` `Opened`/`Closed` timestamps, `[15m]`/`[1h]` timeframe tag, estimated hold window, `%` and `USDT` P&L, and trade duration). |
+| `notifier.py` | Telegram `MarkdownV2` notifications (includes DST-aware `Europe/Belgrade` `Opened`/`Closed` execution timestamps, `[15m]`/`[1h]` timeframe tag, estimated hold window, `%` and `USDT` P&L, and duration). |
 | `chart_logger.py` | Automatically saves dark-themed PNG candlestick/indicator charts (`Price`, `EMA9/21/50`, `Lower BB(20,2)`, `RSI`, `MACD`, `Entry/Exit/SL/TP`) to `charts/`. |
 | `scan_logger.py` | Logs top scan candidates and tracks empirical 1h/4h forward returns in `scan_logs.json`. |
 | `check_perms.py` | Diagnostic CLI tool to verify Binance API keys, server time sync, Spot trading permissions, and account balances. |
 | `backtest.py` | Single-symbol and multi-symbol quantitative backtester with Monte Carlo random-entry baseline comparison. |
-| `validate.py` | Out-of-sample validation suite (`walk_forward`, `basket`, `monte_carlo`, `slippage`). |
+| `validate.py` | Out-of-sample validation suite (`walk_forward`, `basket` with Mark-to-Market portfolio drawdown, `monte_carlo`, `slippage`). |
 | `experiment.py` | Gate 0 accounting & no-lookahead verification harness + Stage A strategy family comparison suite. |
-| `tests/test_patches.py` | 36 automated unit tests covering idempotent order reconciliation, failed-sell protection, OCO break-even sync, spread/regime filters, and accounting invariants. |
+| `tests/test_patches.py` | 44 automated unit tests covering idempotent order reconciliation (`NEW`/`EXPIRED`), partial-sell & dust reconciliation, failed-sell protection, persistent OCO break-even sync retries, spread/regime filters, DST timestamps, and MTM drawdown invariants. |
 | `deploy/` | `vps_setup.sh` (automated Ubuntu 22.04/24.04 installer) and `cryptobot.service` (`systemd` 24/7 background daemon config). |
 
 ---
@@ -112,7 +120,7 @@ python -m venv .venv
 # Linux / macOS:
 ./.venv/bin/pip install -r requirements.txt
 
-# 2. Run the 36 unit tests & Gate 0 accounting audit
+# 2. Run the 44 unit tests & Gate 0 accounting audit
 python -m unittest discover -s tests -v
 
 # 3. Run the 15-coin Dual-Timeframe basket validation (90 days)
