@@ -392,15 +392,55 @@ def simulate_portfolio(all_trades: list, initial_capital: float = 1000.0,
                 sub = sym_df.loc[(sym_df.index >= tr['entry_time']) & (sym_df.index <= tr['exit_time'])]
                 ts_set.update(sub.index.tolist())
 
+        min_seen_factor = {}
+
+        def _bar_low_close(pos_dict, at_ts):
+            sym = pos_dict.get('symbol')
+            entry_px = float(pos_dict.get('entry_price') or 0.0)
+            sym_df = symbol_dfs.get(sym) if sym else None
+            if sym_df is not None and entry_px > 0 and at_ts in sym_df.index:
+                row = sym_df.loc[at_ts]
+                if isinstance(row, pd.DataFrame):
+                    row = row.iloc[0]
+                bar_low = float(row['low'])
+                bar_close = float(row['close'])
+                last_close[sym] = bar_close
+                low_factor = bar_low / entry_px
+                pid = id(pos_dict)
+                prev_min = min_seen_factor.get(pid)
+                min_seen_factor[pid] = low_factor if prev_min is None else min(prev_min, low_factor)
+                return trade_size_usdt * low_factor, trade_size_usdt * (bar_close / entry_px)
+            if entry_px > 0 and sym in last_close and last_close[sym] > 0:
+                px = last_close[sym]
+                val = trade_size_usdt * (px / entry_px)
+                return val, val
+            return trade_size_usdt, trade_size_usdt
+
         for ts in sorted(ts_set):
-            # Settle positions exiting at or before ts
-            still_open = []
-            for p in active:
-                if p['exit_time'] <= ts:
+            exiting_now = [p for p in active if p['exit_time'] <= ts]
+            continuing = [p for p in active if p['exit_time'] > ts]
+
+            # Capture intra-bar lows (and uncaptured mae_pct) BEFORE settling trades exiting at ts
+            if exiting_now:
+                pre_settle_low = running_cash
+                for p in active:
+                    lv, _ = _bar_low_close(p, ts)
+                    if p in exiting_now:
+                        has_mae = ('mae_pct' in p and p.get('mae_pct') is not None) or (
+                            'lowest_reached_pct' in p and p.get('lowest_reached_pct') is not None
+                        )
+                        if has_mae:
+                            mae_val = trade_size_usdt + _mae_unrealized(p)
+                            pid = id(p)
+                            mae_factor = 1.0 + float(p.get('mae_pct', p.get('lowest_reached_pct', 0.0)) or 0.0) / 100.0
+                            if pid not in min_seen_factor or mae_factor < min_seen_factor[pid]:
+                                lv = min(lv, mae_val)
+                    pre_settle_low += lv
+                mtm_points.append(pre_settle_low)
+
+                for p in exiting_now:
                     running_cash += trade_size_usdt + p['pnl_usdt']
-                else:
-                    still_open.append(p)
-            active = still_open
+                active = continuing
 
             while pending and pending[0]['entry_time'] <= ts:
                 nt = pending.pop(0)
@@ -413,6 +453,15 @@ def simulate_portfolio(all_trades: list, initial_capital: float = 1000.0,
                 else:
                     # 0-bar trade entered and exited on ts: capture worst adverse excursion then settle PnL
                     mae = _mae_unrealized(nt)
+                    sym = nt.get('symbol')
+                    entry_px = float(nt.get('entry_price') or 0.0)
+                    sym_df = symbol_dfs.get(sym) if sym else None
+                    if sym_df is not None and entry_px > 0 and ts in sym_df.index:
+                        row = sym_df.loc[ts]
+                        if isinstance(row, pd.DataFrame):
+                            row = row.iloc[0]
+                        bar_adverse = min(0.0, trade_size_usdt * ((float(row['low']) / entry_px) - 1.0))
+                        mae = min(mae, bar_adverse)
                     if mae < 0:
                         mtm_points.append(running_cash + mae)
                     running_cash += nt['pnl_usdt']
@@ -421,25 +470,9 @@ def simulate_portfolio(all_trades: list, initial_capital: float = 1000.0,
                 low_val = running_cash
                 close_val = running_cash
                 for p in active:
-                    sym = p.get('symbol')
-                    entry_px = float(p.get('entry_price') or 0.0)
-                    sym_df = symbol_dfs.get(sym) if sym else None
-                    if sym_df is not None and entry_px > 0 and ts in sym_df.index:
-                        row = sym_df.loc[ts]
-                        if isinstance(row, pd.DataFrame):
-                            row = row.iloc[0]
-                        bar_low = float(row['low'])
-                        bar_close = float(row['close'])
-                        last_close[sym] = bar_close
-                        low_val += trade_size_usdt * (bar_low / entry_px)
-                        close_val += trade_size_usdt * (bar_close / entry_px)
-                    elif entry_px > 0 and sym in last_close and last_close[sym] > 0:
-                        px = last_close[sym]
-                        low_val += trade_size_usdt * (px / entry_px)
-                        close_val += trade_size_usdt * (px / entry_px)
-                    else:
-                        low_val += trade_size_usdt
-                        close_val += trade_size_usdt
+                    lv, cv = _bar_low_close(p, ts)
+                    low_val += lv
+                    close_val += cv
                 mtm_points.append(low_val)
                 mtm_points.append(close_val)
             else:

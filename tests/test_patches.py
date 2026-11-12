@@ -301,6 +301,77 @@ class TestExchange(unittest.TestCase):
         self.assertEqual(order["status"], "EXPIRED")
         self.assertAlmostEqual(float(order["executedQty"]), 0.6)
 
+    def test_reconcile_cancels_partially_filled_remainder_before_returning(self):
+        """PARTIALLY_FILLED market order must poll/cancel remaining quantity and confirm terminal state."""
+        buy_calls = []
+        cancel_calls = []
+        state = {"status": "PARTIALLY_FILLED", "executedQty": "0.4", "cummulativeQuoteQty": "8.0"}
+
+        def fake_market_buy(**kw):
+            buy_calls.append(kw)
+            return dict(state, symbol=kw["symbol"], clientOrderId=kw["newClientOrderId"])
+
+        def fake_get_order(symbol, origClientOrderId):
+            return dict(state, symbol=symbol, clientOrderId=origClientOrderId)
+
+        def fake_cancel_order(symbol, origClientOrderId):
+            cancel_calls.append((symbol, origClientOrderId))
+            state["status"] = "CANCELED"
+            return dict(state, symbol=symbol, clientOrderId=origClientOrderId)
+
+        self.fake.order_market_buy = fake_market_buy
+        self.fake.get_order = fake_get_order
+        self.fake.cancel_order = fake_cancel_order
+
+        order = self.ex.market_buy("AAAUSDT", 20.0)
+        self.assertEqual(len(buy_calls), 1)
+        self.assertEqual(len(cancel_calls), 1)
+        self.assertEqual(order["status"], "CANCELED")
+        self.assertAlmostEqual(float(order["executedQty"]), 0.4)
+
+    def test_last_sell_fill_uses_selected_best_order_timestamp(self):
+        """get_last_sell_fill must return best[0]'s timestamp even when trailing orders have later timestamps."""
+        t0 = 1_000_000
+        self.fake.orders = [
+            {"side": "SELL", "status": "FILLED", "updateTime": t0 + 10_000,
+             "executedQty": "1", "cummulativeQuoteQty": "105", "type": "LIMIT_MAKER", "orderId": 9},
+            {"side": "SELL", "status": "CANCELED", "updateTime": t0 + 50_000,
+             "executedQty": "0", "cummulativeQuoteQty": "0", "type": "STOP_LOSS_LIMIT", "orderId": 10},
+        ]
+        fill = self.ex.get_last_sell_fill("AAAUSDT", t0)
+        self.assertIsNotNone(fill)
+        self.assertAlmostEqual(fill["time"], (t0 + 10_000) / 1000.0)
+
+    def test_get_oco_fill_scopes_to_order_list_id(self):
+        """get_oco_fill must ignore unrelated SELL fills and respect EXECUTING vs ALL_DONE orderListId."""
+        t0 = 2_000_000
+        self.fake.orders = [
+            # Unrelated manual SELL on same symbol
+            {"side": "SELL", "status": "FILLED", "orderListId": 999, "orderId": 100,
+             "updateTime": t0 + 5000, "executedQty": "5", "cummulativeQuoteQty": "999", "type": "MARKET"},
+            # Target OCO order list 7: partial/full TP leg + expired SL leg
+            {"side": "SELL", "status": "FILLED", "orderListId": 7, "orderId": 11,
+             "updateTime": t0 + 2000, "executedQty": "0.6", "cummulativeQuoteQty": "63.0", "type": "LIMIT_MAKER"},
+            {"side": "SELL", "status": "EXPIRED", "orderListId": 7, "orderId": 12,
+             "updateTime": t0 + 2000, "executedQty": "0", "cummulativeQuoteQty": "0", "type": "STOP_LOSS_LIMIT"},
+        ]
+        ol_status = {"listOrderStatus": "ALL_DONE"}
+        self.fake.get_order_list = lambda orderListId: {
+            "orderListId": orderListId,
+            "listOrderStatus": ol_status["listOrderStatus"],
+            "orders": [{"orderId": 11}, {"orderId": 12}],
+        }
+        res = self.ex.get_oco_fill("AAAUSDT", 7, since_ms=t0)
+        self.assertEqual(res["status"], "FILLED")
+        self.assertAlmostEqual(res["price"], 105.0)
+        self.assertAlmostEqual(res["qty"], 0.6)
+        self.assertEqual(res["type"], "LIMIT_MAKER")
+        self.assertAlmostEqual(res["time"], (t0 + 2000) / 1000.0)
+
+        ol_status["listOrderStatus"] = "EXECUTING"
+        res_open = self.ex.get_oco_fill("AAAUSDT", 7, since_ms=t0)
+        self.assertEqual(res_open["status"], "OPEN")
+
 
 # =============================================================== scanner
 class TestScanner(unittest.TestCase):
@@ -610,6 +681,215 @@ class TestBotMonitor(InTempDir):
         self.assertIn("2026-07-01 14:00:00 (UTC+2)", nt_dst._format_ts(summer_ts))
         self.assertIn("2026-11-12 13:00:00 (UTC+1)", nt_dst._format_ts(winter_ts))
 
+    def _make_live_stack(self, client_overrides=None):
+        """Wire real ScannerEngine + real BinanceConnector + real RiskManager against an offline FakeClient."""
+        import exchange
+        from risk_manager import RiskManager
+
+        sub_dir = tempfile.mkdtemp(dir=self.tmp)
+        os.chdir(sub_dir)
+
+        fc = FakeClient()
+        fc.balances = [
+            {"asset": "USDT", "free": "100", "locked": "0"},
+            {"asset": "AAA", "free": "1.0", "locked": "0"},
+            {"asset": "BBB", "free": "0.5", "locked": "0"},
+        ]
+        fc.get_symbol_info = lambda s: {
+            "filters": [
+                {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+                {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                {"filterType": "MIN_NOTIONAL", "minNotional": "10.0"},
+            ]
+        }
+        def _fake_cancel_open(symbol):
+            fc.open_orders = []
+            return []
+        def _fake_create_oco(**kw):
+            fc.oco_calls.append(kw)
+            fc.open_orders.append({"orderListId": 7, "orderId": 701, "status": "NEW"})
+            return {"orderListId": 7}
+        fc.cancel_open_orders = _fake_cancel_open
+        fc.create_oco_order = _fake_create_oco
+        if client_overrides:
+            for k, v in client_overrides.items():
+                setattr(fc, k, v)
+
+        cfg = make_cfg(
+            POSITIONS_FILE=os.path.join(sub_dir, "positions.json"),
+            TRADE_LOG_FILE=os.path.join(sub_dir, "trade_log.json"),
+            MAX_RETRIES=1, RETRY_DELAY=0, USE_QUOTE_ORDER_QTY=True, USE_EXCHANGE_OCO=True,
+        )
+        orig_client = exchange.Client
+        exchange.Client = lambda *a, **k: fc
+        try:
+            conn = exchange.BinanceConnector(cfg)
+        finally:
+            exchange.Client = orig_client
+        self.bot.cfg = cfg
+        rm = RiskManager(cfg)
+        rm.set_exchange(conn)
+        nt = FakeNotifier()
+        eng = self.bot.ScannerEngine(conn, rm, nt)
+        return fc, conn, rm, nt, eng, cfg
+
+    def test_close_defers_when_oco_cancel_fails_and_preserves_oco_id(self):
+        """If cancel_open_orders returns False, _close_position must preserve oco_order_list_id and NOT call market_sell."""
+        self.pos.details["oco_order_list_id"] = 5
+        self.ex.cancel_return = False
+        self.eng._close_position("AAAUSDT", self.pos, 95.0, "STOP_LOSS")
+        self.assertEqual(self.ex.sold, [])
+        self.assertTrue(self.rm.has_position("AAAUSDT"))
+        self.assertEqual(self.rm.get_position("AAAUSDT").details.get("oco_order_list_id"), 5)
+
+        # Next attempt when OCO cancellation succeeds should sell cleanly
+        self.ex.cancel_return = True
+        self.eng._close_position("AAAUSDT", self.pos, 95.0, "STOP_LOSS")
+        self.assertEqual(self.ex.sold, [1.0])
+        self.assertFalse(self.rm.has_position("AAAUSDT"))
+
+    def test_unresolved_sell_persisted_and_reconciled_without_duplicate_sell(self):
+        """A NEW sell whose cancel fails must persist pending_sell_client_oid and never issue a 2nd market_sell across ticks/restarts."""
+        sell_calls = []
+        order_state = {"status": "NEW", "executedQty": "0.0", "cummulativeQuoteQty": "0.0"}
+
+        def fake_market_sell(**kw):
+            sell_calls.append(kw)
+            return dict(order_state, symbol=kw["symbol"], clientOrderId=kw["newClientOrderId"])
+
+        def fake_get_order(symbol, origClientOrderId):
+            return dict(order_state, symbol=symbol, clientOrderId=origClientOrderId)
+
+        def failing_cancel(symbol, origClientOrderId):
+            raise RuntimeError("cancel failed")
+
+        fc, conn, rm, nt, eng, cfg = self._make_live_stack({
+            "order_market_sell": fake_market_sell,
+            "get_order": fake_get_order,
+            "cancel_order": failing_cancel,
+        })
+        pos = rm.open_position("AAAUSDT", 100.0, 1.0, kind="scanner", atr_value=1.0, entry_score=80)
+        fc.price = 95.0
+
+        # Tick 1 / Exit attempt 1: submits 1 market_sell which stays NEW; persists pending_sell_client_oid
+        eng._close_position("AAAUSDT", pos, 95.0, "STOP_LOSS")
+        self.assertEqual(len(sell_calls), 1)
+        self.assertTrue(rm.has_position("AAAUSDT"))
+        persisted = read_json(cfg.POSITIONS_FILE)["AAAUSDT"]["details"].get("pending_sell_client_oid")
+        self.assertEqual(persisted, sell_calls[0]["newClientOrderId"])
+
+        # Simulate process restart loading positions.json while order is still NEW
+        from risk_manager import RiskManager
+        rm2 = RiskManager(cfg)
+        rm2.set_exchange(conn)
+        eng2 = self.bot.ScannerEngine(conn, rm2, nt)
+        eng2._monitor_tick()
+        self.assertEqual(len(sell_calls), 1)  # MUST NOT submit a second sell!
+        self.assertTrue(rm2.has_position("AAAUSDT"))
+
+        # Now order settles FILLED on Binance -> monitor tick reconciles without another sell
+        order_state.update({
+            "status": "FILLED", "executedQty": "1.0",
+            "cummulativeQuoteQty": "95.0", "updateTime": 1_700_000_000_000,
+        })
+        eng2._monitor_tick()
+        self.assertEqual(len(sell_calls), 1)
+        self.assertFalse(rm2.has_position("AAAUSDT"))
+        self.assertEqual(len(nt.closed), 1)
+        self.assertAlmostEqual(read_json(cfg.TRADE_LOG_FILE)[-1]["exit_price"], 95.0)
+
+    def test_unresolved_buy_persisted_and_reconciled_before_duplicate_entry(self):
+        """A PARTIALLY_FILLED/NEW buy whose cancel fails must persist in scanner_state.json,
+        refuse duplicate entry on subsequent scans, and finalize once reconciled terminal."""
+        from scanner import ScanResult
+        buy_calls = []
+        order_state = {"status": "PARTIALLY_FILLED", "executedQty": "0.4", "cummulativeQuoteQty": "8.0"}
+
+        def fake_market_buy(**kw):
+            buy_calls.append(kw)
+            return dict(order_state, symbol=kw["symbol"], clientOrderId=kw["newClientOrderId"])
+
+        def fake_get_order(symbol, origClientOrderId):
+            return dict(order_state, symbol=symbol, clientOrderId=origClientOrderId)
+
+        def failing_cancel(symbol, origClientOrderId):
+            raise RuntimeError("cancel timeout")
+
+        fc, conn, rm, nt, eng, cfg = self._make_live_stack({
+            "price": 20.0,
+            "order_market_buy": fake_market_buy,
+            "get_order": fake_get_order,
+            "cancel_order": failing_cancel,
+        })
+        res = ScanResult(
+            symbol="BBBUSDT", score=85.0, raw_score=80.0, pump_penalty=0.0,
+            ema_score=25.0, rsi_score=25.0, vol_score=25.0, breakout_score=5.0, ob_score=5.0,
+            close_price=20.0, rsi=18.0, volume_ratio=2.5, breakout_atr_ratio=0.0,
+            bid_ask_ratio=1.4, atr=0.5, pct_change_24h=-5.0,
+            reason="CAPITULATION", last_closed_time=1000, timeframe="15m"
+        )
+
+        # Entry attempt leaves unresolved PARTIALLY_FILLED buy persisted in scanner_state.json
+        eng._execute_entry(res)
+        self.assertEqual(len(buy_calls), 1)
+        self.assertFalse(rm.has_position("BBBUSDT"))
+        self.assertEqual(eng._pending_buy_count(), 1)
+        self.assertIn("BBBUSDT", read_json("scanner_state.json")["pending_buys"])
+
+        # Subsequent direct entry, scan tick, or restart must NOT issue a duplicate buy while unresolved
+        eng2 = self.bot.ScannerEngine(conn, rm, nt)
+        self.assertEqual(eng2._pending_buy_count(), 1)
+        eng2._execute_entry(res)
+        eng2.scanner.check_btc_regime = lambda: (_ for _ in ()).throw(AssertionError("must not scan while buy is pending"))
+        eng2._scan_tick()
+        self.assertEqual(len(buy_calls), 1)
+
+        # Binance later confirms CANCELED remainder with 0.4 filled -> monitor tick reconciles and opens position
+        order_state.update({"status": "CANCELED", "executedQty": "0.4", "cummulativeQuoteQty": "8.0"})
+        eng2._monitor_tick()
+        self.assertEqual(len(buy_calls), 1)
+        self.assertEqual(eng2._pending_buy_count(), 0)
+        self.assertTrue(rm.has_position("BBBUSDT"))
+        self.assertAlmostEqual(rm.get_position("BBBUSDT").quantity, 0.4, places=6)
+        self.assertEqual(rm.get_position("BBBUSDT").details.get("oco_order_list_id"), 7)
+
+    def test_oco_partial_fill_uses_fill_qty_and_retains_remainder(self):
+        """Partial OCO fill (via orderListId) must call partial_close_position with fill['qty'] and retain remainder."""
+        t0 = 1_700_000_000_000
+        fc, conn, rm, nt, eng, cfg = self._make_live_stack()
+        fc.price = 104.0
+        pos = rm.open_position("AAAUSDT", 100.0, 1.0, kind="scanner", atr_value=1.0, entry_score=80)
+        pos.open_time = (t0 - 60_000) / 1000.0
+        pos.take_profit = 105.0
+        pos.details["oco_order_list_id"] = 77
+        rm.persist_positions()
+
+        fc.orders = [
+            # Unrelated manual fill must be ignored
+            {"side": "SELL", "status": "FILLED", "orderListId": 999, "orderId": 500,
+             "updateTime": t0 + 10_000, "executedQty": "1.0", "cummulativeQuoteQty": "110.0", "type": "MARKET"},
+            # Partial fill on our OCO orderListId=77
+            {"side": "SELL", "status": "FILLED", "orderListId": 77, "orderId": 771,
+             "updateTime": t0 + 5000, "executedQty": "0.6", "cummulativeQuoteQty": "63.0", "type": "LIMIT_MAKER"},
+            {"side": "SELL", "status": "EXPIRED", "orderListId": 77, "orderId": 772,
+             "updateTime": t0 + 5000, "executedQty": "0", "cummulativeQuoteQty": "0", "type": "STOP_LOSS_LIMIT"},
+        ]
+        fc.get_order_list = lambda orderListId: {
+            "orderListId": orderListId, "listOrderStatus": "ALL_DONE",
+            "orders": [{"orderId": 771}, {"orderId": 772}],
+        }
+
+        eng._monitor_tick()
+        self.assertTrue(rm.has_position("AAAUSDT"))
+        rem_pos = rm.get_position("AAAUSDT")
+        self.assertAlmostEqual(rem_pos.quantity, 0.4, places=6)
+        self.assertTrue(rem_pos.details.get("oco_needs_sync"))
+        self.assertIsNone(rem_pos.details.get("oco_order_list_id"))
+        row = read_json(cfg.TRADE_LOG_FILE)[-1]
+        self.assertEqual(row["reason"], "PARTIAL_OCO_TAKE_PROFIT")
+        self.assertAlmostEqual(row["quantity"], 0.6, places=6)
+        self.assertAlmostEqual(row["exit_price"], 105.0, places=4)
+
 
 # =============================================================== backtester
 class TestBacktest(unittest.TestCase):
@@ -784,6 +1064,43 @@ class TestAccountingAndPortfolio(unittest.TestCase):
         res_mtm = simulate_portfolio(mtm_trade, initial_capital=1000.0, trade_size_usdt=100.0,
                                      max_positions=1, symbol_dfs={"TESTUSDT": df_mtm})
         self.assertAlmostEqual(res_mtm["max_drawdown_pct"], 2.0, places=2)  # 20% of $100 = $20 / $1000 = 2.0%
+
+    def test_simulate_portfolio_captures_exit_candle_adverse_excursion(self):
+        """Worst intra-trade excursion occurring on the trade's final exit candle must still count in MTM drawdown."""
+        from validate import simulate_portfolio
+        idx = pd.date_range("2026-08-02 10:00:00", periods=4, freq="1h", tz="UTC")
+        df_exit_dip = pd.DataFrame({
+            "open":  [100.0, 100.0, 100.0, 100.0],
+            "high":  [100.5, 100.5, 100.5, 104.5],
+            "low":   [100.0, 100.0, 100.0,  82.0],  # -18% dip ONLY on exit bar idx[3]
+            "close": [100.0, 100.0, 100.0, 104.0],
+            "volume": [10.0, 10.0, 10.0, 10.0],
+            "quote_vol": [1000.0, 1000.0, 1000.0, 1000.0],
+        }, index=idx)
+
+        trade_with_mae = [{
+            "symbol": "TESTUSDT",
+            "entry_time": idx[0],
+            "exit_time": idx[3],
+            "entry_price": 100.0,
+            "pnl_usdt": 4.0,
+            "mae_pct": -18.0,
+        }]
+        res = simulate_portfolio(trade_with_mae, initial_capital=1000.0, trade_size_usdt=100.0,
+                                 max_positions=1, symbol_dfs={"TESTUSDT": df_exit_dip})
+        self.assertAlmostEqual(res["max_drawdown_pct"], 1.8, places=2)  # 18% of $100 = $18 / $1000 = 1.8%
+
+        # Even if mae_pct is absent, exit candle bar_low alone must still register the drawdown
+        trade_no_mae = [{
+            "symbol": "TESTUSDT",
+            "entry_time": idx[0],
+            "exit_time": idx[3],
+            "entry_price": 100.0,
+            "pnl_usdt": 4.0,
+        }]
+        res_bar_only = simulate_portfolio(trade_no_mae, initial_capital=1000.0, trade_size_usdt=100.0,
+                                          max_positions=1, symbol_dfs={"TESTUSDT": df_exit_dip})
+        self.assertAlmostEqual(res_bar_only["max_drawdown_pct"], 1.8, places=2)
 
     def test_sanitize_json_removes_infinity_and_nan(self):
         """Ensure validate._save writes strict RFC 8259 JSON without bare Infinity/NaN."""

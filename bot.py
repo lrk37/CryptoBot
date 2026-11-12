@@ -45,13 +45,15 @@ class ScannerEngine:
         self.scanner = MarketScanner(exchange, cfg)
         self._running = False
 
-        # F-10/F-11: Thread lock for shared mutable state
-        self._state_lock = threading.Lock()
+        # F-10/F-11: Reentrant lock for shared mutable state + lock for pending order reconciliation
+        self._state_lock = threading.RLock()
+        self._order_reconcile_lock = threading.Lock()
         self._active_symbols = set()
         self._symbol_cooldowns: dict[str, float] = {}
 
         self._prev_high_scores: dict[str, dict] = {}
         self._curr_high_scores: dict[str, dict] = {}
+        self._pending_buys: dict[str, dict] = {}
 
         self._load_scanner_state()
 
@@ -93,8 +95,10 @@ class ScannerEngine:
             self.notifier.alert("🛑 Circuit breaker tripped! Daily loss limit reached. Trading halted.")
             return
 
-        if self.risk_mgr.open_count() >= getattr(cfg, 'MAX_OPEN_TRADES', 1):
-            log.info("[SCANNER ENGINE] Max open trades reached - skipping scan")
+        self._reconcile_pending_buys()
+
+        if self.risk_mgr.open_count() + self._pending_buy_count() >= getattr(cfg, 'MAX_OPEN_TRADES', 1):
+            log.info("[SCANNER ENGINE] Max open trades (or unresolved entry) reached - skipping scan")
             return
 
         btc_status = self.scanner.check_btc_regime()
@@ -172,29 +176,85 @@ class ScannerEngine:
 
         self._rotate_scores()
 
-    def _execute_entry(self, res: ScanResult):
-        symbol = res.symbol
-        price = res.close_price
+    def _pending_buy_count(self) -> int:
+        with self._state_lock:
+            return len(self._pending_buys)
 
-        bal = self.exchange.get_usdt_balance()
-        max_usdt = getattr(cfg, 'MAX_TRADE_USDT', 20.0)
-        # F-18: Use SCANNER_TRADE_PCT config instead of hardcoded 0.99
-        trade_pct = getattr(cfg, 'SCANNER_TRADE_PCT', 99) / 100.0
-        usable_bal = bal * trade_pct if bal < max_usdt else max_usdt
-        usdt_amount = min(usable_bal, max_usdt)
-
-        if usdt_amount < getattr(cfg, 'MIN_NOTIONAL_USDT', 11.0):
-            log.warning(f"[ENTRY FAILED] Insufficient balance for {symbol}: ${usdt_amount:.2f}")
-            return
-
-        order = self.exchange.market_buy(symbol, usdt_amount=usdt_amount)
+    @staticmethod
+    def _extract_order_exec_qty(order) -> float:
         if not order:
-            log.error(f"[ENTRY FAILED] Market buy failed for {symbol}")
-            return
+            return 0.0
+        if 'executedQty' in order:
+            return float(order.get('executedQty') or 0)
+        if order.get('fills'):
+            return sum(float(f.get('qty', 0) or 0) for f in order['fills'])
+        return 0.0
 
+    def _order_is_terminal(self, order) -> bool:
+        if hasattr(self.exchange, 'is_order_terminal'):
+            return bool(self.exchange.is_order_terminal(order))
+        return BinanceConnector.is_order_terminal(order)
+
+    def _call_market_buy(self, symbol: str, usdt_amount: float = 0.0, client_oid: str = None):
+        if client_oid is not None:
+            try:
+                return self.exchange.market_buy(symbol, usdt_amount=usdt_amount, client_oid=client_oid)
+            except TypeError:
+                pass
+        return self.exchange.market_buy(symbol, usdt_amount=usdt_amount)
+
+    def _call_market_sell(self, symbol: str, sell_qty: float, client_oid: str = None):
+        if client_oid is not None:
+            try:
+                return self.exchange.market_sell(symbol, sell_qty, client_oid=client_oid)
+            except TypeError:
+                pass
+        return self.exchange.market_sell(symbol, sell_qty)
+
+    def _reconcile_pending_buys(self):
+        """Reconcile any persisted unresolved entry clientOrderIds before scanning or allowing new entries."""
+        if not hasattr(self.exchange, 'reconcile_client_order_strict'):
+            return
+        with self._order_reconcile_lock:
+            with self._state_lock:
+                pending_items = list(self._pending_buys.items())
+            for symbol, meta in pending_items:
+                client_oid = (meta or {}).get('client_oid')
+                if not client_oid:
+                    with self._state_lock:
+                        self._pending_buys.pop(symbol, None)
+                    self._save_scanner_state()
+                    continue
+                if self.risk_mgr.has_position(symbol):
+                    with self._state_lock:
+                        self._pending_buys.pop(symbol, None)
+                    self._save_scanner_state()
+                    continue
+
+                state, order = self.exchange.reconcile_client_order_strict(symbol, client_oid)
+                if state == 'NOT_FOUND':
+                    log.info(f"[PENDING BUY] {symbol} {client_oid} confirmed not found (-2013); clearing pending entry")
+                    with self._state_lock:
+                        self._pending_buys.pop(symbol, None)
+                    self._save_scanner_state()
+                elif state == 'FOUND' and order is not None:
+                    if not self._order_is_terminal(order):
+                        log.warning(
+                            f"[PENDING BUY] {symbol} {client_oid} still non-terminal "
+                            f"(status={order.get('status')}); keeping pending lock"
+                        )
+                        continue
+                    with self._state_lock:
+                        self._pending_buys.pop(symbol, None)
+                    self._save_scanner_state()
+                    self._finalize_buy_order(symbol, order, meta)
+                else:
+                    log.warning(f"[PENDING BUY] {symbol} {client_oid} could not be verified ({state}); keeping lock")
+
+    def _finalize_buy_order(self, symbol: str, order: dict, meta: dict):
         fill_price = self.exchange.avg_fill_price(order)
         if fill_price <= 0:
-            fill_price = price
+            fill_price = float(meta.get('price') or 0.0)
 
         exec_qty = self.exchange.net_executed_qty(order, symbol)  # net of commission paid in the coin
         if exec_qty <= 0:
@@ -204,44 +264,31 @@ class ScannerEngine:
             )
             return
 
+        if self.risk_mgr.has_position(symbol):
+            log.warning(f"[ENTRY SKIPPED] Position already tracked for {symbol}")
+            return
+
         tx_ms = order.get('transactTime') or order.get('updateTime') or order.get('time')
         entry_ts = (float(tx_ms) / 1000.0) if tx_ms else None
-
-        # Extract breakdown scores
-        scan_details = {
-            'raw_score': res.raw_score,
-            'pump_penalty': res.pump_penalty,
-            'ema_score': res.ema_score,
-            'rsi_score': res.rsi_score,
-            'vol_score': res.vol_score,
-            'breakout_score': res.breakout_score,
-            'ob_score': res.ob_score,
-            'rsi': res.rsi,
-            'volume_ratio': res.volume_ratio,
-            'breakout_atr_ratio': res.breakout_atr_ratio,
-            'bid_ask_ratio': res.bid_ask_ratio,
-            'timeframe': getattr(res, 'timeframe', getattr(cfg, 'SCANNER_INTERVAL', '15m'))
-        }
 
         pos = self.risk_mgr.open_position(
             symbol=symbol,
             entry_price=fill_price,
             quantity=exec_qty,
             kind="scanner",
-            atr_value=res.atr,
-            entry_reason=res.reason,
-            entry_score=res.score,
-            details=scan_details
+            atr_value=float(meta.get('atr') or 0.0),
+            entry_reason=str(meta.get('reason') or "SCANNER"),
+            entry_score=float(meta.get('score') or 0.0),
+            details=dict(meta.get('scan_details') or {}),
         )
 
         if pos:
             if entry_ts and entry_ts > 0:
                 pos.open_time = entry_ts
                 self.risk_mgr.persist_positions()
-            # F-11: Add to active symbols under lock
             with self._state_lock:
                 self._active_symbols.add(symbol)
-            tf = getattr(res, 'timeframe', getattr(cfg, 'SCANNER_INTERVAL', '15m'))
+            tf = meta.get('timeframe', getattr(cfg, 'SCANNER_INTERVAL', '15m'))
             max_hold_h = getattr(cfg, 'MAX_SCANNER_HOLD_HOURS', 8)
             self.notifier.trade_opened(
                 symbol, "BUY", fill_price, exec_qty, pos.stop_loss, pos.take_profit,
@@ -264,14 +311,117 @@ class ScannerEngine:
                     pos.details['oco_needs_sync'] = True
                     self.risk_mgr.persist_positions()
                     log.warning(f"[OCO EXCEPTION] Could not place OCO: {e}")
-            
+
             # Save chart snapshot on entry (fetch 100 bars so 50-bar chart has warmed-up indicators)
             try:
-                tf = getattr(res, 'timeframe', getattr(cfg, 'SCANNER_INTERVAL', '15m'))
                 df = self.exchange.get_candles(symbol, interval=tf, limit=100)
                 save_trade_chart(symbol, df, fill_price, fill_price, 0.0, 0.0, "ENTRY", pos.stop_loss, pos.take_profit)
             except Exception as e:
                 log.warning(f"[CHART LOGGER] Entry chart failed: {e}")
+
+    def _execute_entry(self, res: ScanResult):
+        symbol = res.symbol
+        price = res.close_price
+
+        with self._state_lock:
+            if symbol in self._pending_buys:
+                log.warning(f"[ENTRY DEFERRED] Unresolved buy order already tracked for {symbol}")
+                return
+
+        bal = self.exchange.get_usdt_balance()
+        max_usdt = getattr(cfg, 'MAX_TRADE_USDT', 20.0)
+        # F-18: Use SCANNER_TRADE_PCT config instead of hardcoded 0.99
+        trade_pct = getattr(cfg, 'SCANNER_TRADE_PCT', 99) / 100.0
+        usable_bal = bal * trade_pct if bal < max_usdt else max_usdt
+        usdt_amount = min(usable_bal, max_usdt)
+
+        if usdt_amount < getattr(cfg, 'MIN_NOTIONAL_USDT', 11.0):
+            log.warning(f"[ENTRY FAILED] Insufficient balance for {symbol}: ${usdt_amount:.2f}")
+            return
+
+        tf = getattr(res, 'timeframe', getattr(cfg, 'SCANNER_INTERVAL', '15m'))
+        scan_details = {
+            'raw_score': res.raw_score,
+            'pump_penalty': res.pump_penalty,
+            'ema_score': res.ema_score,
+            'rsi_score': res.rsi_score,
+            'vol_score': res.vol_score,
+            'breakout_score': res.breakout_score,
+            'ob_score': res.ob_score,
+            'rsi': res.rsi,
+            'volume_ratio': res.volume_ratio,
+            'breakout_atr_ratio': res.breakout_atr_ratio,
+            'bid_ask_ratio': res.bid_ask_ratio,
+            'timeframe': tf,
+        }
+        meta = {
+            'symbol': symbol,
+            'price': price,
+            'atr': res.atr,
+            'score': res.score,
+            'reason': res.reason,
+            'timeframe': tf,
+            'scan_details': scan_details,
+            'created_at': time.time(),
+        }
+
+        buy_oid = (
+            self.exchange.new_client_order_id(symbol, 'BUY')
+            if hasattr(self.exchange, 'new_client_order_id')
+            else None
+        )
+        if buy_oid:
+            meta['client_oid'] = buy_oid
+            with self._state_lock:
+                self._pending_buys[symbol] = meta
+            self._save_scanner_state()
+
+        order = self._call_market_buy(symbol, usdt_amount=usdt_amount, client_oid=buy_oid)
+        if not order:
+            if buy_oid and not getattr(self.exchange, 'last_order_confirmed_unsent', False) and hasattr(self.exchange, 'reconcile_client_order_strict'):
+                state, rec = self.exchange.reconcile_client_order_strict(symbol, buy_oid)
+                if state == 'NOT_FOUND':
+                    with self._state_lock:
+                        self._pending_buys.pop(symbol, None)
+                    self._save_scanner_state()
+                    log.error(f"[ENTRY FAILED] Market buy failed for {symbol}")
+                    return
+                if state == 'FOUND' and rec is not None:
+                    order = rec
+                else:
+                    log.warning(
+                        f"[ENTRY UNCERTAIN] Market buy {buy_oid} for {symbol} could not be confirmed; "
+                        f"keeping persisted pending_buy for next reconciliation tick."
+                    )
+                    return
+            else:
+                if buy_oid:
+                    with self._state_lock:
+                        self._pending_buys.pop(symbol, None)
+                    self._save_scanner_state()
+                log.error(f"[ENTRY FAILED] Market buy failed for {symbol}")
+                return
+
+        if not self._order_is_terminal(order):
+            if buy_oid:
+                log.warning(
+                    f"[ENTRY UNRESOLVED] Market buy {buy_oid} for {symbol} still non-terminal "
+                    f"(status={order.get('status')}, executedQty={order.get('executedQty', 0)}); "
+                    f"deferring position open until reconciled terminal."
+                )
+            else:
+                log.error(
+                    f"[ENTRY ABORTED] Market buy for {symbol} returned non-terminal status="
+                    f"{order.get('status', 'UNKNOWN')} without reconciliation support."
+                )
+            return
+
+        if buy_oid:
+            with self._state_lock:
+                self._pending_buys.pop(symbol, None)
+            self._save_scanner_state()
+
+        self._finalize_buy_order(symbol, order, meta)
 
     def _rotate_scores(self):
         self._prev_high_scores = self._curr_high_scores.copy()
@@ -292,11 +442,22 @@ class ScannerEngine:
                 time.sleep(1)
 
     def _monitor_tick(self):
+        self._reconcile_pending_buys()
+
         symbols = self.risk_mgr.all_position_symbols()
         for symbol in symbols:
             pos = self.risk_mgr.get_position(symbol)
             if not pos or pos.kind != "scanner":
                 continue
+
+            if pos.details.get('pending_sell_client_oid'):
+                try:
+                    fallback_px = self.exchange.get_price(symbol)
+                except Exception:
+                    fallback_px = pos.entry_price
+                rec_state = self._reconcile_pending_sell(symbol, pos, fallback_px)
+                if rec_state in ('FINALIZED', 'BLOCKED'):
+                    continue
 
             try:
                 curr_price = self.exchange.get_price(symbol)
@@ -310,15 +471,61 @@ class ScannerEngine:
             # Decided from ORDER state, not balances: coins locked in an OCO are not 'free', and
             # unrelated pre-existing holdings of the same coin would confuse a balance check.
             try:
-                if pos.details.get('oco_order_list_id') is not None:
-                    open_orders = self.exchange.get_open_orders_strict(symbol)
-                    if open_orders is not None and len(open_orders) == 0:
-                        fill = self.exchange.get_last_sell_fill(symbol, int(pos.open_time * 1000) - 60_000)
-                        if fill:
-                            exit_px = fill['price']
+                oco_id = pos.details.get('oco_order_list_id')
+                if oco_id is not None:
+                    fill = None
+                    oco_gone = False
+                    if hasattr(self.exchange, 'get_oco_fill'):
+                        oco_res = self.exchange.get_oco_fill(
+                            symbol, oco_id, since_ms=int(pos.open_time * 1000) - 60_000
+                        )
+                        oco_status = (oco_res or {}).get('status', 'UNKNOWN')
+                        if oco_status == 'FILLED':
+                            fill = oco_res
+                            oco_gone = True
+                        elif oco_status in ('CANCELED', 'NOT_FOUND'):
+                            oco_gone = True
+                    else:
+                        open_orders = self.exchange.get_open_orders_strict(symbol)
+                        if open_orders is not None and len(open_orders) == 0:
+                            oco_gone = True
+                            fill = self.exchange.get_last_sell_fill(symbol, int(pos.open_time * 1000) - 60_000)
+
+                    if oco_gone:
+                        fill_qty = (
+                            float(fill['qty'])
+                            if fill and 'qty' in fill and fill['qty'] is not None
+                            else (pos.quantity if fill else 0.0)
+                        )
+                        if fill and fill_qty > 0:
+                            exit_px = float(fill['price'])
                             fill_ts = fill.get('time') or time.time()
-                            reason = "TAKE_PROFIT" if fill['type'] in ('LIMIT_MAKER', 'LIMIT') else "STOP_LOSS"
-                            log.info(f"[EXCHANGE FILL] {symbol} OCO leg filled ({reason}) at {exit_px:.6f}")
+                            reason = "TAKE_PROFIT" if fill.get('type') in ('LIMIT_MAKER', 'LIMIT') else "STOP_LOSS"
+                            remaining = pos.quantity - fill_qty
+                            if fill_qty < pos.quantity * 0.99 and remaining > 1e-8:
+                                sellable_rem = (
+                                    self.exchange.is_sellable_qty(symbol, remaining, exit_px)
+                                    if hasattr(self.exchange, 'is_sellable_qty')
+                                    else True
+                                )
+                                if sellable_rem:
+                                    log.info(
+                                        f"[EXCHANGE PARTIAL FILL] {symbol} OCO leg partially filled "
+                                        f"{fill_qty} / {pos.quantity} ({reason}) at {exit_px:.6f}; "
+                                        f"retaining remaining {remaining:.8f}"
+                                    )
+                                    pos.details['oco_needs_sync'] = True
+                                    self.risk_mgr.partial_close_position(
+                                        symbol, fill_qty, exit_px, f"OCO_{reason}", clear_oco=True
+                                    )
+                                    continue
+                                log.info(
+                                    f"[DUST REMAINDER] {symbol} OCO filled {fill_qty} / {pos.quantity}; "
+                                    f"remainder {remaining:.8f} below exchange minQty/minNotional — finalizing close."
+                                )
+
+                            log.info(f"[EXCHANGE FILL] {symbol} OCO leg filled ({reason}) qty={fill_qty} at {exit_px:.6f}")
+                            pos.quantity = fill_qty
                             pnl_pct = pos.pnl_pct(exit_px)
                             pnl_usdt = pos.pnl_usdt(exit_px)
                             dur_sec = max(0.0, fill_ts - pos.open_time)
@@ -395,33 +602,207 @@ class ScannerEngine:
             self.risk_mgr.persist_positions()
             log.warning(f"[OCO SYNC ERROR] {symbol}: {e}")
 
+    def _reconcile_pending_sell(self, symbol: str, pos, curr_price: float, default_reason: str = "PENDING_SELL") -> str:
+        """Reconcile a persisted unresolved sell clientOrderId before ever placing a second market_sell.
+
+        Returns:
+          - 'FINALIZED': filled (partially or fully) and accounted for; caller must stop processing this exit
+          - 'BLOCKED': still non-terminal or unverified on Binance; caller must NOT place another sell
+          - 'CLEARED': confirmed dead (0 fill terminal or -2013 NOT_FOUND); safe to submit a fresh exit
+        """
+        oid = pos.details.get('pending_sell_client_oid')
+        if not oid:
+            return 'CLEARED'
+        if not hasattr(self.exchange, 'reconcile_client_order_strict'):
+            return 'CLEARED'
+
+        sell_reason = pos.details.get('pending_sell_reason') or default_reason
+        state, order = self.exchange.reconcile_client_order_strict(symbol, oid)
+
+        if state == 'NOT_FOUND':
+            pos.details.pop('pending_sell_client_oid', None)
+            pos.details.pop('pending_sell_reason', None)
+            pos.details.pop('pending_sell_qty', None)
+            self.risk_mgr.persist_positions()
+            return 'CLEARED'
+
+        if state != 'FOUND' or not order:
+            log.warning(
+                f"[PENDING SELL UNVERIFIED] {symbol} {oid} could not be confirmed ({state}); "
+                f"retaining pending lock and refusing duplicate sell."
+            )
+            return 'BLOCKED'
+
+        if not self._order_is_terminal(order):
+            log.warning(
+                f"[PENDING SELL OPEN] {symbol} {oid} still non-terminal "
+                f"(status={order.get('status')}, executedQty={order.get('executedQty', 0)}); "
+                f"refusing duplicate sell."
+            )
+            return 'BLOCKED'
+
+        pos.details.pop('pending_sell_client_oid', None)
+        pos.details.pop('pending_sell_reason', None)
+        pos.details.pop('pending_sell_qty', None)
+
+        exec_qty = self._extract_order_exec_qty(order)
+        if exec_qty <= 0:
+            if pos.details.get('oco_order_list_id') is None and getattr(cfg, 'USE_EXCHANGE_OCO', True):
+                pos.details['oco_needs_sync'] = True
+            self.risk_mgr.persist_positions()
+            log.info(f"[PENDING SELL] {symbol} {oid} terminated with 0 executed qty; cleared lock")
+            return 'CLEARED'
+
+        had_oco_cleared = pos.details.get('oco_order_list_id') is None
+        self._finalize_sell_order(symbol, pos, order, exec_qty, curr_price, sell_reason, had_oco=had_oco_cleared)
+        return 'FINALIZED'
+
+    def _finalize_sell_order(self, symbol: str, pos, order: dict, exec_qty: float, curr_price: float, reason: str, had_oco: bool = False):
+        exit_price = self.exchange.avg_fill_price(order) or curr_price
+
+        # Reconcile partial fills: keep remaining position open when it is still sellable on Binance
+        remaining = pos.quantity - exec_qty
+        if exec_qty < pos.quantity * 0.99 and remaining > 1e-8:
+            sellable_rem = (
+                self.exchange.is_sellable_qty(symbol, remaining, exit_price)
+                if hasattr(self.exchange, 'is_sellable_qty')
+                else True
+            )
+            if sellable_rem:
+                if had_oco:
+                    pos.details['oco_needs_sync'] = True
+                self.risk_mgr.partial_close_position(
+                    symbol, exec_qty, exit_price, reason, clear_oco=had_oco
+                )
+                return
+            log.info(
+                f"[DUST REMAINDER] {symbol}: sold {exec_qty} / {pos.quantity}; "
+                f"remainder {remaining:.8f} below exchange minQty/minNotional — finalizing close."
+            )
+
+        # Full fill (or dust remainder): compute realized P&L on actual executed quantity
+        pos.quantity = exec_qty
+        pnl_pct = pos.pnl_pct(exit_price)
+        pnl_usdt = pos.pnl_usdt(exit_price)
+
+        tx_ms = order.get('transactTime') or order.get('updateTime') or order.get('time')
+        close_ts = (float(tx_ms) / 1000.0) if tx_ms else time.time()
+        dur_sec = max(0.0, close_ts - pos.open_time)
+        self.risk_mgr.close_position(symbol, exit_price, reason)
+        with self._state_lock:
+            self._active_symbols.discard(symbol)
+
+        cooldown_sec = getattr(cfg, 'SYMBOL_COOLDOWN_SEC', 3600)
+        if "STOP_LOSS" in str(reason) and getattr(cfg, 'STRATEGY_MODE', 'capitulation') == 'capitulation':
+            cooldown_sec = max(cooldown_sec, 43200)
+        with self._state_lock:
+            self._symbol_cooldowns[symbol] = time.time() + cooldown_sec
+        log.info(f"[COOLDOWN SET] {symbol} placed on {cooldown_sec // 60}m cooldown after trade close ({reason})")
+
+        self.notifier.trade_closed(
+            symbol, reason, pos.entry_price, exit_price, pnl_pct,
+            duration_sec=dur_sec, pnl_usdt=pnl_usdt, open_time=pos.open_time, close_time=close_ts
+        )
+
+        # Save chart snapshot on exit (fetch 100 bars so 50-bar chart has warmed-up indicators)
+        try:
+            tf = (pos.details or {}).get('timeframe', getattr(cfg, 'SCANNER_INTERVAL', '15m'))
+            df = self.exchange.get_candles(symbol, interval=tf, limit=100)
+            save_trade_chart(symbol, df, pos.entry_price, exit_price, pnl_pct, pnl_usdt, reason, pos.stop_loss, pos.take_profit)
+        except Exception as e:
+            log.warning(f"[CHART LOGGER] Exit chart failed: {e}")
+
     def _close_position(self, symbol, pos, curr_price, reason):
         if not self.risk_mgr.start_exit(symbol):
             return
 
         try:
-            # Cancel open orders (OCO) on Binance so balance is unlocked for selling
+            if pos.details.get('pending_sell_client_oid'):
+                rec_state = self._reconcile_pending_sell(symbol, pos, curr_price, default_reason=reason)
+                if rec_state in ('FINALIZED', 'BLOCKED'):
+                    self.risk_mgr.complete_exit(symbol)
+                    return
+
+            # Cancel open orders (OCO) on Binance so balance is unlocked for selling.
+            # NEVER proceed with market_sell if OCO cancellation failed (OCO could still execute concurrently).
             had_oco = pos.details.get('oco_order_list_id') is not None
-            cancelled = self.exchange.cancel_open_orders(symbol)
-            if cancelled is not False and had_oco:
+            if had_oco:
+                cancelled = self.exchange.cancel_open_orders(symbol)
+                if cancelled is False:
+                    self.risk_mgr.persist_positions()
+                    log.warning(
+                        f"[CLOSE DEFERRED] Failed to cancel open OCO for {symbol}; "
+                        f"preserving oco_order_list_id and deferring market sell until next tick."
+                    )
+                    self.risk_mgr.complete_exit(symbol)
+                    return
                 pos.details.pop('oco_order_list_id', None)
                 pos.details.pop('oco_stop_loss', None)
 
             actual_qty = self.exchange.get_asset_balance_fresh(symbol)
             # Sell the POSITION, never more: free balance may include unrelated holdings of the same coin
             sell_qty = min(actual_qty, pos.quantity) if actual_qty > 0 else pos.quantity
-            order = self.exchange.market_sell(symbol, sell_qty)
 
-            if order:
-                if 'executedQty' in order:
-                    exec_qty = float(order.get('executedQty') or 0)
-                elif order.get('fills'):
-                    exec_qty = sum(float(f.get('qty', 0) or 0) for f in order['fills'])
+            sell_oid = (
+                self.exchange.new_client_order_id(symbol, 'SELL')
+                if hasattr(self.exchange, 'new_client_order_id')
+                else None
+            )
+            if sell_oid:
+                pos.details['pending_sell_client_oid'] = sell_oid
+                pos.details['pending_sell_reason'] = reason
+                pos.details['pending_sell_qty'] = sell_qty
+            self.risk_mgr.persist_positions()
+
+            order = self._call_market_sell(symbol, sell_qty, client_oid=sell_oid)
+
+            if not order:
+                if (
+                    sell_oid
+                    and not getattr(self.exchange, 'last_order_confirmed_unsent', False)
+                    and hasattr(self.exchange, 'reconcile_client_order_strict')
+                ):
+                    state, rec = self.exchange.reconcile_client_order_strict(symbol, sell_oid)
+                    if state == 'NOT_FOUND':
+                        pos.details.pop('pending_sell_client_oid', None)
+                        pos.details.pop('pending_sell_reason', None)
+                        pos.details.pop('pending_sell_qty', None)
+                    elif state == 'FOUND' and rec is not None:
+                        order = rec
+                    else:
+                        if had_oco:
+                            pos.details['oco_needs_sync'] = True
+                        self.risk_mgr.persist_positions()
+                        log.warning(
+                            f"[CLOSE UNCERTAIN] Market sell {sell_oid} status unverified for {symbol}; "
+                            f"retaining pending_sell_client_oid to reconcile before any retry."
+                        )
+                        self.risk_mgr.complete_exit(symbol)
+                        return
                 else:
-                    exec_qty = 0.0
-            else:
-                exec_qty = 0.0
+                    if sell_oid:
+                        pos.details.pop('pending_sell_client_oid', None)
+                        pos.details.pop('pending_sell_reason', None)
+                        pos.details.pop('pending_sell_qty', None)
 
+            if order and not self._order_is_terminal(order):
+                if had_oco:
+                    pos.details['oco_needs_sync'] = True
+                self.risk_mgr.persist_positions()
+                log.warning(
+                    f"[CLOSE UNRESOLVED] Sell order {sell_oid} for {symbol} is non-terminal "
+                    f"(status={order.get('status')}, executedQty={order.get('executedQty', 0)}); "
+                    f"keeping pending_sell_client_oid and waiting for terminal reconciliation."
+                )
+                self.risk_mgr.complete_exit(symbol)
+                return
+
+            if sell_oid:
+                pos.details.pop('pending_sell_client_oid', None)
+                pos.details.pop('pending_sell_reason', None)
+                pos.details.pop('pending_sell_qty', None)
+
+            exec_qty = self._extract_order_exec_qty(order)
             if not order or exec_qty <= 0:
                 if had_oco:
                     pos.details['oco_needs_sync'] = True
@@ -433,59 +814,7 @@ class ScannerEngine:
                 self.risk_mgr.complete_exit(symbol)
                 return
 
-            exit_price = self.exchange.avg_fill_price(order) or curr_price
-
-            # Reconcile partial fills: keep remaining position open when it is still sellable on Binance
-            remaining = pos.quantity - exec_qty
-            if exec_qty < pos.quantity * 0.99 and remaining > 1e-8:
-                sellable_rem = (
-                    self.exchange.is_sellable_qty(symbol, remaining, exit_price)
-                    if hasattr(self.exchange, 'is_sellable_qty')
-                    else True
-                )
-                if sellable_rem:
-                    if had_oco:
-                        pos.details['oco_needs_sync'] = True
-                    self.risk_mgr.partial_close_position(symbol, exec_qty, exit_price, reason)
-                    return
-                log.info(
-                    f"[DUST REMAINDER] {symbol}: sold {exec_qty} / {pos.quantity}; "
-                    f"remainder {remaining:.8f} below exchange minQty/minNotional — finalizing close."
-                )
-
-            # Full fill: compute realized P&L on actual executed quantity
-            pos.quantity = exec_qty
-            pnl_pct = pos.pnl_pct(exit_price)
-            pnl_usdt = pos.pnl_usdt(exit_price)
-
-            tx_ms = order.get('transactTime') or order.get('updateTime') or order.get('time')
-            close_ts = (float(tx_ms) / 1000.0) if tx_ms else time.time()
-            dur_sec = max(0.0, close_ts - pos.open_time)
-            self.risk_mgr.close_position(symbol, exit_price, reason)
-            # F-11: Remove from active symbols under lock
-            with self._state_lock:
-                self._active_symbols.discard(symbol)
-
-            # F-10: Set Symbol Cooldown under lock (12h LowProfitPairs lockout after STOP_LOSS in capitulation mode)
-            cooldown_sec = getattr(cfg, 'SYMBOL_COOLDOWN_SEC', 3600)
-            if "STOP_LOSS" in str(reason) and getattr(cfg, 'STRATEGY_MODE', 'capitulation') == 'capitulation':
-                cooldown_sec = max(cooldown_sec, 43200)
-            with self._state_lock:
-                self._symbol_cooldowns[symbol] = time.time() + cooldown_sec
-            log.info(f"[COOLDOWN SET] {symbol} placed on {cooldown_sec // 60}m cooldown after trade close ({reason})")
-
-            self.notifier.trade_closed(
-                symbol, reason, pos.entry_price, exit_price, pnl_pct,
-                duration_sec=dur_sec, pnl_usdt=pnl_usdt, open_time=pos.open_time, close_time=close_ts
-            )
-
-            # Save chart snapshot on exit (fetch 100 bars so 50-bar chart has warmed-up indicators)
-            try:
-                tf = (pos.details or {}).get('timeframe', getattr(cfg, 'SCANNER_INTERVAL', '15m'))
-                df = self.exchange.get_candles(symbol, interval=tf, limit=100)
-                save_trade_chart(symbol, df, pos.entry_price, exit_price, pnl_pct, pnl_usdt, reason, pos.stop_loss, pos.take_profit)
-            except Exception as e:
-                log.warning(f"[CHART LOGGER] Exit chart failed: {e}")
+            self._finalize_sell_order(symbol, pos, order, exec_qty, curr_price, reason, had_oco=had_oco)
 
         except Exception as e:
             log.error(f"[CLOSE ERROR] Failed to close {symbol}: {e}")
@@ -493,13 +822,17 @@ class ScannerEngine:
 
     def _save_scanner_state(self):
         try:
-            data = {
-                'prev_high_scores': self._prev_high_scores,
-                'curr_high_scores': self._curr_high_scores,
-                'timestamp': time.time()
-            }
-            with open('scanner_state.json', 'w') as f:
+            with self._state_lock:
+                data = {
+                    'prev_high_scores': dict(self._prev_high_scores),
+                    'curr_high_scores': dict(self._curr_high_scores),
+                    'pending_buys': dict(self._pending_buys),
+                    'timestamp': time.time()
+                }
+            tmp_path = 'scanner_state.json.tmp'
+            with open(tmp_path, 'w') as f:
                 json.dump(data, f)
+            os.replace(tmp_path, 'scanner_state.json')
         except Exception as e:
             log.error(f"Failed to save scanner state: {e}")
 
@@ -508,8 +841,10 @@ class ScannerEngine:
             if Path('scanner_state.json').exists():
                 with open('scanner_state.json', 'r') as f:
                     data = json.load(f)
-                    self._prev_high_scores = data.get('prev_high_scores', {})
-                    self._curr_high_scores = data.get('curr_high_scores', {})
+                    with self._state_lock:
+                        self._prev_high_scores = data.get('prev_high_scores', {})
+                        self._curr_high_scores = data.get('curr_high_scores', {})
+                        self._pending_buys = data.get('pending_buys', {})
         except Exception as e:
             log.error(f"Failed to load scanner state: {e}")
 

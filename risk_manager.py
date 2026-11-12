@@ -232,7 +232,14 @@ class RiskManager:
                 self._save_loss_state()
                 self._log_trade(pos, exit_price, exit_reason)
 
-    def partial_close_position(self, symbol: str, sold_qty: float, exit_price: float, exit_reason: str) -> Optional[Position]:
+    def partial_close_position(
+        self,
+        symbol: str,
+        sold_qty: float,
+        exit_price: float,
+        exit_reason: str,
+        clear_oco: bool = False,
+    ) -> Optional[Position]:
         """Record realized P&L on a partially filled sell order and retain the remaining position."""
         with self._lock:
             pos = self._positions.get(symbol)
@@ -261,8 +268,12 @@ class RiskManager:
                 self._log_trade(sold_slice, exit_price, f"PARTIAL_{exit_reason}")
             pos.quantity = max(round(pos.quantity - sold_qty, 8), 0.0)
             if pos.details:
-                pos.details.pop('oco_order_list_id', None)
-                pos.details.pop('oco_stop_loss', None)
+                pos.details.pop('pending_sell_client_oid', None)
+                pos.details.pop('pending_sell_reason', None)
+                pos.details.pop('pending_sell_qty', None)
+                if clear_oco:
+                    pos.details.pop('oco_order_list_id', None)
+                    pos.details.pop('oco_stop_loss', None)
             self._save_positions()
             log.warning(
                 f"[PARTIAL CLOSE] {symbol}: sold {sold_qty} @ {exit_price:.6f}, "
