@@ -21,8 +21,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- 1. API & Environment Credentials ---
-USE_TESTNET = os.getenv('USE_TESTNET', 'False').lower() in ('true', '1', 't')
+# --- 1. API & Environment Credentials (Safe Default: Testnet) ---
+USE_TESTNET = os.getenv('USE_TESTNET', 'True').lower() in ('true', '1', 't')
 if USE_TESTNET:
     API_KEY = os.getenv('BINANCE_TESTNET_API_KEY', '') or os.getenv('BINANCE_API_KEY', '')
     API_SECRET = os.getenv('BINANCE_TESTNET_API_SECRET', '') or os.getenv('BINANCE_API_SECRET', '')
@@ -86,6 +86,7 @@ SCANNER_TRAILING_OFFSET = 0.7
 MIN_TRAILING_PROFIT_PCT = 1.6
 ENABLE_BREAK_EVEN_STOP = True
 BREAK_EVEN_TRIGGER_PCT = 2.2
+BREAK_EVEN_SLIPPAGE_BUFFER_PCT = 0.10
 MAX_SCANNER_HOLD_HOURS = 8
 HOLD_EXIT_LOSS_PCT = -1
 
@@ -97,6 +98,7 @@ VOLUME_MA_PERIOD = 20
 ATR_PERIOD = 14
 STABLECOIN_ATR_THRESHOLD = 0.3
 DOJI_MAX_BODY_RATIO = 0.15
+MAX_SPREAD_PCT = 0.25
 MIN_ORDERBOOK_RATIO = 0.70
 PARABOLIC_PUMP_MAX_PCT = 25.0
 MAX_24H_DUMP_PCT = -18.0
@@ -139,5 +141,6 @@ TRADE_LOG_FILE = 'trade_log.json'
 ENABLE_TELEGRAM = os.getenv('ENABLE_TELEGRAM', 'False').lower() in ('true', '1', 't')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
+DISPLAY_TZ_OFFSET_HOURS = int(os.getenv('DISPLAY_TZ_OFFSET_HOURS', '1'))  # Default UTC+1
 LOG_FILE = os.getenv('LOG_FILE', 'bot.log')
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()

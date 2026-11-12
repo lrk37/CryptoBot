@@ -1,6 +1,8 @@
 """notifier.py — Telegram Alerts (MarkdownV2)"""
 import logging
 import re
+import time
+from datetime import datetime, timezone, timedelta
 import requests
 
 log = logging.getLogger(__name__)
@@ -16,6 +18,7 @@ class TelegramNotifier:
         self.enabled = cfg.ENABLE_TELEGRAM
         self.token = cfg.TELEGRAM_TOKEN
         self.chat_id = cfg.TELEGRAM_CHAT_ID
+        self.tz_offset_hours = int(getattr(cfg, 'DISPLAY_TZ_OFFSET_HOURS', 1))
         self._url = f"https://api.telegram.org/bot{self.token}/sendMessage"
 
     def send(self, msg, parse_mode=None) -> bool:
@@ -50,25 +53,40 @@ class TelegramNotifier:
         mins = (seconds % 3600) // 60
         return f"{hours}h {mins}m"
 
-    def trade_opened(self, symbol, side, price, qty, sl, tp, timeframe: str = None, max_hold_hours: int = 8):
+    def _format_ts(self, epoch_sec: float = None) -> str:
+        ts = epoch_sec if epoch_sec is not None else time.time()
+        tz = timezone(timedelta(hours=self.tz_offset_hours))
+        dt = datetime.fromtimestamp(ts, tz=tz)
+        sign = f"+{self.tz_offset_hours}" if self.tz_offset_hours >= 0 else str(self.tz_offset_hours)
+        return f"{dt.strftime('%Y-%m-%d %H:%M:%S')} (UTC{sign})"
+
+    def trade_opened(self, symbol, side, price, qty, sl, tp, timeframe: str = None, max_hold_hours: int = 8, open_time: float = None):
         # F-26: Use code spans for values (no escaping needed inside backticks).
         # Only escape text outside code spans.
         side_esc = _escape_md2(side)
         tf_tag = f" \\[`{timeframe}`\\]" if timeframe else ""
+        open_str = self._format_ts(open_time)
         msg = (f"\U0001f7e2 *{side_esc}* `{symbol}`{tf_tag}\n"
                f"Price: `{price:.6f}` \\| Qty: `{qty}`\n"
                f"SL: `{sl:.6f}` \\| TP: `{tp:.6f}`\n"
+               f"\U0001f552 Opened: `{open_str}`\n"
                f"\u23f1 Est\\. Hold: `30m - 3h` \\(Max `{max_hold_hours}h`\\)")
         self.send(msg, parse_mode='MarkdownV2')
 
-    def trade_closed(self, symbol, reason, entry, close, pnl, duration_sec: float = None, pnl_usdt: float = None):
+    def trade_closed(self, symbol, reason, entry, close, pnl, duration_sec: float = None, pnl_usdt: float = None,
+                     open_time: float = None, close_time: float = None):
         e = '\u2705' if pnl >= 0 else '\U0001f534'
         rsn = _escape_md2(reason)
         pnl_str = f"`{pnl:+.2f}%` \\(`{pnl_usdt:+.2f} USDT`\\)" if pnl_usdt is not None else f"`{pnl:+.2f}%`"
+        now_ts = close_time if close_time is not None else time.time()
+        if open_time is None and duration_sec is not None:
+            open_time = now_ts - duration_sec
+        open_line = f"\n\U0001f552 Opened: `{self._format_ts(open_time)}`" if open_time is not None else ""
+        close_line = f"\n\U0001f3c1 Closed: `{self._format_ts(now_ts)}`"
         dur_line = f"\n\u23f1 Duration: `{self._format_duration(duration_sec)}`" if duration_sec is not None else ""
         msg = (f"{e} *CLOSED* `{symbol}` \\- {rsn}\n"
                f"Entry: `{entry:.6f}` \\-> Exit: `{close:.6f}`\n"
-               f"PnL: {pnl_str}{dur_line}")
+               f"PnL: {pnl_str}{open_line}{close_line}{dur_line}")
         self.send(msg, parse_mode='MarkdownV2')
 
     def alert(self, msg):

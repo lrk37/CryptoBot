@@ -54,7 +54,7 @@ Instead of using a tight `-1.5%` stop-loss that gets hunted by normal crypto wic
    - Places an ATR-scaled catastrophe Stop-Loss (`4.8x ATR`, clamped to `1.5%–7.0%`) and Take-Profit (`2.0x ATR`, floored at `1.8%`) directly on Binance's matching engine via a native **OCO (One-Cancels-the-Other)** order (`USE_EXCHANGE_OCO = True`). Even if your server loses internet, your position is protected on Binance.
 2. **Stage 2 — Fast Risk Elimination (Break-Even & Trailing Stop):**
    - **Trailing Stop (`+1.8%` effective trigger, `0.7%` offset):** Once profit reaches `+1.8%` (`MIN_TRAILING_PROFIT_PCT + ROUND_TRIP_FEE_PCT`), a tight `0.7%` trailing stop arms to follow the rebound upward.
-   - **Break-Even Lock (`+2.2%` trigger):** Once profit reaches `+2.2%`, the Stop-Loss floor is automatically raised above your entry price (`entry * 1.002`), making the trade **100% risk-free**.
+   - **Break-Even Lock (`+2.2%` trigger + OCO Sync):** Once profit reaches `+2.2%`, the Stop-Loss floor is automatically raised above your entry price (`entry * 1.003`, covering `0.20%` round-trip fees plus a `0.10%` slippage allowance) and **synchronized with your exchange-side OCO order on Binance**.
    - **Time-Decaying `EMA21` Profit-Take (`minimal_roi` style):** If a candle closes back above `EMA21` with `>= +1.2%` profit in the first 45m (`2h` on `1h` trades) — or `>= +0.55%` profit after 45m (`2h` on `1h` trades) once `EMA21` has drifted lower — the bot banks the mean-reversion gain immediately.
 3. **Stage 3 — Time & Trend Invalidation (`8h` / `16h`):**
    - If a position has been open for `8 hours` (`MAX_SCANNER_HOLD_HOURS`) and the last closed candle is still below `EMA21`, it exits early (`TREND_INVALIDATED`) rather than waiting for the catastrophe stop. Hard maximum hold time is `16 hours` (`MAX_HOLD_TIMEOUT`).
@@ -88,16 +88,16 @@ Tested across the 15-coin liquid basket (`BTC`, `ETH`, `BNB`, `SOL`, `XRP`, `ADA
 | `bot.py` | Main daemon entry point (`ScannerEngine`: 5-minute market scan thread + 30-second position monitor thread). |
 | `scanner.py` | Dual-Timeframe (`15m` + `1h`) market scanner, BTC `1h EMA200` regime filter, and Capitulation scoring engine. |
 | `risk_manager.py` | Position tracking (`positions.json`), ATR stop/TP computation, Break-Even lock, Trailing Stop, `EMA21` exit, and circuit breakers. |
-| `exchange.py` | Binance Spot API connector (`python-binance`). Uses live public market data for scanning when running on Testnet (`USE_TESTNET=True`). |
-| `config.py` | Central configuration file for strategy modes, timeframes, risk limits, and indicator parameters. |
-| `notifier.py` | Telegram `MarkdownV2` notifications (includes `[15m]`/`[1h]` timeframe tag, estimated hold window, `%` and `USDT` P&L, and trade duration). |
+| `exchange.py` | Binance Spot API connector (`python-binance`). Uses idempotent `newClientOrderId` order reconciliation and live public market data for scanning when running on Testnet (`USE_TESTNET=True`). |
+| `config.py` | Central configuration file for strategy modes, timeframes, risk limits, and indicator parameters (defaults safely to `USE_TESTNET=True`). |
+| `notifier.py` | Telegram `MarkdownV2` notifications (includes `UTC+1` `Opened`/`Closed` timestamps, `[15m]`/`[1h]` timeframe tag, estimated hold window, `%` and `USDT` P&L, and trade duration). |
 | `chart_logger.py` | Automatically saves dark-themed PNG candlestick/indicator charts (`Price`, `EMA9/21/50`, `Lower BB(20,2)`, `RSI`, `MACD`, `Entry/Exit/SL/TP`) to `charts/`. |
 | `scan_logger.py` | Logs top scan candidates and tracks empirical 1h/4h forward returns in `scan_logs.json`. |
 | `check_perms.py` | Diagnostic CLI tool to verify Binance API keys, server time sync, Spot trading permissions, and account balances. |
 | `backtest.py` | Single-symbol and multi-symbol quantitative backtester with Monte Carlo random-entry baseline comparison. |
 | `validate.py` | Out-of-sample validation suite (`walk_forward`, `basket`, `monte_carlo`, `slippage`). |
 | `experiment.py` | Gate 0 accounting & no-lookahead verification harness + Stage A strategy family comparison suite. |
-| `tests/test_patches.py` | 31 automated unit tests covering stop math, OCO order handling, risk manager persistence, and accounting invariants. |
+| `tests/test_patches.py` | 36 automated unit tests covering idempotent order reconciliation, failed-sell protection, OCO break-even sync, spread/regime filters, and accounting invariants. |
 | `deploy/` | `vps_setup.sh` (automated Ubuntu 22.04/24.04 installer) and `cryptobot.service` (`systemd` 24/7 background daemon config). |
 
 ---
@@ -112,7 +112,7 @@ python -m venv .venv
 # Linux / macOS:
 ./.venv/bin/pip install -r requirements.txt
 
-# 2. Run the 31 unit tests & Gate 0 accounting audit
+# 2. Run the 36 unit tests & Gate 0 accounting audit
 python -m unittest discover -s tests -v
 
 # 3. Run the 15-coin Dual-Timeframe basket validation (90 days)

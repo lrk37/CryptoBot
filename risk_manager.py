@@ -134,7 +134,7 @@ class RiskManager:
         self._lock = threading.Lock()
         self._positions: Dict[str, Position] = {}
         self._daily_start_bal = None
-        self._today = date.today()
+        self._today = datetime.now(timezone.utc).date()
         self._halted = False
         self._exiting_symbols: Set[str] = set()
         self.exchange = None
@@ -280,12 +280,13 @@ class RiskManager:
 
             if getattr(self.cfg, 'ENABLE_BREAK_EVEN_STOP', True) and position.min_be_price == 0.0:
                 if position.pnl_pct(current_price) >= trig['be_trigger_pct']:
-                    min_be = position.entry_price * (1 + (fees_pct / 100.0))
+                    slip_buf_pct = float(getattr(self.cfg, 'BREAK_EVEN_SLIPPAGE_BUFFER_PCT', 0.10))
+                    min_be = position.entry_price * (1 + ((fees_pct + slip_buf_pct) / 100.0))
                     if min_be > position.stop_loss:
                         position.min_be_price = min_be
                         position.stop_loss = min_be
                         state_dirty = True
-                        log.info(f"[BREAK-EVEN] {position.symbol} raised SL to fee-aware break-even {min_be:.6f}")
+                        log.info(f"[BREAK-EVEN] {position.symbol} raised SL to fee+slippage break-even {min_be:.6f}")
 
             if state_dirty:
                 self._save_positions()
@@ -389,7 +390,7 @@ class RiskManager:
             log.warning(f"[CIRCUIT BREAKER] Ignoring non-positive portfolio balance ({current_balance})")
             return self._halted
 
-        today = date.today()
+        today = datetime.now(timezone.utc).date()
         if today != self._today:
             self._today = today
             self._daily_start_bal = current_balance
@@ -459,9 +460,10 @@ class RiskManager:
                     self._loss_halt_until = data.get('halt_until', 0)
                     # F-19: Restore daily start balance if still same day
                     saved_today = data.get('today', '')
-                    if saved_today == str(date.today()):
+                    utc_today = datetime.now(timezone.utc).date()
+                    if saved_today == str(utc_today):
                         self._daily_start_bal = data.get('daily_start_bal')
-                        self._today = date.today()
+                        self._today = utc_today
         except Exception as e:
             log.error(f"Failed to load loss state: {e}")
 

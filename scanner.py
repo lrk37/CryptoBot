@@ -51,7 +51,7 @@ class MarketScanner:
         self._btc_cache_time = 0
 
     def check_btc_regime(self) -> str:
-        """Returns 'BULLISH' if BTC >= 1h EMA20, otherwise 'BEARISH'."""
+        """Returns 'BULLISH' if last closed 1h BTC candle >= EMA200, otherwise 'BEARISH' (fails closed)."""
         if not getattr(self.cfg, 'ENABLE_BTC_REGIME_FILTER', True):
             return "BULLISH"
 
@@ -62,17 +62,19 @@ class MarketScanner:
 
         try:
             interval = getattr(self.cfg, 'BTC_REGIME_INTERVAL', '1h')
-            limit = getattr(self.cfg, 'BTC_REGIME_EMA_PERIOD', 20) + 50
+            ema_period = getattr(self.cfg, 'BTC_REGIME_EMA_PERIOD', 200)
+            limit = ema_period + 50
             df = self.exchange.get_candles('BTCUSDT', interval=interval, limit=limit)
-            if df is None or len(df) < 25:
-                log.warning("[BTC REGIME] Could not fetch BTC candles - assuming BULLISH")
-                return "BULLISH"
+            if df is None or len(df) < 26:
+                log.warning("[BTC REGIME] Could not fetch sufficient BTC candles - failing closed (BEARISH)")
+                return "BEARISH"
 
-            ema_period = getattr(self.cfg, 'BTC_REGIME_EMA_PERIOD', 20)
-            df['ema'] = df['close'].ewm(span=ema_period, adjust=False).mean()
+            # Exclude still-forming candle so regime is evaluated strictly on completed candles
+            df_closed = df.iloc[:-1] if len(df) >= 2 else df
+            ema_series = df_closed['close'].ewm(span=ema_period, adjust=False).mean()
 
-            btc_price = df['close'].iloc[-1]
-            ema_val = df['ema'].iloc[-1]
+            btc_price = float(df_closed['close'].iloc[-1])
+            ema_val = float(ema_series.iloc[-1])
 
             status = "BULLISH" if btc_price >= ema_val else "BEARISH"
             self._btc_regime_cache = status
@@ -81,8 +83,8 @@ class MarketScanner:
             log.info(f"[BTC REGIME] BTC={btc_price:.0f} EMA{ema_period}={ema_val:.0f} -> {status}")
             return status
         except Exception as e:
-            log.warning(f"[BTC REGIME] Check failed: {e} - assuming BULLISH")
-            return "BULLISH"
+            log.warning(f"[BTC REGIME] Check failed: {e} - failing closed (BEARISH)")
+            return "BEARISH"
 
     def scan_market(self, active_symbols: List[str] = None) -> List[ScanResult]:
         """Scan all tradeable USDT pairs and return top candidates ordered by score."""
@@ -243,15 +245,26 @@ class MarketScanner:
                     log.info(f"[SCANNER] {symbol} skipped - doji on last closed candle (body={body_ratio:.0%} < {doji_thresh:.0%})")
                     return None
 
-            # --- HARD BLOCK 3: Orderbook ratio ---
+            # --- HARD BLOCK 3a: Bid-Ask Spread Filter ---
+            max_spread = getattr(self.cfg, 'MAX_SPREAD_PCT', 0.25)
+            if hasattr(self.exchange, 'get_spread_pct'):
+                try:
+                    spread_pct = float(self.exchange.get_spread_pct(symbol))
+                except Exception:
+                    spread_pct = 99.0
+                if spread_pct > max_spread:
+                    log.info(f"[SCANNER] {symbol} skipped - spread too wide ({spread_pct:.3f}% > {max_spread:.2f}%)")
+                    return None
+
+            # --- HARD BLOCK 3b: Orderbook ratio ---
             min_ob = getattr(self.cfg, 'MIN_ORDERBOOK_RATIO', 0.70)
             try:
-                ob_ratio = self.exchange.get_orderbook_imbalance(symbol, depth=10)
-                if ob_ratio < min_ob:
-                    log.info(f"[SCANNER] {symbol} skipped - orderbook ratio ({ob_ratio:.2f} < {min_ob:.2f})")
-                    return None
+                ob_ratio = float(self.exchange.get_orderbook_imbalance(symbol, depth=10))
             except Exception:
-                ob_ratio = 1.0
+                ob_ratio = 0.0
+            if ob_ratio < min_ob:
+                log.info(f"[SCANNER] {symbol} skipped - orderbook ratio ({ob_ratio:.2f} < {min_ob:.2f})")
+                return None
 
             ob_score = 0.0
             if ob_ratio >= 2.0:

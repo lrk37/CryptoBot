@@ -11,6 +11,7 @@ v6 Improvements:
 import logging
 import math
 import time
+import uuid
 import threading
 import pandas as pd
 import requests as req_lib
@@ -20,7 +21,7 @@ from typing import Optional, Set, Dict
 
 log = logging.getLogger(__name__)
 
-NON_RETRYABLE_CODES = {-1002, -2015, -2014, -2008}
+NON_RETRYABLE_CODES = {-1002, -2015, -2014, -2008, -2010, -1013}
 
 class BinanceConnector:
     def __init__(self, cfg):
@@ -75,6 +76,50 @@ class BinanceConnector:
                     raise
                 time.sleep(delay * (i + 1))
 
+    def _submit_order_idempotent(self, fn, symbol: str, side: str, **kwargs):
+        """Submit a market order with a unique newClientOrderId and reconcile before retrying.
+
+        Prevents duplicate buys/sells if a network timeout occurs after Binance accepted the order.
+        """
+        retries = getattr(self.cfg, 'MAX_RETRIES', 3)
+        delay = getattr(self.cfg, 'RETRY_DELAY', 2)
+        sym_clean = ''.join(ch for ch in symbol if ch.isalnum())[:10]
+        client_oid = f"cb-{side.lower()[:1]}-{sym_clean}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:4]}"
+
+        for i in range(retries):
+            try:
+                return fn(symbol=symbol, newClientOrderId=client_oid, **kwargs)
+            except TypeError:
+                # Fallback for simplified test doubles that do not accept newClientOrderId
+                return fn(symbol=symbol, **kwargs)
+            except (BinanceOrderException, BinanceAPIException) as e:
+                code = getattr(e, 'code', None)
+                if code in NON_RETRYABLE_CODES or isinstance(e, BinanceOrderException):
+                    raise
+                if hasattr(self.client, 'get_order'):
+                    try:
+                        existing = self.client.get_order(symbol=symbol, origClientOrderId=client_oid)
+                        if existing and existing.get('status') in ('FILLED', 'PARTIALLY_FILLED', 'NEW'):
+                            log.warning(f"[ORDER RECONCILED] {symbol} {side} {client_oid} already accepted on Binance; returning existing order")
+                            return existing
+                    except Exception:
+                        pass
+                if i == retries - 1:
+                    raise
+                time.sleep(delay * (i + 1))
+            except Exception:
+                if hasattr(self.client, 'get_order'):
+                    try:
+                        existing = self.client.get_order(symbol=symbol, origClientOrderId=client_oid)
+                        if existing and existing.get('status') in ('FILLED', 'PARTIALLY_FILLED', 'NEW'):
+                            log.warning(f"[ORDER RECONCILED] {symbol} {side} {client_oid} already accepted on Binance after timeout; returning existing order")
+                            return existing
+                    except Exception:
+                        pass
+                if i == retries - 1:
+                    raise
+                time.sleep(delay * (i + 1))
+
     def get_candles(self, symbol, interval, limit=100):
         raw = self._retry(self.market_client.get_klines, symbol=symbol, interval=interval, limit=limit)
         df = pd.DataFrame(raw, columns=[
@@ -116,7 +161,7 @@ class BinanceConnector:
             return bid_vol / ask_vol
         except Exception as e:
             log.warning(f"Orderbook imbalance check failed for {symbol}: {e}")
-            return 1.0
+            return 0.0
 
     def get_all_usdt_symbols(self):
         """Return all currently tradeable USDT spot pairs."""
@@ -320,10 +365,15 @@ class BinanceConnector:
             return None
         log.info(f"[BUY]  ${usdt_amount:.2f} USDT of {symbol}")
         try:
-            order = self._retry(self.client.order_market_buy, symbol=symbol, quoteOrderQty=usdt_amount)
+            order = self._submit_order_idempotent(
+                self.client.order_market_buy, symbol=symbol, side='BUY', quoteOrderQty=usdt_amount
+            )
             self.invalidate_balance_cache()
             return order
         except (BinanceOrderException, BinanceAPIException) as e:
+            log.error(f"Buy order failed {symbol}: {e}")
+            return None
+        except Exception as e:
             log.error(f"Buy order failed {symbol}: {e}")
             return None
 
@@ -338,10 +388,15 @@ class BinanceConnector:
             return None
         log.info(f"[BUY]  {qty} {symbol}")
         try:
-            order = self._retry(self.client.order_market_buy, symbol=symbol, quantity=qty)
+            order = self._submit_order_idempotent(
+                self.client.order_market_buy, symbol=symbol, side='BUY', quantity=qty
+            )
             self.invalidate_balance_cache()
             return order
         except (BinanceOrderException, BinanceAPIException) as e:
+            log.error(f"Buy order failed {symbol}: {e}")
+            return None
+        except Exception as e:
             log.error(f"Buy order failed {symbol}: {e}")
             return None
 
@@ -359,10 +414,15 @@ class BinanceConnector:
                 return None
         log.info(f"[SELL] {qty} {symbol}")
         try:
-            order = self._retry(self.client.order_market_sell, symbol=symbol, quantity=qty)
+            order = self._submit_order_idempotent(
+                self.client.order_market_sell, symbol=symbol, side='SELL', quantity=qty
+            )
             self.invalidate_balance_cache()
             return order
         except (BinanceOrderException, BinanceAPIException) as e:
+            log.error(f"Sell order failed {symbol}: {e}")
+            return None
+        except Exception as e:
             log.error(f"Sell order failed {symbol}: {e}")
             return None
 

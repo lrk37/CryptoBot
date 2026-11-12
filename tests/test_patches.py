@@ -156,7 +156,9 @@ class TestRiskManager(InTempDir):
         rm.evaluate(p, 100.0 + trig - 0.2)
         self.assertEqual(p.min_be_price, 0.0)
         rm.evaluate(p, 100.0 + trig + 0.2)
-        self.assertGreater(p.min_be_price, 0.0)
+        expected_be = 100.0 * (1 + (cfg.ROUND_TRIP_FEE_PCT + getattr(cfg, "BREAK_EVEN_SLIPPAGE_BUFFER_PCT", 0.10)) / 100.0)
+        self.assertAlmostEqual(p.min_be_price, expected_be, places=4)
+        self.assertAlmostEqual(p.stop_loss, expected_be, places=4)
 
     def test_trade_log_has_net_fields(self):
         rm, cfg = self.make_rm()
@@ -251,6 +253,30 @@ class TestExchange(unittest.TestCase):
         val = self.ex.get_portfolio_value(symbols=["AAAUSDT"], quantities={"AAAUSDT": 2.0})
         self.assertAlmostEqual(val, 980 + 2.0 * 10.0)
 
+    def test_idempotent_order_reconciles_on_timeout(self):
+        """If order_market_buy times out after Binance accepted the order, _submit_order_idempotent
+        must reconcile via get_order(origClientOrderId=...) instead of sending a duplicate buy."""
+        buy_calls = []
+        def fake_market_buy(**kw):
+            buy_calls.append(kw)
+            raise RuntimeError("Read timed out")
+        def fake_get_order(symbol, origClientOrderId):
+            return {
+                "symbol": symbol,
+                "clientOrderId": origClientOrderId,
+                "status": "FILLED",
+                "executedQty": "2.0",
+                "cummulativeQuoteQty": "20.0"
+            }
+        self.fake.order_market_buy = fake_market_buy
+        self.fake.get_order = fake_get_order
+        self.ex.max_retries = 2
+        order = self.ex.market_buy("AAAUSDT", 20.0)
+        self.assertIsNotNone(order)
+        self.assertEqual(len(buy_calls), 1)
+        self.assertEqual(order["status"], "FILLED")
+        self.assertEqual(order["clientOrderId"], buy_calls[0]["newClientOrderId"])
+
 
 # =============================================================== scanner
 class TestScanner(unittest.TestCase):
@@ -265,6 +291,52 @@ class TestScanner(unittest.TestCase):
         sc._analyze_symbol = lambda s: seen.append(s)
         sc.scan_market()
         self.assertEqual(sorted(seen), sorted(syms[-5:]))
+
+    def test_btc_regime_uses_closed_candle_and_fails_closed(self):
+        from scanner import MarketScanner
+        # 210 downward candles (close=90 < EMA200) + 1 forming candle spiking to 200
+        n = 210
+        base = np.linspace(110.0, 90.0, n)
+        df = pd.DataFrame({
+            "open": base, "high": base + 1.0, "low": base - 1.0, "close": base,
+            "volume": 100.0, "quote_vol": 10000.0
+        })
+        forming = df.iloc[[-1]].copy()
+        forming["close"] = 200.0  # unclosed forming spike must be ignored
+        df_with_forming = pd.concat([df, forming], ignore_index=True)
+
+        ex = types.SimpleNamespace(get_candles=lambda *a, **k: df_with_forming)
+        cfg = make_cfg(ENABLE_BTC_REGIME_FILTER=True)
+        sc = MarketScanner(ex, cfg)
+        self.assertEqual(sc.check_btc_regime(), "BEARISH")
+
+        # API failure must also fail closed ("BEARISH")
+        ex_fail = types.SimpleNamespace(get_candles=lambda *a, **k: (_ for _ in ()).throw(RuntimeError("api down")))
+        sc_fail = MarketScanner(ex_fail, cfg)
+        self.assertEqual(sc_fail.check_btc_regime(), "BEARISH")
+
+    def test_scanner_rejects_wide_spread(self):
+        from scanner import MarketScanner
+        n = 210
+        base = np.full(n, 100.0)
+        # Construct an extreme capitulation bar at iloc[-2]
+        df = pd.DataFrame({
+            "open": base, "high": base + 0.5, "low": base - 0.5, "close": base,
+            "volume": 100.0, "quote_vol": 10000.0
+        })
+        df.iloc[-2, df.columns.get_loc("close")] = 90.0
+        df.iloc[-2, df.columns.get_loc("low")] = 89.5
+        df.iloc[-2, df.columns.get_loc("volume")] = 500.0
+        df.iloc[-1, df.columns.get_loc("close")] = 90.2
+
+        ex = types.SimpleNamespace(
+            get_candles=lambda *a, **k: df,
+            get_spread_pct=lambda s: 0.45,  # > 0.25% max spread
+            get_orderbook_imbalance=lambda s, limit=20: 1.5,
+        )
+        cfg = make_cfg(MAX_SPREAD_PCT=0.25, STRATEGY_MODE="capitulation")
+        sc = MarketScanner(ex, cfg)
+        self.assertIsNone(sc._analyze_symbol_tf("AAAUSDT", "15m"))
 
 
 # =============================================================== bot monitor / OCO handling
@@ -281,15 +353,24 @@ class FakeBotExchange:
         self.free = 5.0                # free balance includes unrelated holdings
         self.sold = []
         self.strict_calls = 0
-    def get_price(self, s): return 100.0
+        self.price = 100.0
+        self.sell_return = "default"
+        self.oco_created = []
+    def get_price(self, s): return self.price
     def get_open_orders_strict(self, s):
         self.strict_calls += 1
         return self.open_orders
     def get_last_sell_fill(self, s, since_ms): return self.fill
     def cancel_open_orders(self, s): pass
     def get_asset_balance_fresh(self, s): return self.free
+    def create_oco_sell(self, s, q, tp, sl):
+        self.oco_created.append((s, q, tp, sl))
+        return {"orderListId": 99}
     def market_sell(self, s, q):
-        self.sold.append(q); return {"fills": [{"price": "100", "qty": str(q)}], "executedQty": str(q)}
+        self.sold.append(q)
+        if self.sell_return != "default":
+            return self.sell_return
+        return {"fills": [{"price": "100", "qty": str(q)}], "executedQty": str(q)}
     def avg_fill_price(self, o): return 100.0
     def get_candles(self, *a, **k): raise RuntimeError("no charts in tests")
 
@@ -360,6 +441,27 @@ class TestBotMonitor(InTempDir):
     def test_close_sells_only_the_position(self):
         self.eng._close_position("AAAUSDT", self.pos, 100.0, "TEST")
         self.assertEqual(self.ex.sold, [1.0])      # not the 5.0 free balance
+
+    def test_failed_sell_keeps_position_open(self):
+        """If market_sell returns None (failed order), position must stay open in RiskManager."""
+        self.ex.sell_return = None
+        self.eng._close_position("AAAUSDT", self.pos, 100.0, "STOP_LOSS")
+        self.assertTrue(self.rm.has_position("AAAUSDT"))
+        self.assertEqual(len(self.nt.closed), 0)
+        self.assertNotIn("AAAUSDT", self.eng._symbol_cooldowns)
+
+    def test_oco_resynced_when_break_even_arms(self):
+        """When price crosses Break-Even trigger while holding an OCO, _monitor_tick updates the OCO on Binance."""
+        self.pos.details["oco_order_list_id"] = 5
+        self.pos.take_profit = 110.0
+        self.ex.open_orders = [{"orderId": 1}, {"orderId": 2}]
+        self.ex.price = 103.0  # +3.0% gain triggers break-even (+2.2% threshold), still below TP (110.0)
+        self.tick()
+        self.assertEqual(len(self.ex.oco_created), 1)
+        sym, qty, tp, sl = self.ex.oco_created[0]
+        self.assertEqual(sym, "AAAUSDT")
+        self.assertAlmostEqual(sl, 100.3, places=3)
+        self.assertEqual(self.pos.details["oco_order_list_id"], 99)
 
 
 # =============================================================== backtester

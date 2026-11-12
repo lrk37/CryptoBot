@@ -5,12 +5,17 @@ Uses the SAME stop / take-profit / break-even / trailing rules as the live bot
 (shared helpers `compute_stops` and `exit_triggers` in risk_manager.py) and reads the
 entry threshold from config.py (override with --min_score).
 
-What it models:   closed-bar signals, entry at the NEXT bar's open, taker fees, slippage,
-                  conservative intra-bar ordering (stop is checked before take-profit).
-What it CANNOT model (live scoring uses them, history doesn't have them): order-book depth
-                  bonus/filter, 24h pump penalty, BTC regime filter, top-N ranking across
-                  coins, 2-candle confirmation, the score>=80 fast-track.  Treat results as
-                  a test of the core signal + exits, not of the whole live scanner.
+What it models:   closed-bar Dual-Timeframe (15m + 1h) Capitulation & Momentum signals,
+                  per-symbol EMA200 trend regime, 24h safe-dump (-18%) and parabolic (+25%)
+                  guards, entry at the NEXT bar's open, taker fees (0.10%/side), slippage
+                  (0.05%/side), conservative intra-bar ordering (stop checked before TP),
+                  fee-and-slippage-adjusted break-even, time-decaying EMA21 profit-take,
+                  and 12h post-stop-loss symbol lockout. (Multi-symbol portfolio capacity
+                  and chronological cross-market execution are modeled in validate.py.)
+What it CANNOT model from OHLCV klines alone: live L2 order-book bid-ask spread (<= 0.25%)
+                  and top-20 order-book depth imbalance (historical klines do not include
+                  L2 order-book snapshots), or live cross-pair BTC regime gating when
+                  evaluating a single symbol in isolation.
 
 Use --baseline N to compare against N runs of RANDOM entries with the same exits and costs:
 if random entries do about as well, the signal is not adding anything.
