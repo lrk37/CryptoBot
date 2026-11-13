@@ -105,7 +105,7 @@ Simulating the live Dual-Timeframe mode (`--interval 15m`: `1h` signals on `BTC`
 | `backtest.py` | Single-symbol and multi-symbol quantitative backtester with Monte Carlo random-entry baseline comparison. |
 | `validate.py` | Out-of-sample validation suite (`walk_forward`, `basket` with Mark-to-Market portfolio drawdown including exit-candle lows/MAE, `monte_carlo`, `slippage`). |
 | `experiment.py` | Gate 0 accounting & no-lookahead verification harness + Stage A strategy family comparison suite. |
-| `tests/test_patches.py` | 59 automated unit tests (run via `.github/workflows/ci.yml` on push/PR) covering fail-closed disk persistence for orders and positions, restart-safe `SUBMITTING` confirmation grace recovery, idempotent/persistent `clientOrderId` lifecycle, remainder cancellation on `PARTIALLY_FILLED`, deferred close on OCO cancellation failure, `orderListId`-scoped OCO fill reconciliation, partial-sell & dust reconciliation, persistent OCO break-even retries, spread/regime filters, DST timestamps, dual-timeframe backtest routing, and MTM drawdown invariants. |
+| `tests/test_patches.py` | 63 automated unit tests (run via `.github/workflows/ci.yml` on push/PR) covering fail-closed disk persistence for orders, positions, OCO IDs (cancelling/reconciling unpersisted OCOs), and full/partial sell finalization (idempotent `fill_id` deduplication across restarts), restart-safe `SUBMITTING` confirmation grace recovery, remainder cancellation on `PARTIALLY_FILLED`, `orderListId`-scoped OCO reconciliation, spread/regime filters, DST timestamps, dual-timeframe + `24h <= -1.5%` altcoin fallback routing, and MTM drawdown invariants. |
 | `deploy/` | `vps_setup.sh` (automated Ubuntu 22.04/24.04 installer) and `cryptobot.service` (`systemd` 24/7 background daemon config). |
 
 ---
@@ -120,7 +120,7 @@ python -m venv .venv
 # Linux / macOS:
 ./.venv/bin/pip install -r requirements.txt
 
-# 2. Run the 59 unit tests & Gate 0 accounting audit
+# 2. Run the 63 unit tests & Gate 0 accounting audit
 python -m unittest discover -s tests -v
 
 # 3. Run the 15-coin Dual-Timeframe basket validation (90 days)

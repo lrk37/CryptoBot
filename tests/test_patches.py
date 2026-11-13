@@ -1187,6 +1187,202 @@ class TestBotMonitor(InTempDir):
         eng3._reconcile_pending_buys()
         self.assertEqual(eng3._pending_buy_count(), 0)
 
+    def test_oco_persist_failure_cancels_exchange_oco_and_prevents_untracked_oco(self):
+        """If saving oco_order_list_id fails after create_oco_sell succeeds, the bot must cancel
+        the exchange OCO (not leave an untracked OCO live), and _sync_oco_stop must check open
+        orders before placing any replacement OCO."""
+        from unittest.mock import patch
+        from scanner import ScanResult
+
+        fc, conn, rm, nt, eng, cfg = self._make_live_stack()
+        fc.price = 20.0
+        fc.order_market_buy = lambda **kw: {
+            "symbol": kw["symbol"], "clientOrderId": kw["newClientOrderId"],
+            "status": "FILLED", "executedQty": "1.0", "cummulativeQuoteQty": "20.0",
+            "transactTime": int(time.time() * 1000),
+        }
+
+        cancel_calls = []
+        orig_cancel = fc.cancel_open_orders
+
+        def spy_cancel(symbol):
+            cancel_calls.append(symbol)
+            return orig_cancel(symbol)
+
+        fc.cancel_open_orders = spy_cancel
+
+        save_calls = {"n": 0}
+        orig_replace = os.replace
+
+        def fail_second_positions_write(src, dst):
+            if os.path.basename(str(dst)) == os.path.basename(cfg.POSITIONS_FILE):
+                save_calls["n"] += 1
+                # Allow initial open_position save (#1), fail OCO metadata save (#2)
+                if save_calls["n"] == 2:
+                    raise OSError("disk full during OCO persist")
+            return orig_replace(src, dst)
+
+        res = ScanResult(
+            symbol="BBBUSDT", score=85.0, raw_score=80.0, pump_penalty=0.0,
+            ema_score=25.0, rsi_score=25.0, vol_score=25.0, breakout_score=5.0, ob_score=5.0,
+            close_price=20.0, rsi=18.0, volume_ratio=2.5, breakout_atr_ratio=0.0,
+            bid_ask_ratio=1.4, atr=0.5, pct_change_24h=-5.0,
+            reason="CAPITULATION", last_closed_time=1000, timeframe="15m"
+        )
+        with patch("risk_manager.os.replace", side_effect=fail_second_positions_write):
+            eng._execute_entry(res)
+
+        pos = rm.get_position("BBBUSDT")
+        self.assertIsNotNone(pos)
+        # Unpersisted exchange OCO must have been cancelled and cleared cleanly
+        self.assertEqual(cancel_calls, ["BBBUSDT"])
+        self.assertEqual(fc.open_orders, [])
+        self.assertIsNone(pos.details.get("oco_order_list_id"))
+        self.assertTrue(pos.details.get("oco_needs_sync"))
+
+        # Disk recovers: next _monitor_tick places and persists OCO cleanly
+        eng._monitor_tick()
+        self.assertEqual(pos.details.get("oco_order_list_id"), 7)
+        self.assertFalse(pos.details.get("oco_needs_sync"))
+        self.assertEqual(read_json(cfg.POSITIONS_FILE)["BBBUSDT"]["details"]["oco_order_list_id"], 7)
+
+        # Also test _sync_oco_stop when oco_order_list_id is None but an untracked OCO sits on Binance
+        # and cancellation fails: it must adopt the existing orderListId instead of placing a duplicate.
+        pos.details.pop("oco_order_list_id", None)
+        pos.details["oco_needs_sync"] = True
+        fc.open_orders = [{"orderListId": 55, "orderId": 550, "status": "NEW"}]
+        oco_count_before = len(fc.oco_calls)
+        with patch.object(conn, "cancel_open_orders", return_value=False):
+            eng._sync_oco_stop("BBBUSDT", pos, 20.0)
+        self.assertEqual(len(fc.oco_calls), oco_count_before)
+        self.assertEqual(pos.details.get("oco_order_list_id"), 55)
+        self.assertTrue(pos.details.get("oco_needs_sync"))
+
+    def test_full_sell_persist_failure_preserves_lock_and_prevents_duplicate_trade_log_on_restart(self):
+        """If saving positions.json fails after a full sell executes on Binance, the position and
+        pending_sell_client_oid stay recoverable and restart reconciliation commits ONCE without
+        duplicating trade_log.json or double-counting consecutive_losses."""
+        from unittest.mock import patch
+        from risk_manager import RiskManager
+
+        fc, conn, rm, nt, eng, cfg = self._make_live_stack()
+        fc.price = 94.0
+        pos = rm.open_position("AAAUSDT", 100.0, 1.0, kind="scanner", atr_value=1.0, entry_score=80)
+        self.assertIsNotNone(pos)
+
+        sold_oid = []
+
+        def fake_market_sell(**kw):
+            oid = kw["newClientOrderId"]
+            sold_oid.append(oid)
+            return {
+                "symbol": "AAAUSDT", "clientOrderId": oid, "orderId": 888,
+                "status": "FILLED", "executedQty": "1.0",
+                "cummulativeQuoteQty": "94.0", "transactTime": 1_700_000_100_000,
+            }
+
+        fc.order_market_sell = fake_market_sell
+        fc.get_order = lambda symbol, origClientOrderId: {
+            "symbol": symbol, "clientOrderId": origClientOrderId, "orderId": 888,
+            "status": "FILLED", "executedQty": "1.0",
+            "cummulativeQuoteQty": "94.0", "updateTime": 1_700_000_100_000,
+        }
+
+        orig_replace = os.replace
+
+        def fail_second_positions_write(src, dst):
+            # Allow the pre-sell save (#1 with pending_sell_client_oid), fail the final close removal save (#2)
+            if os.path.basename(str(dst)) == os.path.basename(cfg.POSITIONS_FILE):
+                if getattr(fail_second_positions_write, "calls", 0) >= 1:
+                    raise OSError("disk full on final close")
+                fail_second_positions_write.calls = getattr(fail_second_positions_write, "calls", 0) + 1
+            return orig_replace(src, dst)
+
+        with patch("risk_manager.os.replace", side_effect=fail_second_positions_write):
+            eng._close_position("AAAUSDT", pos, 94.0, "STOP_LOSS")
+
+        # Position stayed recoverable in memory & on disk, and premature close alert was NOT sent
+        self.assertEqual(len(sold_oid), 1)
+        self.assertTrue(rm.has_position("AAAUSDT"))
+        self.assertEqual(len(nt.closed), 0)
+        self.assertEqual(read_json(cfg.POSITIONS_FILE)["AAAUSDT"]["details"]["pending_sell_client_oid"], sold_oid[0])
+
+        # Restart after disk recovers: must reconcile the filled order, remove positions.json entry,
+        # and keep EXACTLY 1 trade log entry & consecutive_losses == 1 (no double-counting!).
+        rm2 = RiskManager(cfg)
+        rm2.set_exchange(conn)
+        nt2 = FakeNotifier()
+        eng2 = self.bot.ScannerEngine(conn, rm2, nt2)
+        eng2._monitor_tick()
+
+        self.assertFalse(rm2.has_position("AAAUSDT"))
+        self.assertEqual(len(sold_oid), 1)  # no duplicate sell order submitted
+        self.assertEqual(len(nt2.closed), 1)
+        self.assertEqual(rm2.consecutive_losses, 1)
+        trades = read_json(cfg.TRADE_LOG_FILE)
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0]["fill_id"], sold_oid[0])
+
+    def test_partial_sell_persist_failure_rolls_back_and_retries_without_double_subtraction(self):
+        """If saving positions.json fails during partial_close_position, quantity must roll back so a
+        restart does NOT subtract the partial fill twice or log duplicate PARTIAL_ trade entries."""
+        from unittest.mock import patch
+        from risk_manager import RiskManager
+
+        fc, conn, rm, nt, eng, cfg = self._make_live_stack()
+        fc.price = 94.0
+        pos = rm.open_position("AAAUSDT", 100.0, 1.0, kind="scanner", atr_value=1.0, entry_score=80)
+        self.assertIsNotNone(pos)
+
+        sold_oid = []
+
+        def fake_partial_sell(**kw):
+            oid = kw["newClientOrderId"]
+            sold_oid.append(oid)
+            return {
+                "symbol": "AAAUSDT", "clientOrderId": oid, "orderId": 889,
+                "status": "EXPIRED", "executedQty": "0.6",
+                "cummulativeQuoteQty": "56.4", "transactTime": 1_700_000_200_000,
+            }
+
+        fc.order_market_sell = fake_partial_sell
+        fc.get_order = lambda symbol, origClientOrderId: {
+            "symbol": symbol, "clientOrderId": origClientOrderId, "orderId": 889,
+            "status": "EXPIRED", "executedQty": "0.6",
+            "cummulativeQuoteQty": "56.4", "updateTime": 1_700_000_200_000,
+        }
+
+        orig_replace = os.replace
+
+        def fail_second_positions_write(src, dst):
+            if os.path.basename(str(dst)) == os.path.basename(cfg.POSITIONS_FILE):
+                if getattr(fail_second_positions_write, "calls", 0) >= 1:
+                    raise OSError("disk full on partial save")
+                fail_second_positions_write.calls = getattr(fail_second_positions_write, "calls", 0) + 1
+            return orig_replace(src, dst)
+
+        with patch("risk_manager.os.replace", side_effect=fail_second_positions_write):
+            eng._close_position("AAAUSDT", pos, 94.0, "STOP_LOSS")
+
+        # Memory quantity rolled back to 1.0 and pending_sell_client_oid preserved
+        self.assertTrue(rm.has_position("AAAUSDT"))
+        self.assertAlmostEqual(rm.get_position("AAAUSDT").quantity, 1.0, places=6)
+        self.assertEqual(rm.get_position("AAAUSDT").details.get("pending_sell_client_oid"), sold_oid[0])
+
+        # Restart with working disk: reconciles once -> 0.4 remaining and only 1 PARTIAL trade logged
+        rm2 = RiskManager(cfg)
+        rm2.set_exchange(conn)
+        nt2 = FakeNotifier()
+        eng2 = self.bot.ScannerEngine(conn, rm2, nt2)
+        eng2._monitor_tick()
+
+        self.assertTrue(rm2.has_position("AAAUSDT"))
+        self.assertAlmostEqual(rm2.get_position("AAAUSDT").quantity, 0.4, places=6)
+        trades = read_json(cfg.TRADE_LOG_FILE)
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0]["reason"], "PARTIAL_STOP_LOSS")
+        self.assertAlmostEqual(trades[0]["quantity"], 0.6, places=6)
+
 
 # =============================================================== backtester
 class TestBacktest(unittest.TestCase):
@@ -1475,6 +1671,56 @@ class TestAccountingAndPortfolio(unittest.TestCase):
         # BTCUSDT (ONE_HOUR_ONLY_SYMBOLS) MUST ignore 15m signals and only enter on closed 1h (:00)
         for tr in bt_btc.trades:
             self.assertEqual(pd.Timestamp(tr["entry_time"]).minute, 0)
+
+    def test_dual_timeframe_altcoin_1h_fallback_requires_24h_dip_gate(self):
+        """Altcoins running on 15m only fall back to 1h signals when 24h change <= -1.5%
+        (matching scanner.py), whereas negative 24h change > -1.5% blocks the 1h fallback."""
+        from backtest import StrategyBacktester
+
+        # Construct 260 hours (1040 x 15m bars) where hour 240 produces a clean 1h signal
+        # while the 15m bars ramp down gently across the hour (so 15m EMA21 tracks price and stays < min_score).
+        n_bars = 1040
+        idx = pd.date_range("2026-06-01", periods=n_bars, freq="15min", tz="UTC")
+
+        def make_alt_df(early_price: float) -> pd.DataFrame:
+            closes = np.full(n_bars, 100.0)
+            vols = np.full(n_bars, 10.0)
+            # First 217 hours sit at early_price so pct_24h at hour 241 reflects vs 96 bars prior (~hour 217)
+            closes[:218 * 4] = early_price
+            # Step gradually from early_price toward 100.0 so 1h EMA21 sits near ~99.5 by hour 240
+            for k in range(218 * 4, 240 * 4):
+                closes[k] = 100.0
+            # Across hour 240: keep intrahour bars high-volume BEFORE the dip, then close the 1h bar
+            # at 95.3 on low 15m bar volume (so 15m score < 75, while aggregated 1h bar scores >= 75).
+            closes[240 * 4 + 0] = 99.6
+            closes[240 * 4 + 1] = 99.4
+            closes[240 * 4 + 2] = 99.2
+            closes[240 * 4 + 3] = 95.3
+            vols[240 * 4 + 0] = 10.0
+            vols[240 * 4 + 1] = 50.0
+            vols[240 * 4 + 2] = 50.0
+            vols[240 * 4 + 3] = 10.0
+            for k in range(241 * 4, n_bars):
+                closes[k] = 98.5
+            return pd.DataFrame({
+                "open": closes,
+                "high": closes + 0.3,
+                "low": closes - 0.3,
+                "close": closes,
+                "volume": vols,
+                "quote_vol": closes * vols,
+            }, index=idx)
+
+        # Case A: 24h ago price was 95.8 -> at close 95.3, pct_24h ~ -0.52% (> -1.5%) -> 1h fallback blocked
+        bt_shallow = StrategyBacktester(initial_capital=1000, trade_size_usdt=100, min_score=75)
+        bt_shallow.run("AVAXUSDT", make_alt_df(early_price=95.8), interval="15m")
+        self.assertEqual(len(bt_shallow.trades), 0)
+
+        # Case B: 24h ago price was 98.0 -> at close 95.3, pct_24h ~ -2.76% (<= -1.5%) -> 1h fallback enters
+        bt_dip = StrategyBacktester(initial_capital=1000, trade_size_usdt=100, min_score=75)
+        bt_dip.run("AVAXUSDT", make_alt_df(early_price=98.0), interval="15m")
+        self.assertGreater(len(bt_dip.trades), 0)
+        self.assertEqual(pd.Timestamp(bt_dip.trades[0]["entry_time"]).minute, 0)
 
 
 if __name__ == "__main__":

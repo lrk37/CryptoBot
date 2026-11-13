@@ -214,13 +214,39 @@ class RiskManager:
             log.info(f"[OPENED] {symbol} ({kind}) | entry={entry_price:.6f} qty={quantity} | SL={sl:.6f} TP={tp:.6f} Score={entry_score:.0f} Reason: {entry_reason}")
             return pos
 
-    def close_position(self, symbol: str, exit_price: float, exit_reason: str):
+    def close_position(self, symbol: str, exit_price: float, exit_reason: str,
+                       fill_id: str = None, executed_qty: float = None) -> bool:
         with self._lock:
-            pos = self._positions.pop(symbol, None)
-            self._save_positions()
-            self._exiting_symbols.discard(symbol)
-            if pos and exit_price > 0:
-                pnl = pos.pnl_pct(exit_price)
+            pos = self._positions.get(symbol)
+            if not pos:
+                self._exiting_symbols.discard(symbol)
+                return False
+
+            prev_losses = self._consecutive_losses
+            prev_halt = self._loss_halt_until
+            eff_qty = float(executed_qty) if (executed_qty is not None and executed_qty > 0) else pos.quantity
+            closed_slice = Position(
+                symbol=pos.symbol, entry_price=pos.entry_price, quantity=eff_qty,
+                stop_loss=pos.stop_loss, take_profit=pos.take_profit,
+                trailing=pos.trailing, trailing_offset=pos.trailing_offset,
+                highest_price=pos.highest_price, lowest_price=pos.lowest_price,
+                kind=pos.kind, open_time=pos.open_time, min_be_price=pos.min_be_price,
+                entry_reason=pos.entry_reason, entry_score=pos.entry_score,
+                details=dict(pos.details or {}),
+            )
+
+            already_logged = bool(
+                fill_id and any(
+                    t.get('fill_id') == fill_id and t.get('symbol') == symbol
+                    for t in self._trade_log
+                )
+            )
+            already_in_applied = bool(
+                fill_id and fill_id in (pos.details or {}).get('applied_sell_ids', [])
+            )
+
+            if exit_price > 0 and not already_logged and not already_in_applied:
+                pnl = closed_slice.pnl_pct(exit_price)
                 # F-20: Account for round-trip fees when determining if trade is a net loss
                 fees_pct = getattr(self.cfg, 'ROUND_TRIP_FEE_PCT', 0.2)
                 is_loss = pnl < fees_pct or 'SL' in exit_reason or 'Stop-Loss' in exit_reason
@@ -233,8 +259,40 @@ class RiskManager:
                         log.error(f"[CONSECUTIVE LOSSES] {self._consecutive_losses} losses in a row - pausing {cooldown}s")
                 else:
                     self._consecutive_losses = 0
-                self._save_loss_state()
-                self._log_trade(pos, exit_price, exit_reason)
+
+                if not self._save_loss_state():
+                    self._consecutive_losses = prev_losses
+                    self._loss_halt_until = prev_halt
+                    self._exiting_symbols.discard(symbol)
+                    log.error(
+                        f"[CLOSE PERSIST ERROR] Failed saving loss_state.json for {symbol}; "
+                        f"preserving position record until retry."
+                    )
+                    return False
+
+                if not self._log_trade(closed_slice, exit_price, exit_reason, fill_id=fill_id):
+                    self._consecutive_losses = prev_losses
+                    self._loss_halt_until = prev_halt
+                    self._save_loss_state()
+                    self._exiting_symbols.discard(symbol)
+                    log.error(
+                        f"[CLOSE PERSIST ERROR] Failed saving trade_log.json for {symbol}; "
+                        f"preserving position record until retry."
+                    )
+                    return False
+
+            self._positions.pop(symbol, None)
+            if not self._save_positions():
+                self._positions[symbol] = pos
+                self._exiting_symbols.discard(symbol)
+                log.error(
+                    f"[CLOSE PERSIST ERROR] Failed saving positions.json for closed {symbol}; "
+                    f"retaining recoverable position record (fill_id={fill_id}) until disk recovers."
+                )
+                return False
+
+            self._exiting_symbols.discard(symbol)
+            return True
 
     def partial_close_position(
         self,
@@ -243,13 +301,30 @@ class RiskManager:
         exit_price: float,
         exit_reason: str,
         clear_oco: bool = False,
-    ) -> Optional[Position]:
+        fill_id: str = None,
+    ) -> bool:
         """Record realized P&L on a partially filled sell order and retain the remaining position."""
         with self._lock:
             pos = self._positions.get(symbol)
             self._exiting_symbols.discard(symbol)
             if not pos or sold_qty <= 0:
-                return pos
+                return False
+
+            prev_qty = pos.quantity
+            prev_details = dict(pos.details or {})
+            if 'applied_sell_ids' in prev_details:
+                prev_details['applied_sell_ids'] = list(prev_details['applied_sell_ids'])
+
+            if fill_id and fill_id in (prev_details.get('applied_sell_ids') or []):
+                return True
+
+            already_logged = bool(
+                fill_id and any(
+                    t.get('fill_id') == fill_id and t.get('symbol') == symbol
+                    for t in self._trade_log
+                )
+            )
+
             sold_qty = min(sold_qty, pos.quantity)
             sold_slice = Position(
                 symbol=pos.symbol,
@@ -266,24 +341,46 @@ class RiskManager:
                 min_be_price=pos.min_be_price,
                 entry_reason=pos.entry_reason,
                 entry_score=pos.entry_score,
-                details=dict(pos.details or {}),
+                details=dict(prev_details),
             )
-            if exit_price > 0:
-                self._log_trade(sold_slice, exit_price, f"PARTIAL_{exit_reason}")
+            if exit_price > 0 and not already_logged:
+                if not self._log_trade(sold_slice, exit_price, f"PARTIAL_{exit_reason}", fill_id=fill_id):
+                    log.error(
+                        f"[PARTIAL CLOSE PERSIST ERROR] Failed saving trade_log.json for {symbol}; "
+                        f"preserving full quantity and pending order lock."
+                    )
+                    return False
+
             pos.quantity = max(round(pos.quantity - sold_qty, 8), 0.0)
-            if pos.details:
-                pos.details.pop('pending_sell_client_oid', None)
-                pos.details.pop('pending_sell_reason', None)
-                pos.details.pop('pending_sell_qty', None)
-                if clear_oco:
-                    pos.details.pop('oco_order_list_id', None)
-                    pos.details.pop('oco_stop_loss', None)
-            self._save_positions()
+            if pos.details is None:
+                pos.details = {}
+            if fill_id:
+                applied = list(pos.details.get('applied_sell_ids') or [])
+                if fill_id not in applied:
+                    applied.append(fill_id)
+                pos.details['applied_sell_ids'] = applied
+            pos.details.pop('pending_sell_client_oid', None)
+            pos.details.pop('pending_sell_reason', None)
+            pos.details.pop('pending_sell_qty', None)
+            if clear_oco:
+                pos.details.pop('oco_order_list_id', None)
+                pos.details.pop('oco_stop_loss', None)
+                pos.details['oco_needs_sync'] = True
+
+            if not self._save_positions():
+                pos.quantity = prev_qty
+                pos.details = prev_details
+                log.error(
+                    f"[PARTIAL CLOSE PERSIST ERROR] Failed saving positions.json for {symbol}; "
+                    f"rolled back in-memory reduction (fill_id={fill_id}) to keep recoverable lock intact."
+                )
+                return False
+
             log.warning(
                 f"[PARTIAL CLOSE] {symbol}: sold {sold_qty} @ {exit_price:.6f}, "
                 f"remaining qty={pos.quantity} retained in RiskManager"
             )
-            return pos
+            return True
 
     def get_position(self, symbol: str) -> Optional[Position]:
         with self._lock:
@@ -490,7 +587,7 @@ class RiskManager:
         except Exception as e:
             log.error(f"Failed to load positions: {e}")
 
-    def _save_loss_state(self):
+    def _save_loss_state(self) -> bool:
         # F-19: Also persist daily start balance and date. F-30: Atomic write.
         try:
             data = {
@@ -503,8 +600,10 @@ class RiskManager:
             with open(tmp_fn, 'w') as f:
                 json.dump(data, f)
             os.replace(tmp_fn, 'loss_state.json')
+            return True
         except Exception as e:
             log.error(f"Failed to save loss state: {e}")
+            return False
 
     def _load_loss_state(self):
         try:
@@ -522,7 +621,7 @@ class RiskManager:
         except Exception as e:
             log.error(f"Failed to load loss state: {e}")
 
-    def _save_trade_log(self):
+    def _save_trade_log(self) -> bool:
         # F-30: Atomic write
         try:
             fn = getattr(self.cfg, 'TRADE_LOG_FILE', 'trade_log.json')
@@ -530,8 +629,10 @@ class RiskManager:
             with open(tmp_fn, 'w') as f:
                 json.dump(self._trade_log, f, indent=2)
             os.replace(tmp_fn, fn)
+            return True
         except Exception as e:
             log.error(f"Failed to save trade log: {e}")
+            return False
 
     def _load_trade_log(self):
         try:
@@ -542,7 +643,7 @@ class RiskManager:
         except Exception as e:
             log.error(f"Failed to load trade log: {e}")
 
-    def _log_trade(self, pos: Position, exit_price: float, reason: str):
+    def _log_trade(self, pos: Position, exit_price: float, reason: str, fill_id: str = None) -> bool:
         pnl_pct = pos.pnl_pct(exit_price)
         pnl_usdt = pos.pnl_usdt(exit_price)
         hold_duration = int(time.time() - pos.open_time)
@@ -594,7 +695,12 @@ class RiskManager:
             'hold_duration_sec': hold_duration,
             'entry_reason': pos.entry_reason
         }
+        if fill_id:
+            entry['fill_id'] = fill_id
         self._trade_log.append(entry)
-        self._save_trade_log()
+        if not self._save_trade_log():
+            self._trade_log.pop()
+            return False
 
         log.info(f"[TRADE LOGGED] {pos.symbol} | Exit: {exit_price:.6f} | PnL: {pnl_pct:+.2f}% gross / {net_pnl_pct:+.2f}% net (${net_pnl_usdt:+.4f}) | Final Score: {pos.entry_score:.0f} (Raw: {raw_score:.0f}, Pen: {pump_penalty:.0f}) | MFE: {mfe:+.2f}% | MAE: {mae:+.2f}% | Reason: {reason}")
+        return True

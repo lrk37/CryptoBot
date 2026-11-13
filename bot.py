@@ -357,14 +357,7 @@ class ScannerEngine:
             if getattr(cfg, 'USE_EXCHANGE_OCO', True):
                 try:
                     oco = self.exchange.create_oco_sell(symbol, exec_qty, target_pos.take_profit, target_pos.stop_loss)
-                    if oco and oco.get('orderListId') is not None:
-                        target_pos.details['oco_order_list_id'] = oco.get('orderListId')
-                        target_pos.details['oco_stop_loss'] = target_pos.stop_loss
-                        target_pos.details['oco_needs_sync'] = False
-                        self.risk_mgr.persist_positions()
-                    else:
-                        target_pos.details['oco_needs_sync'] = True
-                        self.risk_mgr.persist_positions()
+                    self._record_or_rollback_oco(symbol, target_pos, oco, target_pos.stop_loss, tag="OCO ENTRY")
                 except Exception as e:
                     target_pos.details['oco_needs_sync'] = True
                     self.risk_mgr.persist_positions()
@@ -585,6 +578,7 @@ class ScannerEngine:
                             exit_px = float(fill['price'])
                             fill_ts = fill.get('time') or time.time()
                             reason = "TAKE_PROFIT" if fill.get('type') in ('LIMIT_MAKER', 'LIMIT') else "STOP_LOSS"
+                            oco_fill_id = f"OCO:{oco_id}:{fill.get('order_id') or fill.get('time') or ''}"
                             remaining = pos.quantity - fill_qty
                             if fill_qty < pos.quantity * 0.99 and remaining > 1e-8:
                                 sellable_rem = (
@@ -598,9 +592,9 @@ class ScannerEngine:
                                         f"{fill_qty} / {pos.quantity} ({reason}) at {exit_px:.6f}; "
                                         f"retaining remaining {remaining:.8f}"
                                     )
-                                    pos.details['oco_needs_sync'] = True
                                     self.risk_mgr.partial_close_position(
-                                        symbol, fill_qty, exit_px, f"OCO_{reason}", clear_oco=True
+                                        symbol, fill_qty, exit_px, f"OCO_{reason}",
+                                        clear_oco=True, fill_id=oco_fill_id,
                                     )
                                     continue
                                 log.info(
@@ -609,11 +603,18 @@ class ScannerEngine:
                                 )
 
                             log.info(f"[EXCHANGE FILL] {symbol} OCO leg filled ({reason}) qty={fill_qty} at {exit_px:.6f}")
-                            pos.quantity = fill_qty
                             pnl_pct = pos.pnl_pct(exit_px)
-                            pnl_usdt = pos.pnl_usdt(exit_px)
+                            pnl_usdt = (exit_px - pos.entry_price) * fill_qty
                             dur_sec = max(0.0, fill_ts - pos.open_time)
-                            self.risk_mgr.close_position(symbol, exit_px, f"OCO_{reason}")
+                            if not self.risk_mgr.close_position(
+                                symbol, exit_px, f"OCO_{reason}",
+                                fill_id=oco_fill_id, executed_qty=fill_qty,
+                            ):
+                                log.error(
+                                    f"[CLOSE DEFERRED] Failed persisting OCO fill close for {symbol}; "
+                                    f"retaining position and OCO id for retry."
+                                )
+                                continue
                             with self._state_lock:
                                 self._active_symbols.discard(symbol)
                                 cd_sec = getattr(cfg, 'SYMBOL_COOLDOWN_SEC', 3600)
@@ -649,6 +650,49 @@ class ScannerEngine:
                 if pos.details.get('oco_needs_sync'):
                     self._sync_oco_stop(symbol, pos, curr_price)
 
+    def _record_or_rollback_oco(self, symbol: str, pos, oco, stop_loss_px: float, tag: str = "OCO") -> bool:
+        """Persist a newly created OCO orderListId; if persistence fails, cancel the exchange OCO
+        so an untracked protective order is never left silently orphaned."""
+        lid = oco.get('orderListId') if oco else None
+        if lid is None:
+            pos.details.pop('oco_order_list_id', None)
+            pos.details.pop('oco_stop_loss', None)
+            pos.details['oco_needs_sync'] = True
+            self.risk_mgr.persist_positions()
+            return False
+
+        pos.details['oco_order_list_id'] = lid
+        pos.details['oco_stop_loss'] = stop_loss_px
+        pos.details['oco_needs_sync'] = False
+        if self.risk_mgr.persist_positions():
+            return True
+
+        log.error(
+            f"[{tag} PERSIST ERROR] Failed saving OCO orderListId={lid} for {symbol}; "
+            f"cancelling exchange OCO to avoid untracked protective order."
+        )
+        try:
+            cancelled = self.exchange.cancel_open_orders(symbol)
+        except Exception as exc:
+            log.warning(f"[{tag} ROLLBACK CANCEL ERROR] {symbol}: {exc}")
+            cancelled = False
+
+        if cancelled is not False:
+            pos.details.pop('oco_order_list_id', None)
+            pos.details.pop('oco_stop_loss', None)
+            pos.details['oco_needs_sync'] = True
+            self.risk_mgr.persist_positions()
+            log.warning(f"[{tag} ROLLBACK] Cancelled unpersisted OCO {lid} for {symbol}; will re-sync on next tick.")
+        else:
+            pos.details['oco_order_list_id'] = lid
+            pos.details['oco_stop_loss'] = stop_loss_px
+            pos.details['oco_needs_sync'] = True
+            log.error(
+                f"[{tag} ROLLBACK FAILED] Could not cancel unpersisted OCO {lid} for {symbol}; "
+                f"retaining in-memory oco_order_list_id and oco_needs_sync."
+            )
+        return False
+
     def _sync_oco_stop(self, symbol, pos, curr_price):
         """Re-submit exchange-side OCO when local stop_loss moves up (e.g. Break-Even), retrying across ticks until confirmed."""
         if curr_price <= pos.stop_loss * 1.002 or curr_price >= pos.take_profit * 0.998:
@@ -665,22 +709,38 @@ class ScannerEngine:
                     log.warning(f"[OCO SYNC] {symbol} cancellation failed; keeping existing OCO id and retrying next tick")
                     return
                 pos.details.pop('oco_order_list_id', None)
+                pos.details.pop('oco_stop_loss', None)
                 pos.details['oco_needs_sync'] = True
-                self.risk_mgr.persist_positions()
+                if not self.risk_mgr.persist_positions():
+                    log.warning(f"[OCO SYNC] {symbol} failed persisting cleared OCO state after cancel; deferring replacement")
+                    return
+            elif hasattr(self.exchange, 'get_open_orders_strict'):
+                existing_open = self.exchange.get_open_orders_strict(symbol)
+                if existing_open is None:
+                    pos.details['oco_needs_sync'] = True
+                    self.risk_mgr.persist_positions()
+                    log.warning(f"[OCO SYNC DEFERRED] Could not verify open orders for {symbol}; deferring OCO placement")
+                    return
+                if existing_open:
+                    cancelled = self.exchange.cancel_open_orders(symbol)
+                    if cancelled is False:
+                        for ord_obj in existing_open:
+                            ol_id = (ord_obj or {}).get('orderListId')
+                            if ol_id not in (None, -1):
+                                pos.details['oco_order_list_id'] = ol_id
+                                break
+                        pos.details['oco_needs_sync'] = True
+                        self.risk_mgr.persist_positions()
+                        log.warning(f"[OCO SYNC] Untracked open orders exist for {symbol} and cancel failed; avoiding duplicate OCO")
+                        return
 
             actual_qty = self.exchange.get_asset_balance_fresh(symbol)
             oco_qty = min(actual_qty, pos.quantity) if actual_qty > 0 else pos.quantity
             oco = self.exchange.create_oco_sell(symbol, oco_qty, pos.take_profit, pos.stop_loss)
-            if oco and oco.get('orderListId') is not None:
-                pos.details['oco_order_list_id'] = oco.get('orderListId')
-                pos.details['oco_stop_loss'] = pos.stop_loss
-                pos.details['oco_needs_sync'] = False
+            if self._record_or_rollback_oco(symbol, pos, oco, pos.stop_loss, tag="OCO SYNC"):
                 log.info(f"[OCO SYNC] {symbol} exchange OCO stop updated to {pos.stop_loss:.6f}")
-            else:
-                pos.details.pop('oco_order_list_id', None)
-                pos.details['oco_needs_sync'] = True
+            elif not oco or oco.get('orderListId') is None:
                 log.warning(f"[OCO SYNC] {symbol} OCO replacement returned None; will retry on next monitor tick")
-            self.risk_mgr.persist_positions()
         except Exception as e:
             pos.details['oco_needs_sync'] = True
             self.risk_mgr.persist_positions()
@@ -742,6 +802,9 @@ class ScannerEngine:
 
     def _finalize_sell_order(self, symbol: str, pos, order: dict, exec_qty: float, curr_price: float, reason: str, had_oco: bool = False):
         exit_price = self.exchange.avg_fill_price(order) or curr_price
+        sell_oid = order.get('clientOrderId') or pos.details.get('pending_sell_client_oid')
+        order_id = order.get('orderId')
+        fill_id = str(sell_oid or (f"ORD:{order_id}" if order_id is not None else "")) or None
 
         # Reconcile partial fills: keep remaining position open when it is still sellable on Binance
         remaining = pos.quantity - exec_qty
@@ -752,11 +815,13 @@ class ScannerEngine:
                 else True
             )
             if sellable_rem:
-                if had_oco:
-                    pos.details['oco_needs_sync'] = True
-                self.risk_mgr.partial_close_position(
-                    symbol, exec_qty, exit_price, reason, clear_oco=had_oco
-                )
+                if not self.risk_mgr.partial_close_position(
+                    symbol, exec_qty, exit_price, reason, clear_oco=had_oco, fill_id=fill_id
+                ):
+                    log.error(
+                        f"[PARTIAL CLOSE DEFERRED] Failed to persist partial fill for {symbol} "
+                        f"(fill_id={fill_id}); retaining recoverable order record."
+                    )
                 return
             log.info(
                 f"[DUST REMAINDER] {symbol}: sold {exec_qty} / {pos.quantity}; "
@@ -764,14 +829,21 @@ class ScannerEngine:
             )
 
         # Full fill (or dust remainder): compute realized P&L on actual executed quantity
-        pos.quantity = exec_qty
         pnl_pct = pos.pnl_pct(exit_price)
-        pnl_usdt = pos.pnl_usdt(exit_price)
+        pnl_usdt = (exit_price - pos.entry_price) * exec_qty
 
         tx_ms = order.get('transactTime') or order.get('updateTime') or order.get('time')
         close_ts = (float(tx_ms) / 1000.0) if tx_ms else time.time()
         dur_sec = max(0.0, close_ts - pos.open_time)
-        self.risk_mgr.close_position(symbol, exit_price, reason)
+        if not self.risk_mgr.close_position(
+            symbol, exit_price, reason, fill_id=fill_id, executed_qty=exec_qty
+        ):
+            log.error(
+                f"[CLOSE DEFERRED] Failed to persist sell close for {symbol} "
+                f"(fill_id={fill_id}); retaining recoverable position lock."
+            )
+            return
+
         with self._state_lock:
             self._active_symbols.discard(symbol)
 

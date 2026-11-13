@@ -385,6 +385,7 @@ class StrategyBacktester:
                 p_open = open_p.iloc[i-1]
                 p_vol = vol.iloc[i-1]
 
+                pct_24h = 0.0
                 if strategy_mode == 'capitulation':
                     bars_24h = 24 if interval == '1h' else 96
                     max_dump = getattr(cfg, 'MAX_24H_DUMP_PCT', -18.0)
@@ -421,7 +422,9 @@ class StrategyBacktester:
                                 score = 20.0
 
                     # Dual-Timeframe: at the top of each hour, also check the just-closed 1h candle
-                    if score < self.min_score and df_1h is not None and getattr(curr_time, 'minute', -1) == 0:
+                    # (matching scanner.py: 1h-only symbols always check 1h; altcoins require pct_24h <= -1.5%)
+                    allow_1h_fallback = (symbol in one_hour_only) or (pct_24h <= -1.5)
+                    if score < self.min_score and df_1h is not None and allow_1h_fallback and getattr(curr_time, 'minute', -1) == 0:
                         prev_1h_ts = curr_time - pd.Timedelta(hours=1)
                         if prev_1h_ts in df_1h.index:
                             row_1h = df_1h.loc[prev_1h_ts]
