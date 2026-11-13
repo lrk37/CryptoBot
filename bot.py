@@ -212,10 +212,10 @@ class ScannerEngine:
                 pass
         return self.exchange.market_sell(symbol, sell_qty)
 
-    def _clear_pending_buy(self, symbol: str):
+    def _clear_pending_buy(self, symbol: str) -> bool:
         with self._state_lock:
             self._pending_buys.pop(symbol, None)
-        self._save_scanner_state()
+        return self._save_scanner_state()
 
     def _reconcile_pending_buys(self):
         """Reconcile any persisted unresolved entry clientOrderIds before scanning or allowing new entries."""
@@ -245,6 +245,28 @@ class ScannerEngine:
 
                 state, order = self.exchange.reconcile_client_order_strict(symbol, client_oid)
                 if state == 'NOT_FOUND':
+                    if (meta or {}).get('state') == 'SUBMITTING':
+                        now_ts = time.time()
+                        created_at = float((meta or {}).get('created_at') or 0.0)
+                        if created_at <= 0.0:
+                            created_at = now_ts
+                            with self._state_lock:
+                                if symbol in self._pending_buys:
+                                    self._pending_buys[symbol]['created_at'] = created_at
+                        age = max(0.0, now_ts - created_at)
+                        grace_sec = float(getattr(cfg, 'SUBMITTING_RECOVERY_GRACE_SEC', 15.0))
+                        min_checks = max(1, int(getattr(cfg, 'SUBMITTING_NOT_FOUND_CONFIRMATIONS', 2)))
+                        checks = int((meta or {}).get('not_found_checks') or 0) + 1
+                        if checks < min_checks or age < grace_sec:
+                            with self._state_lock:
+                                if symbol in self._pending_buys:
+                                    self._pending_buys[symbol]['not_found_checks'] = checks
+                            self._save_scanner_state()
+                            log.warning(
+                                f"[PENDING BUY] {symbol} {client_oid} was SUBMITTING before restart and "
+                                f"returned -2013 (check {checks}/{min_checks}, age {age:.1f}s/{grace_sec:.1f}s); keeping lock"
+                            )
+                            continue
                     log.info(f"[PENDING BUY] {symbol} {client_oid} confirmed not found (-2013); clearing pending entry")
                     self._clear_pending_buy(symbol)
                 elif state == 'FOUND' and order is not None:
@@ -252,7 +274,7 @@ class ScannerEngine:
                         with self._state_lock:
                             if symbol in self._pending_buys:
                                 self._pending_buys[symbol]['state'] = 'PENDING'
-                                self._save_scanner_state()
+                        self._save_scanner_state()
                         log.warning(
                             f"[PENDING BUY] {symbol} {client_oid} still non-terminal "
                             f"(status={order.get('status')}); keeping pending lock"
@@ -303,15 +325,18 @@ class ScannerEngine:
             entry_reason=str(meta.get('reason') or "SCANNER"),
             entry_score=float(meta.get('score') or 0.0),
             details=details,
+            open_time=entry_ts if (entry_ts and entry_ts > 0) else None,
         )
 
         if not pos and not self.risk_mgr.has_position(symbol):
             log.error(f"[ENTRY PERSIST ERROR] RiskManager refused/failed opening position for {symbol}; retaining pending buy record")
             return False
 
-        if pos and entry_ts and entry_ts > 0:
+        if pos and entry_ts and entry_ts > 0 and abs(pos.open_time - entry_ts) > 1e-6:
             pos.open_time = entry_ts
-            self.risk_mgr.persist_positions()
+            if not self.risk_mgr.persist_positions():
+                log.error(f"[ENTRY PERSIST ERROR] Failed updating open_time for {symbol}; retaining pending buy record")
+                return False
 
         # Position is now durably persisted in positions.json — safe to clear pending buy lock
         if clear_pending:
@@ -412,7 +437,14 @@ class ScannerEngine:
                     meta['state'] = 'SUBMITTING'
                     self._pending_buys[symbol] = meta
                     self._in_flight_buys.add(symbol)
-                    self._save_scanner_state()
+                    if not self._save_scanner_state():
+                        self._pending_buys.pop(symbol, None)
+                        self._in_flight_buys.discard(symbol)
+                        log.error(
+                            f"[ENTRY ABORTED] Failed to persist scanner state for {symbol}; "
+                            f"refusing unrecorded market buy."
+                        )
+                        return
 
         try:
             order = self._call_market_buy(symbol, usdt_amount=usdt_amount, client_oid=buy_oid)
@@ -803,7 +835,19 @@ class ScannerEngine:
                 pos.details['pending_sell_client_oid'] = sell_oid
                 pos.details['pending_sell_reason'] = reason
                 pos.details['pending_sell_qty'] = sell_qty
-            self.risk_mgr.persist_positions()
+            if not self.risk_mgr.persist_positions():
+                if sell_oid:
+                    pos.details.pop('pending_sell_client_oid', None)
+                    pos.details.pop('pending_sell_reason', None)
+                    pos.details.pop('pending_sell_qty', None)
+                if had_oco:
+                    pos.details['oco_needs_sync'] = True
+                log.error(
+                    f"[CLOSE ABORTED] Failed to persist positions state before market sell for {symbol}; "
+                    f"refusing unrecorded sell."
+                )
+                self.risk_mgr.complete_exit(symbol)
+                return
 
             order = self._call_market_sell(symbol, sell_qty, client_oid=sell_oid)
 
@@ -870,7 +914,7 @@ class ScannerEngine:
             log.error(f"[CLOSE ERROR] Failed to close {symbol}: {e}")
             self.risk_mgr.complete_exit(symbol)
 
-    def _save_scanner_state(self):
+    def _save_scanner_state(self) -> bool:
         try:
             with self._state_lock:
                 data = {
@@ -883,8 +927,10 @@ class ScannerEngine:
             with open(tmp_path, 'w') as f:
                 json.dump(data, f)
             os.replace(tmp_path, 'scanner_state.json')
+            return True
         except Exception as e:
             log.error(f"Failed to save scanner state: {e}")
+            return False
 
     def _load_scanner_state(self):
         try:

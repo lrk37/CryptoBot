@@ -574,9 +574,16 @@ def run_basket(args):
         print(f"  {sym:<10} {t:>6}  {wr:>5.1f}%  {pf:>6.2f}  "
               f"{sh:>7.2f}  {so:>8.2f}  {ex:>+7.2f}%  {nr:>+7.2f}%  {beat_str:>8}{marker}")
 
+        dual_tf = getattr(cfg, 'ENABLE_DUAL_TIMEFRAME', True)
+        one_hour_only = set(getattr(cfg, 'ONE_HOUR_ONLY_SYMBOLS', ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT']))
+        if interval == '15m' and dual_tf:
+            entry_tf = '1h' if sym in one_hour_only else '15m+1h_fallback'
+        else:
+            entry_tf = interval
+
         results.append({
-            'symbol': sym, 'metrics': m,
-            'beat_random_pct': beat_pct,
+            'symbol': sym, 'entry_timeframe': entry_tf,
+            'metrics': m, 'beat_random_pct': beat_pct,
         })
 
         if t > 0:
@@ -657,6 +664,8 @@ def run_basket(args):
 
     _save(f'basket_{interval}_{days}d', {
         'interval': interval, 'days': days, 'n_symbols': len(symbols),
+        'dual_timeframe_enabled': bool(getattr(cfg, 'ENABLE_DUAL_TIMEFRAME', True)),
+        'one_hour_only_symbols': list(getattr(cfg, 'ONE_HOUR_ONLY_SYMBOLS', ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT'])),
         'generated_at_utc': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
         'data_window': {
             'start': str(data_start) if data_start is not None else None,

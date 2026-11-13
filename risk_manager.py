@@ -189,7 +189,7 @@ class RiskManager:
     def open_position(self, symbol: str, entry_price: float, quantity: float,
                       kind: str = "standard", atr_value: float = 0.0,
                       entry_reason: str = "", entry_score: float = 0.0,
-                      details: dict = None) -> Optional[Position]:
+                      details: dict = None, open_time: float = None) -> Optional[Position]:
         with self._lock:
             if symbol in self._positions:
                 log.warning(f"Position already open for {symbol}, skipping.")
@@ -199,14 +199,18 @@ class RiskManager:
                 return None
 
             sl, tp, trail, trail_off = self._risk_params(kind, entry_price, atr_value)
+            ts = float(open_time) if (open_time is not None and open_time > 0) else time.time()
             pos = Position(
                 symbol=symbol, entry_price=entry_price, quantity=quantity,
                 stop_loss=sl, take_profit=tp, trailing=trail, trailing_offset=trail_off,
-                kind=kind, open_time=time.time(), entry_reason=entry_reason, entry_score=entry_score,
+                kind=kind, open_time=ts, entry_reason=entry_reason, entry_score=entry_score,
                 details=details or {}
             )
             self._positions[symbol] = pos
-            self._save_positions()
+            if not self._save_positions():
+                self._positions.pop(symbol, None)
+                log.error(f"[OPEN FAILED] {symbol} could not be persisted to positions file; rolling back")
+                return None
             log.info(f"[OPENED] {symbol} ({kind}) | entry={entry_price:.6f} qty={quantity} | SL={sl:.6f} TP={tp:.6f} Score={entry_score:.0f} Reason: {entry_reason}")
             return pos
 
@@ -428,10 +432,10 @@ class RiskManager:
             log.warning(f"[TREND CHECK] could not evaluate EMA{getattr(self.cfg, 'EMA_SLOW', 21)} for {symbol}: {e}")
             return False
 
-    def persist_positions(self):
+    def persist_positions(self) -> bool:
         """Public wrapper: write positions.json (call after mutating Position.details)."""
         with self._lock:
-            self._save_positions()
+            return self._save_positions()
 
     def check_circuit_breaker(self, current_balance: float) -> bool:
         """Check daily loss circuit breaker. Pass total portfolio value, not just USDT cash."""
@@ -461,7 +465,7 @@ class RiskManager:
 
         return False
 
-    def _save_positions(self):
+    def _save_positions(self) -> bool:
         # F-30: Atomic write — write to tmp then rename
         try:
             fn = getattr(self.cfg, 'POSITIONS_FILE', 'positions.json')
@@ -470,8 +474,10 @@ class RiskManager:
             with open(tmp_fn, 'w') as f:
                 json.dump(data, f, indent=2)
             os.replace(tmp_fn, fn)
+            return True
         except Exception as e:
             log.error(f"Failed to save positions: {e}")
+            return False
 
     def _load_positions(self):
         try:

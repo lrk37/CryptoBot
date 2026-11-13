@@ -80,7 +80,7 @@ Tested across the 15-coin liquid basket (`BTC`, `ETH`, `BNB`, `SOL`, `XRP`, `ADA
 | **Median Expectancy / Trade** | `-1.12%` | **`+0.87%` net per trade** |
 
 ### B. Shared-Capital Portfolio Simulation (`MAX_OPEN_TRADES = 1`, `$1,000` Capital, `$100` / Trade)
-Simulating the live 1-position-at-a-time constraint chronologically across all 15 coins with bar-by-bar Mark-to-Market drawdown accounting ([`validation_results/basket_15m_90d.json`](validation_results/basket_15m_90d.json)):
+Simulating the live Dual-Timeframe mode (`--interval 15m`: `1h` signals on `BTC`/`ETH`/`SOL`/`XRP`, `15m + 1h` fallback on altcoins) with the 1-position-at-a-time constraint chronologically across all 15 coins and bar-by-bar Mark-to-Market drawdown accounting ([`validation_results/basket_15m_90d.json`](validation_results/basket_15m_90d.json)):
 - **Trades Executed:** `33` taken (`64` concurrent signals skipped due to `MAX_OPEN_TRADES = 1`)
 - **Portfolio Net Return:** **`+1.24%`** (`+$12.40` -> `$1,012.40` final equity; note `$100` / trade = `10%` position sizing)
 - **Mark-to-Market Max Drawdown:** **`1.24%`** (vs `0.89%` realized-only)
@@ -105,7 +105,7 @@ Simulating the live 1-position-at-a-time constraint chronologically across all 1
 | `backtest.py` | Single-symbol and multi-symbol quantitative backtester with Monte Carlo random-entry baseline comparison. |
 | `validate.py` | Out-of-sample validation suite (`walk_forward`, `basket` with Mark-to-Market portfolio drawdown including exit-candle lows/MAE, `monte_carlo`, `slippage`). |
 | `experiment.py` | Gate 0 accounting & no-lookahead verification harness + Stage A strategy family comparison suite. |
-| `tests/test_patches.py` | 54 automated unit tests (run via `.github/workflows/ci.yml` on push/PR) covering idempotent/persistent `clientOrderId` order lifecycle, race-safe `SUBMITTING` lock & crash-safe buy finalization, remainder cancellation on `PARTIALLY_FILLED`, deferred close on OCO cancellation failure, `orderListId`-scoped OCO fill reconciliation, partial-sell & dust reconciliation, persistent OCO break-even retries, spread/regime filters, DST timestamps, and MTM drawdown invariants. |
+| `tests/test_patches.py` | 59 automated unit tests (run via `.github/workflows/ci.yml` on push/PR) covering fail-closed disk persistence for orders and positions, restart-safe `SUBMITTING` confirmation grace recovery, idempotent/persistent `clientOrderId` lifecycle, remainder cancellation on `PARTIALLY_FILLED`, deferred close on OCO cancellation failure, `orderListId`-scoped OCO fill reconciliation, partial-sell & dust reconciliation, persistent OCO break-even retries, spread/regime filters, DST timestamps, dual-timeframe backtest routing, and MTM drawdown invariants. |
 | `deploy/` | `vps_setup.sh` (automated Ubuntu 22.04/24.04 installer) and `cryptobot.service` (`systemd` 24/7 background daemon config). |
 
 ---
@@ -120,7 +120,7 @@ python -m venv .venv
 # Linux / macOS:
 ./.venv/bin/pip install -r requirements.txt
 
-# 2. Run the 54 unit tests & Gate 0 accounting audit
+# 2. Run the 59 unit tests & Gate 0 accounting audit
 python -m unittest discover -s tests -v
 
 # 3. Run the 15-coin Dual-Timeframe basket validation (90 days)

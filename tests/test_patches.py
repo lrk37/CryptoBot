@@ -1004,6 +1004,189 @@ class TestBotMonitor(InTempDir):
         self.assertTrue(rm2.has_position("BBBUSDT"))
         self.assertEqual(rm2.get_position("BBBUSDT").details.get("oco_order_list_id"), 7)
 
+    def test_entry_aborts_if_scanner_state_persistence_fails(self):
+        """If saving scanner_state.json fails, _execute_entry must roll back in-memory locks
+        and abort BEFORE calling order_market_buy."""
+        from unittest.mock import patch
+        from scanner import ScanResult
+
+        fc, conn, rm, nt, eng, cfg = self._make_live_stack()
+        buy_calls = []
+        fc.order_market_buy = lambda **kw: buy_calls.append(kw) or {}
+
+        orig_replace = os.replace
+
+        def fail_scanner_state(src, dst):
+            if os.path.basename(str(dst)) == "scanner_state.json":
+                raise OSError("disk full")
+            return orig_replace(src, dst)
+
+        res = ScanResult(
+            symbol="BBBUSDT", score=85.0, raw_score=80.0, pump_penalty=0.0,
+            ema_score=25.0, rsi_score=25.0, vol_score=25.0, breakout_score=5.0, ob_score=5.0,
+            close_price=20.0, rsi=18.0, volume_ratio=2.5, breakout_atr_ratio=0.0,
+            bid_ask_ratio=1.4, atr=0.5, pct_change_24h=-5.0,
+            reason="CAPITULATION", last_closed_time=1000, timeframe="15m"
+        )
+        with patch("bot.os.replace", side_effect=fail_scanner_state):
+            eng._execute_entry(res)
+
+        self.assertEqual(buy_calls, [])
+        self.assertEqual(eng._pending_buy_count(), 0)
+        self.assertEqual(len(eng._in_flight_buys), 0)
+        self.assertEqual(rm.open_count(), 0)
+
+    def test_position_open_rolls_back_and_retains_pending_buy_if_positions_save_fails(self):
+        """If writing positions.json fails after a filled buy, RiskManager.open_position must roll back
+        and pending_buys must remain locked so reconciliation recovers the trade once disk recovers."""
+        from unittest.mock import patch
+        from scanner import ScanResult
+
+        fc, conn, rm, nt, eng, cfg = self._make_live_stack()
+        fc.price = 20.0
+        filled_order = {
+            "symbol": "BBBUSDT", "clientOrderId": None, "status": "FILLED",
+            "executedQty": "1.0", "cummulativeQuoteQty": "20.0", "transactTime": 1_700_000_000_000,
+        }
+
+        def fake_buy(**kw):
+            o = dict(filled_order)
+            o["clientOrderId"] = kw["newClientOrderId"]
+            return o
+
+        fc.order_market_buy = fake_buy
+        fc.get_order = lambda symbol, origClientOrderId: {**filled_order, "clientOrderId": origClientOrderId}
+
+        orig_replace = os.replace
+
+        def fail_positions_save(src, dst):
+            if os.path.basename(str(dst)) == os.path.basename(cfg.POSITIONS_FILE):
+                raise OSError("disk full")
+            return orig_replace(src, dst)
+
+        res = ScanResult(
+            symbol="BBBUSDT", score=85.0, raw_score=80.0, pump_penalty=0.0,
+            ema_score=25.0, rsi_score=25.0, vol_score=25.0, breakout_score=5.0, ob_score=5.0,
+            close_price=20.0, rsi=18.0, volume_ratio=2.5, breakout_atr_ratio=0.0,
+            bid_ask_ratio=1.4, atr=0.5, pct_change_24h=-5.0,
+            reason="CAPITULATION", last_closed_time=1000, timeframe="15m"
+        )
+        with patch("risk_manager.os.replace", side_effect=fail_positions_save):
+            eng._execute_entry(res)
+
+        self.assertFalse(rm.has_position("BBBUSDT"))
+        self.assertFalse(os.path.exists(cfg.POSITIONS_FILE))
+        self.assertEqual(eng._pending_buy_count(), 1)
+        self.assertIn("BBBUSDT", read_json("scanner_state.json")["pending_buys"])
+
+        # Once disk recovers, reconciliation recovers the fill cleanly and clears pending_buys
+        eng._reconcile_pending_buys()
+        self.assertTrue(rm.has_position("BBBUSDT"))
+        self.assertEqual(eng._pending_buy_count(), 0)
+        self.assertIn("BBBUSDT", read_json(cfg.POSITIONS_FILE))
+
+    def test_close_position_aborts_before_market_sell_if_persist_fails(self):
+        """If persisting pending_sell_client_oid to positions.json fails, _close_position must refuse
+        to submit market_sell so exits cannot execute unrecorded."""
+        from unittest.mock import patch
+
+        fc, conn, rm, nt, eng, cfg = self._make_live_stack()
+        pos = rm.open_position("AAAUSDT", 100.0, 1.0, kind="scanner", atr_value=1.0)
+        self.assertIsNotNone(pos)
+
+        sell_calls = []
+        fc.order_market_sell = lambda **kw: sell_calls.append(kw) or {}
+        orig_replace = os.replace
+
+        def fail_positions_save(src, dst):
+            if os.path.basename(str(dst)) == os.path.basename(cfg.POSITIONS_FILE):
+                raise OSError("read-only filesystem")
+            return orig_replace(src, dst)
+
+        with patch("risk_manager.os.replace", side_effect=fail_positions_save):
+            eng._close_position("AAAUSDT", pos, 94.0, "STOP_LOSS")
+
+        self.assertEqual(sell_calls, [])
+        self.assertTrue(rm.has_position("AAAUSDT"))
+        self.assertIsNone(pos.details.get("pending_sell_client_oid"))
+
+    def test_restart_submitting_buy_survives_single_not_found_and_recovers_or_clears_after_grace(self):
+        """Restarted state with SUBMITTING must not clear on the first -2013 NOT_FOUND; it recovers late
+        fills and only clears after both SUBMITTING_NOT_FOUND_CONFIRMATIONS and grace window elapse."""
+        from binance.exceptions import BinanceAPIException
+
+        def make_not_found():
+            err = BinanceAPIException.__new__(BinanceAPIException)
+            Exception.__init__(err, "Order does not exist")
+            err.code = -2013
+            return err
+
+        fc, conn, rm, nt, _, cfg = self._make_live_stack()
+        fc.price = 20.0
+        with open("scanner_state.json", "w") as f:
+            json.dump({
+                "prev_high_scores": {},
+                "curr_high_scores": {},
+                "pending_buys": {
+                    "BBBUSDT": {
+                        "symbol": "BBBUSDT", "client_oid": "CB_BUY_CRASH_1", "state": "SUBMITTING",
+                        "created_at": time.time() - 25.0, "atr": 0.5, "reason": "CAPITULATION", "score": 85.0,
+                    }
+                },
+            }, f)
+
+        get_calls = {"n": 0}
+
+        def delayed_order_lookup(symbol, origClientOrderId):
+            get_calls["n"] += 1
+            if get_calls["n"] == 1:
+                raise make_not_found()
+            return {
+                "symbol": symbol, "clientOrderId": origClientOrderId, "status": "FILLED",
+                "executedQty": "1.0", "cummulativeQuoteQty": "20.0", "updateTime": 1_700_000_000_000,
+            }
+
+        fc.get_order = delayed_order_lookup
+        eng2 = self.bot.ScannerEngine(conn, rm, nt)
+
+        # First -2013 after restart must retain the SUBMITTING lock
+        eng2._reconcile_pending_buys()
+        self.assertEqual(eng2._pending_buy_count(), 1)
+        self.assertFalse(rm.has_position("BBBUSDT"))
+        saved = read_json("scanner_state.json")["pending_buys"]["BBBUSDT"]
+        self.assertEqual(saved["state"], "SUBMITTING")
+        self.assertEqual(saved["not_found_checks"], 1)
+
+        # Second check sees delayed Binance FILLED order and opens position safely
+        eng2._reconcile_pending_buys()
+        self.assertTrue(rm.has_position("BBBUSDT"))
+        self.assertEqual(eng2._pending_buy_count(), 0)
+
+        # Now test permanent NOT_FOUND: requires BOTH >= confirmations AND >= grace window
+        with open("scanner_state.json", "w") as f:
+            json.dump({
+                "prev_high_scores": {},
+                "curr_high_scores": {},
+                "pending_buys": {
+                    "CCCUSDT": {
+                        "symbol": "CCCUSDT", "client_oid": "CB_BUY_LOST_2", "state": "SUBMITTING",
+                        "created_at": time.time(), "atr": 0.5, "reason": "CAPITULATION", "score": 85.0,
+                    }
+                },
+            }, f)
+        fc.get_order = lambda symbol, origClientOrderId: (_ for _ in ()).throw(make_not_found())
+        eng3 = self.bot.ScannerEngine(conn, rm, nt)
+
+        eng3._reconcile_pending_buys()  # check 1, age < grace
+        eng3._reconcile_pending_buys()  # check 2 >= 2, STILL age < grace
+        self.assertEqual(eng3._pending_buy_count(), 1)
+        self.assertEqual(read_json("scanner_state.json")["pending_buys"]["CCCUSDT"]["not_found_checks"], 2)
+
+        # Advance past grace window and confirm once more -> clears lock
+        eng3._pending_buys["CCCUSDT"]["created_at"] = time.time() - (cfg.SUBMITTING_RECOVERY_GRACE_SEC + 5.0)
+        eng3._reconcile_pending_buys()
+        self.assertEqual(eng3._pending_buy_count(), 0)
+
 
 # =============================================================== backtester
 class TestBacktest(unittest.TestCase):
@@ -1249,6 +1432,49 @@ class TestAccountingAndPortfolio(unittest.TestCase):
         self.assertEqual(len(sig_b), n)
         self.assertEqual(len(sig_t), n)
         self.assertEqual(len(sig_m), n)
+
+    def test_dual_timeframe_routes_mega_caps_to_1h_entries(self):
+        """StrategyBacktester with interval='15m' must route ONE_HOUR_ONLY_SYMBOLS (BTCUSDT)
+        strictly through closed 1h bars while agile altcoins (AVAXUSDT) evaluate 15m bars."""
+        from backtest import StrategyBacktester
+
+        # 260 hours = 1040 x 15m bars; flat warmup followed by an intrahour 15m crash at bar :30
+        # that recovers by hour-end, plus a full closed 1h capitulation across hour 240.
+        n_bars = 1040
+        idx = pd.date_range("2026-06-01", periods=n_bars, freq="15min", tz="UTC")
+        closes = np.full(n_bars, 100.0)
+        vols = np.full(n_bars, 10.0)
+        # Intrahour 15m dip inside hour 220 (rebounds before hour close so 1h close remains 100.0)
+        closes[220 * 4 + 1] = 94.0
+        vols[220 * 4 + 1] = 80.0
+        # Full closed 1h capitulation at hour 240 (all 4 x 15m bars deep below EMA21 on high vol)
+        for k in range(240 * 4, 241 * 4):
+            closes[k] = 90.0
+            vols[k] = 80.0
+        for k in range(241 * 4, n_bars):
+            closes[k] = 97.0
+        df = pd.DataFrame({
+            "open": closes,
+            "high": closes + 0.5,
+            "low": closes - 0.5,
+            "close": closes,
+            "volume": vols,
+            "quote_vol": closes * vols,
+        }, index=idx)
+
+        bt_alt = StrategyBacktester(initial_capital=1000, trade_size_usdt=100, min_score=60)
+        bt_alt.run("AVAXUSDT", df, interval="15m")
+        self.assertGreater(len(bt_alt.trades), 0)
+        # Altcoin can catch the intrahour 15m crash (at :30 -> enters at bar :45 or :30 open)
+        self.assertTrue(any(pd.Timestamp(t["entry_time"]).minute != 0 for t in bt_alt.trades))
+
+        bt_btc = StrategyBacktester(initial_capital=1000, trade_size_usdt=100, min_score=60)
+        m_btc = bt_btc.run("BTCUSDT", df, interval="15m")
+        self.assertNotIn("error", m_btc)
+        self.assertGreater(len(bt_btc.trades), 0)
+        # BTCUSDT (ONE_HOUR_ONLY_SYMBOLS) MUST ignore 15m signals and only enter on closed 1h (:00)
+        for tr in bt_btc.trades:
+            self.assertEqual(pd.Timestamp(tr["entry_time"]).minute, 0)
 
 
 if __name__ == "__main__":
