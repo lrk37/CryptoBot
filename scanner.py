@@ -63,7 +63,7 @@ class MarketScanner:
         try:
             interval = getattr(self.cfg, 'BTC_REGIME_INTERVAL', '1h')
             ema_period = getattr(self.cfg, 'BTC_REGIME_EMA_PERIOD', 200)
-            limit = ema_period + 50
+            limit = max(ema_period + 300, 500)
             df = self.exchange.get_candles('BTCUSDT', interval=interval, limit=limit)
             if df is None or len(df) < ema_period + 1:
                 log.warning(
@@ -174,7 +174,7 @@ class MarketScanner:
 
     def _analyze_symbol_tf(self, symbol: str, tf: str) -> Optional[ScanResult]:
         try:
-            limit = getattr(self.cfg, 'SCANNER_CANDLE_LIMIT', 250)
+            limit = getattr(self.cfg, 'SCANNER_CANDLE_LIMIT', 500)
             df = self.exchange.get_candles(symbol, interval=tf, limit=limit)
 
             if df is None or len(df) < 50:

@@ -2,7 +2,15 @@
   "interval": "15m",
   "days": 90,
   "n_symbols": 15,
-  "generated_at_utc": "2026-11-12T22:25:28Z",
+  "dual_timeframe_enabled": true,
+  "btc_regime_filter_enabled": true,
+  "one_hour_only_symbols": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "XRPUSDT"
+  ],
+  "generated_at_utc": "2026-11-13T17:12:17Z",
   "data_window": {
     "start": "2026-08-14 22:30:00+00:00",
     "end": "2026-11-12 22:15:00+00:00"
@@ -10,6 +18,7 @@
   "results": [
     {
       "symbol": "BTCUSDT",
+      "entry_timeframe": "1h",
       "metrics": {
         "initial_capital": 1000.0,
         "final_capital": 999.75,
@@ -35,6 +44,7 @@
     },
     {
       "symbol": "ETHUSDT",
+      "entry_timeframe": "1h",
       "metrics": {
         "initial_capital": 1000.0,
         "final_capital": 1003.1,
@@ -60,6 +70,7 @@
     },
     {
       "symbol": "BNBUSDT",
+      "entry_timeframe": "15m+1h_fallback",
       "metrics": {
         "initial_capital": 1000.0,
         "final_capital": 1002.15,
@@ -85,6 +96,7 @@
     },
     {
       "symbol": "SOLUSDT",
+      "entry_timeframe": "1h",
       "metrics": {
         "initial_capital": 1000.0,
         "final_capital": 1003.44,
@@ -110,6 +122,7 @@
     },
     {
       "symbol": "XRPUSDT",
+      "entry_timeframe": "1h",
       "metrics": {
         "initial_capital": 1000.0,
         "final_capital": 1001.65,
@@ -135,6 +148,7 @@
     },
     {
       "symbol": "ADAUSDT",
+      "entry_timeframe": "15m+1h_fallback",
       "metrics": {
         "initial_capital": 1000.0,
         "final_capital": 1009.98,
@@ -160,6 +174,7 @@
     },
     {
       "symbol": "AVAXUSDT",
+      "entry_timeframe": "15m+1h_fallback",
       "metrics": {
         "initial_capital": 1000.0,
         "final_capital": 1007.93,
@@ -185,6 +200,7 @@
     },
     {
       "symbol": "DOTUSDT",
+      "entry_timeframe": "15m+1h_fallback",
       "metrics": {
         "initial_capital": 1000.0,
         "final_capital": 1007.55,
@@ -210,6 +226,7 @@
     },
     {
       "symbol": "LINKUSDT",
+      "entry_timeframe": "15m+1h_fallback",
       "metrics": {
         "initial_capital": 1000.0,
         "final_capital": 1006.07,
@@ -235,6 +252,7 @@
     },
     {
       "symbol": "POLUSDT",
+      "entry_timeframe": "15m+1h_fallback",
       "metrics": {
         "initial_capital": 1000.0,
         "final_capital": 1005.62,
@@ -260,6 +278,7 @@
     },
     {
       "symbol": "NEARUSDT",
+      "entry_timeframe": "15m+1h_fallback",
       "metrics": {
         "initial_capital": 1000.0,
         "final_capital": 1002.62,
@@ -285,6 +304,7 @@
     },
     {
       "symbol": "ATOMUSDT",
+      "entry_timeframe": "15m+1h_fallback",
       "metrics": {
         "initial_capital": 1000.0,
         "final_capital": 1000.95,
@@ -310,6 +330,7 @@
     },
     {
       "symbol": "APTUSDT",
+      "entry_timeframe": "15m+1h_fallback",
       "metrics": {
         "initial_capital": 1000.0,
         "final_capital": 1012.07,
@@ -335,6 +356,7 @@
     },
     {
       "symbol": "SUIUSDT",
+      "entry_timeframe": "15m+1h_fallback",
       "metrics": {
         "initial_capital": 1000.0,
         "final_capital": 1007.81,
@@ -360,6 +382,7 @@
     },
     {
       "symbol": "ARBUSDT",
+      "entry_timeframe": "15m+1h_fallback",
       "metrics": {
         "initial_capital": 1000.0,
         "final_capital": 1003.06,

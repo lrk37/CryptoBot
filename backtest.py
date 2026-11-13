@@ -136,7 +136,8 @@ class StrategyBacktester:
 
     def run(self, symbol: str, df: pd.DataFrame, entry_mode: str = 'signal',
             random_prob: float = 0.0, seed: int = None, _check_entry_bar: bool = True,
-            interval: str = '15m', start_bar: int = 55) -> dict:
+            interval: str = '15m', start_bar: int = 55,
+            btc_df: pd.DataFrame = None) -> dict:
         """entry_mode='signal' -> the strategy's scoring; 'random' -> enter with probability
         `random_prob` on every eligible bar (baseline with identical exits and costs)."""
         self.trades = []
@@ -220,6 +221,27 @@ class StrategyBacktester:
                 ema21_1h_aligned = e21_closed.reindex(df.index).ffill()
             else:
                 df_1h = None
+
+        btc_bull_aligned = None
+        if (
+            btc_df is not None
+            and strategy_mode == 'capitulation'
+            and getattr(cfg, 'ENABLE_BTC_REGIME_FILTER', True)
+            and isinstance(df.index, pd.DatetimeIndex)
+            and isinstance(btc_df.index, pd.DatetimeIndex)
+            and not btc_df.empty
+        ):
+            btc_1h = btc_df.resample('1h').agg({'close': 'last'}).dropna()
+            btc_ema_period = int(getattr(cfg, 'BTC_REGIME_EMA_PERIOD', 200))
+            if len(btc_1h) >= btc_ema_period:
+                btc_ema = btc_1h['close'].ewm(span=btc_ema_period, adjust=False).mean()
+                btc_bull_1h = (btc_1h['close'] >= btc_ema).copy()
+                # Shift 1h open_time by +1h so bar i only evaluates completed 1h BTC candles
+                btc_bull_1h.index = btc_bull_1h.index + pd.Timedelta(hours=1)
+                btc_bull_aligned = btc_bull_1h.reindex(df.index).ffill().fillna(False).astype(bool)
+            else:
+                # Fail closed when BTC history < EMA period (matches scanner.check_btc_regime)
+                btc_bull_aligned = pd.Series(False, index=df.index, dtype=bool)
 
         position = None
         cooldown_until_idx = 0
@@ -437,6 +459,11 @@ class StrategyBacktester:
 
                     if score < self.min_score:
                         continue
+
+                    if btc_bull_aligned is not None:
+                        high_thresh = float(getattr(cfg, 'HIGH_SCORE_THRESHOLD', 85))
+                        if not bool(btc_bull_aligned.iloc[i]) and score < high_thresh:
+                            continue
                 else:
                     # Hard Block: Doji filter
                     c_range = p_high - p_low

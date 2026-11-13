@@ -13,8 +13,9 @@ import sys
 import time
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import config as cfg
@@ -32,10 +33,20 @@ logging.basicConfig(
     format=log_format,
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(getattr(cfg, 'LOG_FILE', 'bot.log'), encoding='utf-8')
+        RotatingFileHandler(
+            getattr(cfg, 'LOG_FILE', 'bot.log'),
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding='utf-8',
+        ),
     ]
 )
 log = logging.getLogger('MainThread')
+
+_INTERVAL_SECONDS = {
+    '1m': 60, '3m': 180, '5m': 300, '15m': 900, '30m': 1800,
+    '1h': 3600, '2h': 7200, '4h': 14400, '1d': 86400,
+}
 
 class ScannerEngine:
     def __init__(self, exchange: BinanceConnector, risk_mgr: RiskManager, notifier: TelegramNotifier):
@@ -50,6 +61,8 @@ class ScannerEngine:
         self._order_reconcile_lock = threading.RLock()
         self._active_symbols = set()
         self._symbol_cooldowns: dict[str, float] = {}
+        self._last_alerts: dict[str, float] = {}
+        self._breaker_alerted_date: str | None = None
 
         self._prev_high_scores: dict[str, dict] = {}
         self._curr_high_scores: dict[str, dict] = {}
@@ -57,6 +70,51 @@ class ScannerEngine:
         self._in_flight_buys: set[str] = set()
 
         self._load_scanner_state()
+
+    def _alert_throttled(self, key: str, message: str, min_interval: float = 900.0):
+        """Send a Telegram operational alert at most once per `min_interval` seconds per key."""
+        if not hasattr(self.notifier, 'alert'):
+            return
+        now = time.time()
+        with self._state_lock:
+            last = self._last_alerts.get(key, 0.0)
+            if now - last < min_interval:
+                return
+            self._last_alerts[key] = now
+        try:
+            self.notifier.alert(message)
+        except Exception as e:
+            log.warning(f"[ALERT ERROR] {key}: {e}")
+
+    def _record_cooldown(self, symbol: str, reason: str) -> int:
+        """Apply and persist per-symbol post-exit cooldown (extended after STOP_LOSS)."""
+        cooldown_sec = getattr(cfg, 'SYMBOL_COOLDOWN_SEC', 3600)
+        if "STOP_LOSS" in str(reason) and getattr(cfg, 'STRATEGY_MODE', 'capitulation') == 'capitulation':
+            cooldown_sec = max(cooldown_sec, getattr(cfg, 'COOLDOWN_AFTER_SL_SEC', 43200))
+        with self._state_lock:
+            self._symbol_cooldowns[symbol] = time.time() + cooldown_sec
+        self._save_scanner_state()
+        return cooldown_sec
+
+    def _is_signal_stale(self, res) -> bool:
+        """Return True if a real-epoch signal's closed candle ended longer ago than MAX_SIGNAL_AGE_SEC."""
+        lct = getattr(res, 'last_closed_time', 0) or 0
+        if lct < 1_000_000_000:
+            return False
+        tf = getattr(res, 'timeframe', getattr(cfg, 'SCANNER_INTERVAL', '15m'))
+        bar_sec = _INTERVAL_SECONDS.get(tf, 900)
+        base_max_age = float(getattr(cfg, 'MAX_SIGNAL_AGE_SEC', 480))
+        if base_max_age <= 0:
+            return False
+        max_age = max(base_max_age, int(bar_sec * 0.5)) if bar_sec > 900 else base_max_age
+        age = time.time() - (float(lct) + bar_sec)
+        if age > max_age:
+            log.warning(
+                f"[STALE SIGNAL] {res.symbol} ({tf}) closed {age:.0f}s ago "
+                f"(> max {max_age:.0f}s) - skipping entry"
+            )
+            return True
+        return False
 
     def start(self):
         self._running = True
@@ -68,32 +126,58 @@ class ScannerEngine:
         self._running = False
 
     def _scan_loop(self):
-        rescan_sec = getattr(cfg, 'SCANNER_RESCAN_INTERVAL', 300)
+        rescan_sec = int(getattr(cfg, 'SCANNER_RESCAN_INTERVAL', 300) or 300)
         while self._running:
             try:
                 self._scan_tick()
             except Exception as e:
                 log.error(f"[SCANNER ENGINE ERROR] {e}", exc_info=True)
 
-            for _ in range(rescan_sec):
+            if getattr(cfg, 'ALIGN_SCANS_TO_CANDLE', True) and rescan_sec > 0:
+                offset_sec = int(getattr(cfg, 'SCAN_ALIGN_OFFSET_SEC', 3))
+                now_s = int(time.time())
+                next_slot = ((now_s // rescan_sec) + 1) * rescan_sec + offset_sec
+                wait_sec = max(1, next_slot - now_s)
+            else:
+                wait_sec = max(1, rescan_sec)
+
+            for _ in range(wait_sec):
                 if not self._running:
                     break
                 time.sleep(1)
 
     def _scan_tick(self):
         if self.risk_mgr.is_loss_halted():
+            halt_until = getattr(self.risk_mgr, '_loss_halt_until', 0)
+            self._alert_throttled(
+                f"loss_halt:{int(halt_until)}",
+                f"⏸️ Consecutive loss halt active ({getattr(self.risk_mgr, 'consecutive_losses', 0)} consecutive losses); scanning paused.",
+                min_interval=3600.0,
+            )
             return
 
         # F-07: Use portfolio value (including open positions) for circuit breaker
         pos_symbols = self.risk_mgr.all_position_symbols()
         pos_qty = {}
+        pos_fallback_prices = {}
         for s in pos_symbols:
             p_ = self.risk_mgr.get_position(s)
             if p_:
                 pos_qty[s] = p_.quantity
-        portfolio_val = self.exchange.get_portfolio_value(symbols=pos_symbols, quantities=pos_qty)
+                if p_.entry_price > 0:
+                    pos_fallback_prices[s] = p_.entry_price
+        try:
+            portfolio_val = self.exchange.get_portfolio_value(
+                symbols=pos_symbols, quantities=pos_qty, fallback_prices=pos_fallback_prices
+            )
+        except TypeError:
+            portfolio_val = self.exchange.get_portfolio_value(symbols=pos_symbols, quantities=pos_qty)
         if self.risk_mgr.check_circuit_breaker(portfolio_val):
-            self.notifier.alert("🛑 Circuit breaker tripped! Daily loss limit reached. Trading halted.")
+            today_str = str(datetime.now(timezone.utc).date())
+            if self._breaker_alerted_date != today_str:
+                self._breaker_alerted_date = today_str
+                if hasattr(self.notifier, 'alert'):
+                    self.notifier.alert("🛑 Circuit breaker tripped! Daily loss limit reached. Trading halted.")
             return
 
         self._reconcile_pending_buys()
@@ -108,72 +192,83 @@ class ScannerEngine:
         with self._state_lock:
             active_copy = list(self._active_symbols)
         results = self.scanner.scan_market(active_symbols=active_copy)
-        
-        # Log candidates & check empirical 1h/4h forward returns (no capital risk)
-        try:
-            log_scan_candidates(results, self.exchange)
-            update_forward_returns(self.exchange)
-        except Exception as e:
-            log.warning(f"[SCAN LOGGER] Forward tracking exception: {e}")
 
         if not results:
             log.info("[SCANNER ENGINE] No candidates passed scoring threshold")
+            try:
+                update_forward_returns(self.exchange)
+            except Exception as e:
+                log.warning(f"[SCAN LOGGER] Forward tracking exception: {e}")
             self._rotate_scores()
             return
 
         now = time.time()
-        cooldown_sec = getattr(cfg, 'SYMBOL_COOLDOWN_SEC', 3600)
         high_thresh = getattr(cfg, 'HIGH_SCORE_THRESHOLD', 80)
         require_confirm = getattr(cfg, 'REQUIRE_CONFIRMATION', True)
+        expired_removed = False
 
-        for res in results:
-            symbol = res.symbol
-            score = res.score
-            closed_time = res.last_closed_time
+        try:
+            for res in results:
+                symbol = res.symbol
+                score = res.score
+                closed_time = res.last_closed_time
 
-            # F-10: Check symbol cooldown under lock
-            with self._state_lock:
-                if symbol in self._symbol_cooldowns:
-                    if now < self._symbol_cooldowns[symbol]:
-                        remaining = int(self._symbol_cooldowns[symbol] - now)
-                        log.info(f"[SCANNER ENGINE] {symbol} is in cooldown ({remaining}s remaining) - skipping")
-                        continue
+                # F-10: Check symbol cooldown under lock
+                with self._state_lock:
+                    if symbol in self._symbol_cooldowns:
+                        if now < self._symbol_cooldowns[symbol]:
+                            remaining = int(self._symbol_cooldowns[symbol] - now)
+                            log.info(f"[SCANNER ENGINE] {symbol} is in cooldown ({remaining}s remaining) - skipping")
+                            continue
+                        else:
+                            del self._symbol_cooldowns[symbol]
+                            expired_removed = True
+
+                # 1. Enforce BTC Market Regime: in BEARISH regime, only allow Extreme Capitulation (>= high_thresh)
+                if btc_status == "BEARISH" and not (
+                    getattr(cfg, 'STRATEGY_MODE', 'capitulation') == 'capitulation' and score >= high_thresh
+                ):
+                    log.info(f"[SCANNER ENGINE] BTC regime BEARISH - skipping entry for {symbol} (score {score:.0f})")
+                    continue
+
+                if self._is_signal_stale(res):
+                    continue
+
+                # 2. High Score Override (>=80) fast-tracks entry (only in Bullish BTC regime)
+                if score >= high_thresh and getattr(cfg, 'ENABLE_HIGH_SCORE_OVERRIDE', True):
+                    log.info(f"[CONFIRMATION BYPASS] {symbol} score {score:.0f} >= {high_thresh:.0f} - fast-tracking entry!")
+                    self._execute_entry(res)
+                    break
+
+                # 2-Scan Candle-Based Confirmation System
+                if require_confirm:
+                    self._curr_high_scores[symbol] = {'score': score, 'last_closed_time': closed_time}
+
+                    if symbol in self._prev_high_scores:
+                        prev_info = self._prev_high_scores[symbol]
+                        prev_score = prev_info.get('score', 0)
+                        prev_time = prev_info.get('last_closed_time', 0)
+
+                        if closed_time > prev_time:
+                            log.info(f"[CONFIRMATION CONFIRMED] {symbol} scored high on distinct 15m candles ({prev_score:.0f} -> {score:.0f}) - executing!")
+                            self._execute_entry(res)
+                            break
+                        else:
+                            log.info(f"[CONFIRMATION WAIT] {symbol} same 15m candle as previous scan ({closed_time}) - waiting for next closed candle")
                     else:
-                        del self._symbol_cooldowns[symbol]
-
-            # 1. Enforce BTC Market Regime: in BEARISH regime, only allow Extreme Capitulation (>= high_thresh)
-            if btc_status == "BEARISH" and not (
-                getattr(cfg, 'STRATEGY_MODE', 'capitulation') == 'capitulation' and score >= high_thresh
-            ):
-                log.info(f"[SCANNER ENGINE] BTC regime BEARISH - skipping entry for {symbol} (score {score:.0f})")
-                continue
-
-            # 2. High Score Override (>=80) fast-tracks entry (only in Bullish BTC regime)
-            if score >= high_thresh and getattr(cfg, 'ENABLE_HIGH_SCORE_OVERRIDE', True):
-                log.info(f"[CONFIRMATION BYPASS] {symbol} score {score:.0f} >= {high_thresh:.0f} - fast-tracking entry!")
-                self._execute_entry(res)
-                break
-
-            # 2-Scan Candle-Based Confirmation System
-            if require_confirm:
-                self._curr_high_scores[symbol] = {'score': score, 'last_closed_time': closed_time}
-
-                if symbol in self._prev_high_scores:
-                    prev_info = self._prev_high_scores[symbol]
-                    prev_score = prev_info.get('score', 0)
-                    prev_time = prev_info.get('last_closed_time', 0)
-
-                    if closed_time > prev_time:
-                        log.info(f"[CONFIRMATION CONFIRMED] {symbol} scored high on distinct 15m candles ({prev_score:.0f} -> {score:.0f}) - executing!")
-                        self._execute_entry(res)
-                        break
-                    else:
-                        log.info(f"[CONFIRMATION WAIT] {symbol} same 15m candle as previous scan ({closed_time}) - waiting for next closed candle")
+                        log.info(f"[CONFIRMATION WAIT] {symbol} score {score:.0f} >= 60 - waiting for 2nd scan confirmation")
                 else:
-                    log.info(f"[CONFIRMATION WAIT] {symbol} score {score:.0f} >= 60 - waiting for 2nd scan confirmation")
-            else:
-                self._execute_entry(res)
-                break
+                    self._execute_entry(res)
+                    break
+        finally:
+            if expired_removed:
+                self._save_scanner_state()
+            # Log candidates & update historical forward returns AFTER entry execution (avoids retry lag on buys)
+            try:
+                log_scan_candidates(results, self.exchange)
+                update_forward_returns(self.exchange)
+            except Exception as e:
+                log.warning(f"[SCAN LOGGER] Forward tracking exception: {e}")
 
         self._rotate_scores()
 
@@ -518,6 +613,171 @@ class ScannerEngine:
                     break
                 time.sleep(1)
 
+    def _process_oco_fill(self, symbol: str, pos, oco_id, fill: dict) -> str:
+        """Finalize a full or partial OCO fill dict detected from Binance.
+
+        Returns one of: 'FULL_CLOSED', 'FULL_DEFERRED', 'PARTIAL_CLOSED', 'PARTIAL_DEFERRED', 'NO_FILL'.
+        """
+        fill_qty = (
+            float(fill['qty'])
+            if fill and 'qty' in fill and fill['qty'] is not None
+            else (pos.quantity if fill else 0.0)
+        )
+        if not fill or fill_qty <= 0:
+            return 'NO_FILL'
+
+        exit_px = float(fill['price'])
+        fill_ts = fill.get('time') or time.time()
+        reason = "TAKE_PROFIT" if fill.get('type') in ('LIMIT_MAKER', 'LIMIT') else "STOP_LOSS"
+        oco_fill_id = f"OCO:{oco_id}:{fill.get('order_id') or fill.get('time') or ''}"
+        remaining = pos.quantity - fill_qty
+        if fill_qty < pos.quantity * 0.99 and remaining > 1e-8:
+            sellable_rem = (
+                self.exchange.is_sellable_qty(symbol, remaining, exit_px)
+                if hasattr(self.exchange, 'is_sellable_qty')
+                else True
+            )
+            if sellable_rem:
+                log.info(
+                    f"[EXCHANGE PARTIAL FILL] {symbol} OCO leg partially filled "
+                    f"{fill_qty} / {pos.quantity} ({reason}) at {exit_px:.6f}; "
+                    f"retaining remaining {remaining:.8f}"
+                )
+                if not self.risk_mgr.partial_close_position(
+                    symbol, fill_qty, exit_px, f"OCO_{reason}",
+                    clear_oco=True, fill_id=oco_fill_id,
+                ):
+                    self._alert_throttled(
+                        f"oco_partial_fail:{symbol}",
+                        f"⚠️ Failed persisting OCO partial fill for {symbol}; retaining state for retry.",
+                    )
+                    return 'PARTIAL_DEFERRED'
+                return 'PARTIAL_CLOSED'
+            log.info(
+                f"[DUST REMAINDER] {symbol} OCO filled {fill_qty} / {pos.quantity}; "
+                f"remainder {remaining:.8f} below exchange minQty/minNotional — finalizing close."
+            )
+
+        log.info(f"[EXCHANGE FILL] {symbol} OCO leg filled ({reason}) qty={fill_qty} at {exit_px:.6f}")
+        pnl_pct = pos.pnl_pct(exit_px)
+        pnl_usdt = (exit_px - pos.entry_price) * fill_qty
+        dur_sec = max(0.0, fill_ts - pos.open_time)
+        if not self.risk_mgr.close_position(
+            symbol, exit_px, f"OCO_{reason}",
+            fill_id=oco_fill_id, executed_qty=fill_qty,
+        ):
+            log.error(
+                f"[CLOSE DEFERRED] Failed persisting OCO fill close for {symbol}; "
+                f"retaining position and OCO id for retry."
+            )
+            self._alert_throttled(
+                f"close_defer_oco:{symbol}",
+                f"⚠️ Failed persisting OCO close for {symbol}; will retry on next monitor tick.",
+            )
+            return 'FULL_DEFERRED'
+
+        with self._state_lock:
+            self._active_symbols.discard(symbol)
+        self._record_cooldown(symbol, reason)
+        self.notifier.trade_closed(
+            symbol, f"OCO_{reason}", pos.entry_price, exit_px, pnl_pct,
+            duration_sec=dur_sec, pnl_usdt=pnl_usdt, open_time=pos.open_time, close_time=fill_ts
+        )
+        return 'FULL_CLOSED'
+
+    def _check_position_oco_status(self, symbol: str, pos) -> bool:
+        """Inspect active exchange OCO for `pos` and handle fills/vanished OCOs.
+
+        Returns True if the caller should stop processing further exit/sync actions for `pos`
+        this tick (e.g. closed, partially closed, or persistence deferred).
+        """
+        oco_id = (pos.details or {}).get('oco_order_list_id')
+        if oco_id is None:
+            return False
+
+        try:
+            fill = None
+            oco_gone = False
+            if hasattr(self.exchange, 'get_oco_fill'):
+                oco_res = self.exchange.get_oco_fill(
+                    symbol, oco_id, since_ms=int(pos.open_time * 1000) - 60_000
+                )
+                oco_status = (oco_res or {}).get('status', 'UNKNOWN')
+                if oco_status == 'FILLED':
+                    fill = oco_res
+                    oco_gone = True
+                elif oco_status in ('CANCELED', 'NOT_FOUND'):
+                    oco_gone = True
+            else:
+                open_orders = self.exchange.get_open_orders_strict(symbol)
+                if open_orders is not None and len(open_orders) == 0:
+                    oco_gone = True
+                    fill = self.exchange.get_last_sell_fill(symbol, int(pos.open_time * 1000) - 60_000)
+
+            if oco_gone:
+                if fill and float(fill.get('qty', pos.quantity) if fill.get('qty') is not None else pos.quantity) > 0:
+                    outcome = self._process_oco_fill(symbol, pos, oco_id, fill)
+                    if outcome != 'NO_FILL':
+                        return True
+                log.warning(
+                    f"[OCO] {symbol}: OCO is no longer open but no filled SELL was found - "
+                    f"clearing stale OCO link and marking oco_needs_sync; client-side exits stay active"
+                )
+                pos.details.pop('oco_order_list_id', None)
+                pos.details.pop('oco_stop_loss', None)
+                if getattr(cfg, 'USE_EXCHANGE_OCO', True):
+                    pos.details['oco_needs_sync'] = True
+                self.risk_mgr.persist_positions()
+        except Exception as e:
+            log.warning(f"[MONITOR OCO CHECK] {symbol}: {e}")
+        return False
+
+    def _check_oco_before_replacing_or_selling(self, symbol: str, pos, oco_id, tag: str) -> str:
+        """Right after cancel_open_orders(symbol) succeeds (which treats -2011 as True), check
+        whether the OCO actually executed just before cancellation.
+
+        Returns one of: 'CLEAR', 'DEFER', 'FULL_CLOSED', 'FULL_DEFERRED', 'PARTIAL_CLOSED', 'PARTIAL_DEFERRED'.
+        """
+        since_ms = int(pos.open_time * 1000) - 60_000
+        if hasattr(self.exchange, 'get_oco_fill'):
+            oco_res = self.exchange.get_oco_fill(symbol, oco_id, since_ms=since_ms)
+            st = (oco_res or {}).get('status', 'UNKNOWN')
+            if st in ('OPEN', 'UNKNOWN'):
+                self.risk_mgr.persist_positions()
+                log.warning(
+                    f"[{tag}] {symbol} OCO {oco_id} status={st} after cancel; "
+                    f"preserving oco_order_list_id and deferring action."
+                )
+                self._alert_throttled(
+                    f"oco_post_cancel:{tag}:{symbol}",
+                    f"⚠️ {symbol} OCO {oco_id} status={st} after cancel; preserving OCO and deferring.",
+                )
+                return 'DEFER'
+            if st == 'FILLED' and oco_res and float(oco_res.get('qty') or 0) > 0:
+                return self._process_oco_fill(symbol, pos, oco_id, oco_res)
+            return 'CLEAR'
+
+        fill = self.exchange.get_last_sell_fill(symbol, since_ms)
+        if fill and float(fill.get('qty', pos.quantity) if fill.get('qty') is not None else pos.quantity) > 0:
+            return self._process_oco_fill(symbol, pos, oco_id, fill)
+        return 'CLEAR'
+
+    def _reconcile_startup_exits(self):
+        """Reconcile any pending sells or exchange OCO fills before startup stale-position cleanup."""
+        for symbol in self.risk_mgr.all_position_symbols():
+            pos = self.risk_mgr.get_position(symbol)
+            if not pos:
+                continue
+            if (pos.details or {}).get('pending_sell_client_oid'):
+                try:
+                    fallback_px = self.exchange.get_price(symbol)
+                except Exception:
+                    fallback_px = pos.entry_price
+                self._reconcile_pending_sell(symbol, pos, fallback_px)
+            pos = self.risk_mgr.get_position(symbol)
+            if pos and (pos.details or {}).get('oco_order_list_id') is not None:
+                self._check_position_oco_status(symbol, pos)
+
     def _monitor_tick(self):
         self._reconcile_pending_buys()
 
@@ -544,95 +804,9 @@ class ScannerEngine:
                 log.warning(f"[MONITOR] Failed to get price for {symbol}: {e}")
                 continue
 
-            # Did the exchange-side OCO already close this position?
-            # Decided from ORDER state, not balances: coins locked in an OCO are not 'free', and
-            # unrelated pre-existing holdings of the same coin would confuse a balance check.
-            try:
-                oco_id = pos.details.get('oco_order_list_id')
-                if oco_id is not None:
-                    fill = None
-                    oco_gone = False
-                    if hasattr(self.exchange, 'get_oco_fill'):
-                        oco_res = self.exchange.get_oco_fill(
-                            symbol, oco_id, since_ms=int(pos.open_time * 1000) - 60_000
-                        )
-                        oco_status = (oco_res or {}).get('status', 'UNKNOWN')
-                        if oco_status == 'FILLED':
-                            fill = oco_res
-                            oco_gone = True
-                        elif oco_status in ('CANCELED', 'NOT_FOUND'):
-                            oco_gone = True
-                    else:
-                        open_orders = self.exchange.get_open_orders_strict(symbol)
-                        if open_orders is not None and len(open_orders) == 0:
-                            oco_gone = True
-                            fill = self.exchange.get_last_sell_fill(symbol, int(pos.open_time * 1000) - 60_000)
-
-                    if oco_gone:
-                        fill_qty = (
-                            float(fill['qty'])
-                            if fill and 'qty' in fill and fill['qty'] is not None
-                            else (pos.quantity if fill else 0.0)
-                        )
-                        if fill and fill_qty > 0:
-                            exit_px = float(fill['price'])
-                            fill_ts = fill.get('time') or time.time()
-                            reason = "TAKE_PROFIT" if fill.get('type') in ('LIMIT_MAKER', 'LIMIT') else "STOP_LOSS"
-                            oco_fill_id = f"OCO:{oco_id}:{fill.get('order_id') or fill.get('time') or ''}"
-                            remaining = pos.quantity - fill_qty
-                            if fill_qty < pos.quantity * 0.99 and remaining > 1e-8:
-                                sellable_rem = (
-                                    self.exchange.is_sellable_qty(symbol, remaining, exit_px)
-                                    if hasattr(self.exchange, 'is_sellable_qty')
-                                    else True
-                                )
-                                if sellable_rem:
-                                    log.info(
-                                        f"[EXCHANGE PARTIAL FILL] {symbol} OCO leg partially filled "
-                                        f"{fill_qty} / {pos.quantity} ({reason}) at {exit_px:.6f}; "
-                                        f"retaining remaining {remaining:.8f}"
-                                    )
-                                    self.risk_mgr.partial_close_position(
-                                        symbol, fill_qty, exit_px, f"OCO_{reason}",
-                                        clear_oco=True, fill_id=oco_fill_id,
-                                    )
-                                    continue
-                                log.info(
-                                    f"[DUST REMAINDER] {symbol} OCO filled {fill_qty} / {pos.quantity}; "
-                                    f"remainder {remaining:.8f} below exchange minQty/minNotional — finalizing close."
-                                )
-
-                            log.info(f"[EXCHANGE FILL] {symbol} OCO leg filled ({reason}) qty={fill_qty} at {exit_px:.6f}")
-                            pnl_pct = pos.pnl_pct(exit_px)
-                            pnl_usdt = (exit_px - pos.entry_price) * fill_qty
-                            dur_sec = max(0.0, fill_ts - pos.open_time)
-                            if not self.risk_mgr.close_position(
-                                symbol, exit_px, f"OCO_{reason}",
-                                fill_id=oco_fill_id, executed_qty=fill_qty,
-                            ):
-                                log.error(
-                                    f"[CLOSE DEFERRED] Failed persisting OCO fill close for {symbol}; "
-                                    f"retaining position and OCO id for retry."
-                                )
-                                continue
-                            with self._state_lock:
-                                self._active_symbols.discard(symbol)
-                                cd_sec = getattr(cfg, 'SYMBOL_COOLDOWN_SEC', 3600)
-                                if reason == "STOP_LOSS" and getattr(cfg, 'STRATEGY_MODE', 'capitulation') == 'capitulation':
-                                    cd_sec = max(cd_sec, 43200)
-                                self._symbol_cooldowns[symbol] = time.time() + cd_sec
-                            self.notifier.trade_closed(
-                                symbol, f"OCO_{reason}", pos.entry_price, exit_px, pnl_pct,
-                                duration_sec=dur_sec, pnl_usdt=pnl_usdt, open_time=pos.open_time, close_time=fill_ts
-                            )
-                            continue
-                        log.warning(f"[OCO] {symbol}: OCO is no longer open but no filled SELL was found - "
-                                    f"dropping the OCO link; client-side exits stay active")
-                        pos.details.pop('oco_order_list_id', None)
-                        pos.details.pop('oco_stop_loss', None)
-                        self.risk_mgr.persist_positions()
-            except Exception as e:
-                log.warning(f"[MONITOR OCO CHECK] {symbol}: {e}")
+            # Did the exchange-side OCO already close or partially fill this position?
+            if self._check_position_oco_status(symbol, pos):
+                continue
 
             prev_sl = pos.stop_loss
             action = self.risk_mgr.evaluate(pos, curr_price)
@@ -691,6 +865,10 @@ class ScannerEngine:
                 f"[{tag} ROLLBACK FAILED] Could not cancel unpersisted OCO {lid} for {symbol}; "
                 f"retaining in-memory oco_order_list_id and oco_needs_sync."
             )
+            self._alert_throttled(
+                f"oco_rollback_fail:{symbol}",
+                f"🚨 Critical: {symbol} failed both persisting OCO {lid} and cancelling it; manual verification advised.",
+            )
         return False
 
     def _sync_oco_stop(self, symbol, pos, curr_price):
@@ -701,19 +879,24 @@ class ScannerEngine:
             log.info(f"[OCO SYNC DEFERRED] {symbol} price {curr_price:.6f} too close to SL/TP; will retry on next monitor tick")
             return
         try:
-            if pos.details.get('oco_order_list_id') is not None:
+            old_oco_id = pos.details.get('oco_order_list_id')
+            if old_oco_id is not None:
                 cancelled = self.exchange.cancel_open_orders(symbol)
                 if cancelled is False:
                     pos.details['oco_needs_sync'] = True
                     self.risk_mgr.persist_positions()
                     log.warning(f"[OCO SYNC] {symbol} cancellation failed; keeping existing OCO id and retrying next tick")
                     return
-                pos.details.pop('oco_order_list_id', None)
-                pos.details.pop('oco_stop_loss', None)
-                pos.details['oco_needs_sync'] = True
-                if not self.risk_mgr.persist_positions():
-                    log.warning(f"[OCO SYNC] {symbol} failed persisting cleared OCO state after cancel; deferring replacement")
+                oco_check = self._check_oco_before_replacing_or_selling(symbol, pos, old_oco_id, tag="OCO SYNC")
+                if oco_check in ('DEFER', 'FULL_CLOSED', 'FULL_DEFERRED', 'PARTIAL_DEFERRED'):
                     return
+                if oco_check == 'CLEAR':
+                    pos.details.pop('oco_order_list_id', None)
+                    pos.details.pop('oco_stop_loss', None)
+                    pos.details['oco_needs_sync'] = True
+                    if not self.risk_mgr.persist_positions():
+                        log.warning(f"[OCO SYNC] {symbol} failed persisting cleared OCO state after cancel; deferring replacement")
+                        return
             elif hasattr(self.exchange, 'get_open_orders_strict'):
                 existing_open = self.exchange.get_open_orders_strict(symbol)
                 if existing_open is None:
@@ -735,7 +918,12 @@ class ScannerEngine:
                         return
 
             actual_qty = self.exchange.get_asset_balance_fresh(symbol)
-            oco_qty = min(actual_qty, pos.quantity) if actual_qty > 0 else pos.quantity
+            if actual_qty <= 0:
+                pos.details['oco_needs_sync'] = True
+                self.risk_mgr.persist_positions()
+                log.warning(f"[OCO SYNC] {symbol} zero free balance ({actual_qty}) for {pos.quantity}; deferring OCO placement")
+                return
+            oco_qty = min(actual_qty, pos.quantity)
             oco = self.exchange.create_oco_sell(symbol, oco_qty, pos.take_profit, pos.stop_loss)
             if self._record_or_rollback_oco(symbol, pos, oco, pos.stop_loss, tag="OCO SYNC"):
                 log.info(f"[OCO SYNC] {symbol} exchange OCO stop updated to {pos.stop_loss:.6f}")
@@ -822,6 +1010,10 @@ class ScannerEngine:
                         f"[PARTIAL CLOSE DEFERRED] Failed to persist partial fill for {symbol} "
                         f"(fill_id={fill_id}); retaining recoverable order record."
                     )
+                    self._alert_throttled(
+                        f"partial_close_defer:{symbol}",
+                        f"⚠️ Failed persisting partial sell close for {symbol}; retaining state for retry.",
+                    )
                 return
             log.info(
                 f"[DUST REMAINDER] {symbol}: sold {exec_qty} / {pos.quantity}; "
@@ -842,16 +1034,16 @@ class ScannerEngine:
                 f"[CLOSE DEFERRED] Failed to persist sell close for {symbol} "
                 f"(fill_id={fill_id}); retaining recoverable position lock."
             )
+            self._alert_throttled(
+                f"close_defer_persist:{symbol}",
+                f"⚠️ Failed persisting close for {symbol}; retaining state for retry.",
+            )
             return
 
         with self._state_lock:
             self._active_symbols.discard(symbol)
 
-        cooldown_sec = getattr(cfg, 'SYMBOL_COOLDOWN_SEC', 3600)
-        if "STOP_LOSS" in str(reason) and getattr(cfg, 'STRATEGY_MODE', 'capitulation') == 'capitulation':
-            cooldown_sec = max(cooldown_sec, 43200)
-        with self._state_lock:
-            self._symbol_cooldowns[symbol] = time.time() + cooldown_sec
+        cooldown_sec = self._record_cooldown(symbol, reason)
         log.info(f"[COOLDOWN SET] {symbol} placed on {cooldown_sec // 60}m cooldown after trade close ({reason})")
 
         self.notifier.trade_closed(
@@ -879,8 +1071,9 @@ class ScannerEngine:
                     return
 
             # Cancel open orders (OCO) on Binance so balance is unlocked for selling.
-            # NEVER proceed with market_sell if OCO cancellation failed (OCO could still execute concurrently).
-            had_oco = pos.details.get('oco_order_list_id') is not None
+            # NEVER proceed with market_sell if OCO cancellation failed or if the OCO already filled (-2011 race).
+            old_oco_id = pos.details.get('oco_order_list_id')
+            had_oco = old_oco_id is not None
             if had_oco:
                 cancelled = self.exchange.cancel_open_orders(symbol)
                 if cancelled is False:
@@ -889,14 +1082,39 @@ class ScannerEngine:
                         f"[CLOSE DEFERRED] Failed to cancel open OCO for {symbol}; "
                         f"preserving oco_order_list_id and deferring market sell until next tick."
                     )
+                    self._alert_throttled(
+                        f"close_defer_oco_cancel:{symbol}",
+                        f"⚠️ Failed cancelling open OCO for {symbol}; close deferred until next tick.",
+                    )
                     self.risk_mgr.complete_exit(symbol)
                     return
-                pos.details.pop('oco_order_list_id', None)
-                pos.details.pop('oco_stop_loss', None)
+                oco_check = self._check_oco_before_replacing_or_selling(symbol, pos, old_oco_id, tag="CLOSE OCO CHECK")
+                if oco_check in ('DEFER', 'FULL_CLOSED', 'FULL_DEFERRED', 'PARTIAL_DEFERRED'):
+                    self.risk_mgr.complete_exit(symbol)
+                    return
+                if oco_check == 'CLEAR':
+                    pos.details.pop('oco_order_list_id', None)
+                    pos.details.pop('oco_stop_loss', None)
 
             actual_qty = self.exchange.get_asset_balance_fresh(symbol)
+            if actual_qty <= 0:
+                total_qty = self.exchange.get_asset_total(symbol) if hasattr(self.exchange, 'get_asset_total') else 0.0
+                if had_oco and total_qty > 0 and getattr(cfg, 'USE_EXCHANGE_OCO', True):
+                    pos.details['oco_needs_sync'] = True
+                self.risk_mgr.persist_positions()
+                log.warning(
+                    f"[CLOSE DEFERRED] {symbol} has zero free balance (free={actual_qty}, total={total_qty}); "
+                    f"refusing phantom/duplicate market sell."
+                )
+                self._alert_throttled(
+                    f"close_zero_bal:{symbol}",
+                    f"⚠️ {symbol} exit deferred: free balance={actual_qty}, total={total_qty}.",
+                )
+                self.risk_mgr.complete_exit(symbol)
+                return
+
             # Sell the POSITION, never more: free balance may include unrelated holdings of the same coin
-            sell_qty = min(actual_qty, pos.quantity) if actual_qty > 0 else pos.quantity
+            sell_qty = min(actual_qty, pos.quantity)
 
             sell_oid = (
                 self.exchange.new_client_order_id(symbol, 'SELL')
@@ -917,6 +1135,10 @@ class ScannerEngine:
                 log.error(
                     f"[CLOSE ABORTED] Failed to persist positions state before market sell for {symbol}; "
                     f"refusing unrecorded sell."
+                )
+                self._alert_throttled(
+                    f"close_abort_persist:{symbol}",
+                    f"⚠️ Failed persisting positions.json before exit for {symbol}; market sell aborted.",
                 )
                 self.risk_mgr.complete_exit(symbol)
                 return
@@ -943,6 +1165,10 @@ class ScannerEngine:
                         log.warning(
                             f"[CLOSE UNCERTAIN] Market sell {sell_oid} status unverified for {symbol}; "
                             f"retaining pending_sell_client_oid to reconcile before any retry."
+                        )
+                        self._alert_throttled(
+                            f"close_uncertain:{symbol}",
+                            f"⚠️ Market sell {sell_oid} for {symbol} is unverified; holding pending sell lock.",
                         )
                         self.risk_mgr.complete_exit(symbol)
                         return
@@ -988,12 +1214,19 @@ class ScannerEngine:
 
     def _save_scanner_state(self) -> bool:
         try:
+            now = time.time()
             with self._state_lock:
+                active_cooldowns = {
+                    k: float(v) for k, v in self._symbol_cooldowns.items()
+                    if float(v) > now
+                }
+                self._symbol_cooldowns = dict(active_cooldowns)
                 data = {
                     'prev_high_scores': dict(self._prev_high_scores),
                     'curr_high_scores': dict(self._curr_high_scores),
                     'pending_buys': dict(self._pending_buys),
-                    'timestamp': time.time()
+                    'symbol_cooldowns': active_cooldowns,
+                    'timestamp': now,
                 }
             tmp_path = 'scanner_state.json.tmp'
             with open(tmp_path, 'w') as f:
@@ -1007,12 +1240,18 @@ class ScannerEngine:
     def _load_scanner_state(self):
         try:
             if Path('scanner_state.json').exists():
+                now = time.time()
                 with open('scanner_state.json', 'r') as f:
                     data = json.load(f)
                     with self._state_lock:
                         self._prev_high_scores = data.get('prev_high_scores', {})
                         self._curr_high_scores = data.get('curr_high_scores', {})
                         self._pending_buys = data.get('pending_buys', {})
+                        raw_cd = data.get('symbol_cooldowns', {}) or {}
+                        self._symbol_cooldowns = {
+                            k: float(v) for k, v in raw_cd.items()
+                            if float(v) > now
+                        }
         except Exception as e:
             log.error(f"Failed to load scanner state: {e}")
 
@@ -1044,9 +1283,16 @@ def main():
     risk_mgr.set_exchange(connector)
     notifier = TelegramNotifier(cfg)
 
+    engine = ScannerEngine(connector, risk_mgr, notifier)
+    # Reconcile pending buys, pending sells, and offline OCO fills before cleaning stale ghost positions
+    try:
+        engine._reconcile_pending_buys()
+        engine._reconcile_startup_exits()
+    except Exception as e:
+        log.warning(f"[STARTUP RECONCILE] Failed startup reconciliation pass: {e}")
+
     risk_mgr.validate_positions(connector)
 
-    engine = ScannerEngine(connector, risk_mgr, notifier)
     engine.start()
 
     log.info("Bot running - Scanner Engine active. Press Ctrl+C to exit.")

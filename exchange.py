@@ -31,14 +31,7 @@ class BinanceConnector:
         self.client = Client(cfg.API_KEY, cfg.API_SECRET, testnet=cfg.USE_TESTNET)
         self.client.recvWindow = 10000
 
-        try:
-            server_time = self.client.get_server_time()
-            local_time = int(time.time() * 1000)
-            self.client.timestamp_offset = server_time['serverTime'] - local_time
-            offset_ms = self.client.timestamp_offset
-            log.info(f"Time offset synced: {offset_ms:+d} ms")
-        except Exception as e:
-            log.warning(f"Failed to sync server time: {e}")
+        self._sync_time()
 
         adapter = req_lib.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
         self.client.session.mount('https://', adapter)
@@ -60,7 +53,20 @@ class BinanceConnector:
         self._portfolio_cache = 0
         self._portfolio_cache_time = 0
         self._portfolio_lock = threading.Lock()
+        self._last_prices: Dict[str, float] = {}
         self._last_order_unsent = False
+
+    def _sync_time(self) -> bool:
+        """Synchronize local client clock offset with Binance server time."""
+        try:
+            server_time = self.client.get_server_time()
+            local_time = int(time.time() * 1000)
+            self.client.timestamp_offset = server_time['serverTime'] - local_time
+            log.info(f"Time offset synced: {self.client.timestamp_offset:+d} ms")
+            return True
+        except Exception as e:
+            log.warning(f"Failed to sync server time: {e}")
+            return False
 
     def _retry(self, fn, *args, **kwargs):
         retries = getattr(self.cfg, 'MAX_RETRIES', 3)
@@ -71,6 +77,9 @@ class BinanceConnector:
             except BinanceAPIException as e:
                 if e.code in NON_RETRYABLE_CODES:
                     raise
+                if e.code == -1021:
+                    log.warning("[TIME SYNC] Binance -1021 timestamp error, re-syncing server clock")
+                    self._sync_time()
                 if i == retries - 1:
                     raise
                 time.sleep(delay * (i + 1))
@@ -215,6 +224,9 @@ class BinanceConnector:
                 if isinstance(e, BinanceOrderException):
                     self._last_order_unsent = True
                     raise
+                if code == -1021:
+                    log.warning("[TIME SYNC] Binance -1021 during idempotent order, re-syncing server clock")
+                    self._sync_time()
                 if code in NON_RETRYABLE_CODES:
                     if code == -2010:
                         state, existing = self.reconcile_client_order_strict(symbol, client_oid)
@@ -280,7 +292,10 @@ class BinanceConnector:
 
     def get_price(self, symbol):
         t = self._retry(self.client.get_symbol_ticker, symbol=symbol)
-        return float(t['price'])
+        px = float(t['price'])
+        if px > 0:
+            self._last_prices[symbol] = px
+        return px
 
     def get_spread_pct(self, symbol):
         """Get bid-ask spread as percentage. Uses live public market data when on Testnet."""
@@ -372,11 +387,12 @@ class BinanceConnector:
                 fee_base += float(f.get('commission', 0) or 0)
         return max(executed - fee_base, 0.0)
 
-    def get_portfolio_value(self, symbols=None, quantities=None):
+    def get_portfolio_value(self, symbols=None, quantities=None, fallback_prices=None):
         """Estimate total portfolio value in USDT.
 
         quantities: optional {symbol: qty} of the bot's tracked positions. When given it is used instead of
         the account balance, so locked (OCO) coins and unrelated pre-existing holdings are handled correctly.
+        fallback_prices: optional {symbol: price} used if live ticker lookup temporarily fails.
         """
         now = time.time()
         with self._portfolio_lock:
@@ -385,22 +401,47 @@ class BinanceConnector:
 
         usdt = self.get_usdt_balance()
         val = usdt
+        degraded = False
+        unpriced = False
         if symbols:
             for s in symbols:
+                qty = 0.0
                 try:
                     if quantities is not None and s in quantities:
                         qty = quantities[s]
                     else:
                         qty = self.get_asset_total(s)  # free + locked
-                    if qty > 0:
-                        px = self.get_price(s)
-                        val += qty * px
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning(f"[PORTFOLIO] Quantity lookup failed for {s}: {e}")
+                    unpriced = True
+                    continue
+                if qty <= 0:
+                    continue
+                px = None
+                try:
+                    px = self.get_price(s)
+                except Exception as e:
+                    fallback = self._last_prices.get(s) or (fallback_prices or {}).get(s)
+                    if fallback and float(fallback) > 0:
+                        px = float(fallback)
+                        degraded = True
+                        log.warning(f"[PORTFOLIO] Price lookup failed for {s} ({e}); using fallback {px:.6f}")
+                    else:
+                        unpriced = True
+                        log.warning(f"[PORTFOLIO] Price lookup failed for {s} with no fallback ({e})")
+                if px and px > 0:
+                    val += qty * px
 
-        with self._portfolio_lock:
-            self._portfolio_cache = val
-            self._portfolio_cache_time = now
+        if unpriced:
+            with self._portfolio_lock:
+                if self._portfolio_cache > 0:
+                    return self._portfolio_cache
+            return 0.0
+
+        if not degraded:
+            with self._portfolio_lock:
+                self._portfolio_cache = val
+                self._portfolio_cache_time = now
         return val
 
     def verify_asset_holding(self, symbol, expected_qty):
@@ -572,11 +613,11 @@ class BinanceConnector:
             return None
         min_qty = self._get_min_qty(symbol)
         if qty < min_qty:
-            log.warning(f"{symbol}: sell qty {qty} below minQty {min_qty}, attempting with full available balance")
-            actual = self.get_asset_balance_fresh(symbol)
+            log.warning(f"{symbol}: sell qty {qty} below minQty {min_qty}, checking actual balance capped to {quantity}")
+            actual = min(self.get_asset_balance_fresh(symbol), quantity)
             qty = self._round_lot(symbol, actual)
             if qty < min_qty:
-                log.error(f"{symbol}: even actual balance {actual} is below minQty {min_qty}")
+                log.error(f"{symbol}: capped sell balance {actual} (qty={qty}) is below minQty {min_qty}")
                 self._last_order_unsent = True
                 return None
         log.info(f"[SELL] {qty} {symbol}")
@@ -830,8 +871,12 @@ class BinanceConnector:
         qty = self._round_lot(symbol, quantity)
         tp_price = self._round_price(symbol, take_profit)
         sl_price = self._round_price(symbol, stop_loss)
-        # Stop trigger slightly above stopLimitPrice so limit order fills promptly on spot
-        stop_trigger = self._round_price(symbol, sl_price * 1.002)
+        # Trigger at sl_price and place stopLimitPrice below trigger so fast wicks still fill
+        offset_pct = float(getattr(self.cfg, 'OCO_STOP_LIMIT_OFFSET_PCT', 0.8) or 0.8)
+        stop_trigger = sl_price
+        sl_limit = self._round_price(symbol, stop_trigger * (1.0 - offset_pct / 100.0))
+        if sl_limit <= 0 or sl_limit > stop_trigger:
+            sl_limit = stop_trigger
 
         if qty <= 0 or tp_price <= 0 or sl_price <= 0:
             log.warning(f"[OCO ERROR] Invalid parameters for {symbol}: qty={qty}, tp={tp_price}, sl={sl_price}")
@@ -842,7 +887,7 @@ class BinanceConnector:
             log.warning(f"[OCO ERROR] {symbol} qty {qty} < minQty {min_qty}")
             return None
 
-        log.info(f"[OCO ORDER] Submitting OCO Sell for {symbol} | Qty: {qty} | TP: {tp_price} | Trigger: {stop_trigger} | SL Limit: {sl_price}")
+        log.info(f"[OCO ORDER] Submitting OCO Sell for {symbol} | Qty: {qty} | TP: {tp_price} | Trigger: {stop_trigger} | SL Limit: {sl_limit}")
         try:
             oco = self._retry(
                 self.client.create_oco_order,
@@ -851,7 +896,7 @@ class BinanceConnector:
                 quantity=qty,
                 price=f"{tp_price:.8f}".rstrip('0').rstrip('.'),
                 stopPrice=f"{stop_trigger:.8f}".rstrip('0').rstrip('.'),
-                stopLimitPrice=f"{sl_price:.8f}".rstrip('0').rstrip('.'),
+                stopLimitPrice=f"{sl_limit:.8f}".rstrip('0').rstrip('.'),
                 stopLimitTimeInForce='GTC'
             )
             log.info(f"[OCO SUCCESS] Placed OCO order for {symbol} (OrderListId: {oco.get('orderListId')})")

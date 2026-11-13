@@ -16,6 +16,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 SCAN_LOG_FILE = Path("scan_history.jsonl")
+MAX_SCAN_LOG_LINES = 1000
 
 def log_scan_candidates(candidates: list, exchange=None):
     """
@@ -102,7 +103,11 @@ def update_forward_returns(exchange):
                     log.debug(f"[SCAN LOGGER] Row update skipped: {line_err}")
                     new_lines.append(line + "\n")
 
-        if updated:
+        trimmed = len(new_lines) > MAX_SCAN_LOG_LINES
+        if trimmed:
+            new_lines = new_lines[-MAX_SCAN_LOG_LINES:]
+
+        if updated or trimmed:
             tmp_file = SCAN_LOG_FILE.with_suffix(".jsonl.tmp")
             with open(tmp_file, 'w', encoding='utf-8') as f:
                 f.writelines(new_lines)

@@ -533,9 +533,21 @@ def run_basket(args):
     all_basket_trades = []
     symbol_dfs = {}
 
+    btc_df = None
+    if getattr(cfg, 'ENABLE_BTC_REGIME_FILTER', True):
+        try:
+            btc_df = fetch_historical_candles('BTCUSDT', interval=interval, days=days, refresh=refresh)
+            if btc_df is not None and not btc_df.empty:
+                symbol_dfs['BTCUSDT'] = btc_df
+        except Exception as e:
+            print(f"  [WARN] Could not load BTCUSDT regime series ({e}); running without BTC filter")
+            btc_df = None
+
     for i, sym in enumerate(symbols, 1):
         try:
-            df = fetch_historical_candles(sym, interval=interval, days=days, refresh=refresh)
+            df = symbol_dfs.get(sym)
+            if df is None:
+                df = fetch_historical_candles(sym, interval=interval, days=days, refresh=refresh)
         except Exception as e:
             print(f"  {sym:<10} SKIP — {e}")
             continue
@@ -546,7 +558,7 @@ def run_basket(args):
 
         symbol_dfs[sym] = df
         bt = StrategyBacktester(initial_capital=cap, trade_size_usdt=tsize, min_score=mscore)
-        m  = bt.run(sym, df, interval=interval)
+        m  = bt.run(sym, df, interval=interval, btc_df=btc_df)
 
         # Random baseline comparison
         beat_str = ''
@@ -665,6 +677,7 @@ def run_basket(args):
     _save(f'basket_{interval}_{days}d', {
         'interval': interval, 'days': days, 'n_symbols': len(symbols),
         'dual_timeframe_enabled': bool(getattr(cfg, 'ENABLE_DUAL_TIMEFRAME', True)),
+        'btc_regime_filter_enabled': bool(btc_df is not None and getattr(cfg, 'ENABLE_BTC_REGIME_FILTER', True)),
         'one_hour_only_symbols': list(getattr(cfg, 'ONE_HOUR_ONLY_SYMBOLS', ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT'])),
         'generated_at_utc': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
         'data_window': {

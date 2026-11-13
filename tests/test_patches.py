@@ -541,9 +541,19 @@ class TestBotMonitor(InTempDir):
         self.pos.details["oco_order_list_id"] = 5
         self.ex.open_orders = []
         self.ex.fill = None
+        # Even if replacement OCO fails on tick 1, stale OCO 5 is cleared and oco_needs_sync=True is persisted
+        self.ex.oco_return = None
         self.tick()
         self.assertTrue(self.rm.has_position("AAAUSDT"))
         self.assertNotIn("oco_order_list_id", self.rm.get_position("AAAUSDT").details)
+        self.assertTrue(self.rm.get_position("AAAUSDT").details.get("oco_needs_sync"))
+        self.assertTrue(read_json(self.bot.cfg.POSITIONS_FILE)["AAAUSDT"]["details"].get("oco_needs_sync"))
+
+        # Once OCO placement succeeds on next tick, exchange protection is automatically restored
+        self.ex.oco_return = {"orderListId": 99}
+        self.tick()
+        self.assertEqual(self.rm.get_position("AAAUSDT").details.get("oco_order_list_id"), 99)
+        self.assertFalse(self.rm.get_position("AAAUSDT").details.get("oco_needs_sync"))
 
     def test_close_sells_only_the_position(self):
         self.eng._close_position("AAAUSDT", self.pos, 100.0, "TEST")
@@ -1721,6 +1731,388 @@ class TestAccountingAndPortfolio(unittest.TestCase):
         bt_dip.run("AVAXUSDT", make_alt_df(early_price=98.0), interval="15m")
         self.assertGreater(len(bt_dip.trades), 0)
         self.assertEqual(pd.Timestamp(bt_dip.trades[0]["entry_time"]).minute, 0)
+
+    def test_backtest_btc_regime_filter_blocks_tier2_allows_tier1(self):
+        """S2: With btc_df passed to StrategyBacktester.run(), bearish BTC 1h < EMA200 blocks
+        Tier-2 dips (score 78) while still allowing Tier-1 extreme capitulation (score 85)."""
+        from backtest import StrategyBacktester
+
+        n_1h = 240
+        n_bars = n_1h * 4
+        idx = pd.date_range("2026-06-01", periods=n_bars, freq="15min", tz="UTC")
+
+        def make_alt(drop_pct_from_top: float, vol_spike: float) -> pd.DataFrame:
+            # Uptrend from 80 -> 106 so EMA200 stays near ~96 while EMA21 reaches ~105.5;
+            # a pullback to 101.5 stays above 0.992*EMA200 (~95) while dipping >2% below EMA21 (Tier 2).
+            closes = np.linspace(80.0, 106.0, n_bars)
+            vols = np.full(n_bars, 10.0)
+            sig_bar = 230 * 4
+            closes[sig_bar - 40:sig_bar] = 106.0
+            closes[sig_bar] = 106.0 * (1.0 - drop_pct_from_top / 100.0)
+            vols[sig_bar] = vol_spike
+            closes[sig_bar + 1:] = 104.0
+            return pd.DataFrame({
+                "open": closes, "high": closes + 0.2, "low": closes - 0.2,
+                "close": closes, "volume": vols, "quote_vol": closes * vols,
+            }, index=idx)
+
+        def make_btc(trend: str) -> pd.DataFrame:
+            h_idx = pd.date_range("2026-06-01", periods=n_1h, freq="1h", tz="UTC")
+            b = np.linspace(100.0, 140.0, n_1h) if trend == "bull" else np.linspace(140.0, 100.0, n_1h)
+            return pd.DataFrame({
+                "open": b, "high": b + 0.5, "low": b - 0.5, "close": b,
+                "volume": np.full(n_1h, 100.0), "quote_vol": b * 100.0,
+            }, index=h_idx)
+
+        # Tier-2 altcoin dip: ~2.6% drop below 106 (above EMA200~96 -> is_bull=True, >2% below EMA21) -> score=78
+        alt_tier2 = make_alt(drop_pct_from_top=2.6, vol_spike=30.0)
+        btc_bull = make_btc("bull")
+        btc_bear = make_btc("bear")
+
+        bt_bull = StrategyBacktester(initial_capital=1000, trade_size_usdt=100, min_score=75)
+        bt_bull.run("AVAXUSDT", alt_tier2, interval="15m", btc_df=btc_bull)
+        self.assertGreater(len(bt_bull.trades), 0)
+
+        bt_bear_t2 = StrategyBacktester(initial_capital=1000, trade_size_usdt=100, min_score=75)
+        bt_bear_t2.run("AVAXUSDT", alt_tier2, interval="15m", btc_df=btc_bear)
+        self.assertEqual(len(bt_bear_t2.trades), 0)
+
+        # Tier-1 extreme capitulation: ~5.0% drop (>3.2% below EMA21, RSI <= 20, vol >= 2.0x) -> score=85
+        alt_tier1 = make_alt(drop_pct_from_top=5.0, vol_spike=50.0)
+        bt_bear_t1 = StrategyBacktester(initial_capital=1000, trade_size_usdt=100, min_score=75)
+        bt_bear_t1.run("AVAXUSDT", alt_tier1, interval="15m", btc_df=btc_bear)
+        self.assertGreater(len(bt_bear_t1.trades), 0)
+
+
+class TestHardeningRegressionSuite(InTempDir):
+    """Regression suite covering N1-N10, ChatGPT Issue A/B, S1/S2/S7 fixes."""
+
+    def _live_stack(self, client_overrides=None, **cfg_over):
+        import exchange
+        import bot
+        from risk_manager import RiskManager
+
+        fc = FakeClient()
+        fc.balances = [
+            {"asset": "USDT", "free": "100", "locked": "0"},
+            {"asset": "AAA", "free": "1.0", "locked": "0"},
+            {"asset": "BBB", "free": "0.5", "locked": "0"},
+        ]
+        fc.get_symbol_info = lambda symbol: {
+            "filters": [
+                {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+                {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                {"filterType": "MIN_NOTIONAL", "minNotional": "10.0"},
+            ]
+        }
+        fc.cancel_open_orders = lambda symbol: fc.open_orders.clear() or []
+        def _fake_oco(**kw):
+            fc.oco_calls.append(kw)
+            fc.open_orders.append({"orderListId": 77, "orderId": 771, "status": "NEW"})
+            return {"orderListId": 77}
+        fc.create_oco_order = _fake_oco
+        if client_overrides:
+            for k, v in client_overrides.items():
+                setattr(fc, k, v)
+
+        cfg = make_cfg(
+            POSITIONS_FILE=os.path.join(self.tmp, "positions.json"),
+            TRADE_LOG_FILE=os.path.join(self.tmp, "trade_log.json"),
+            MAX_RETRIES=2, RETRY_DELAY=0, USE_QUOTE_ORDER_QTY=True, USE_EXCHANGE_OCO=True,
+            **cfg_over,
+        )
+        orig_client = exchange.Client
+        exchange.Client = lambda *a, **k: fc
+        try:
+            conn = exchange.BinanceConnector(cfg)
+        finally:
+            exchange.Client = orig_client
+        bot.cfg = cfg
+        rm = RiskManager(cfg)
+        rm.set_exchange(conn)
+        alerts = []
+        closed = []
+        nt = types.SimpleNamespace(
+            closed=closed,
+            alerts=alerts,
+            trade_opened=lambda *a, **k: None,
+            trade_closed=lambda *a, **k: closed.append(a),
+            alert=lambda msg: alerts.append(msg),
+        )
+        eng = bot.ScannerEngine(conn, rm, nt)
+        return bot, fc, conn, rm, nt, eng, cfg
+
+    def test_n1_validate_positions_preserves_active_exits_and_partial_balances(self):
+        from risk_manager import RiskManager
+        cfg = make_cfg(POSITIONS_FILE=os.path.join(self.tmp, "positions.json"),
+                       TRADE_LOG_FILE=os.path.join(self.tmp, "trade_log.json"), MAX_OPEN_TRADES=5)
+        rm = RiskManager(cfg)
+        rm.open_position("PENDUSDT", 100.0, 1.0, kind="scanner", details={"pending_sell_client_oid": "S_1"})
+        rm.open_position("OCOUSDT", 100.0, 1.0, kind="scanner", details={"oco_order_list_id": 12})
+        rm.open_position("PARTUSDT", 100.0, 1.0, kind="scanner")
+        rm.open_position("GHOSTUSDT", 100.0, 1.0, kind="scanner")
+
+        held = {"PENDUSDT": 0.0, "OCOUSDT": 0.0, "PARTUSDT": 0.4, "GHOSTUSDT": 0.0}
+        ex = types.SimpleNamespace(
+            verify_asset_holding=lambda s, q: held[s] >= q * 0.9,
+            get_asset_total=lambda s: held[s],
+            get_price=lambda s: 100.0,
+            is_sellable_qty=lambda s, q, px: q >= 0.1,
+        )
+        rm.validate_positions(ex)
+        self.assertTrue(rm.has_position("PENDUSDT"))
+        self.assertTrue(rm.has_position("OCOUSDT"))
+        self.assertTrue(rm.has_position("PARTUSDT"))
+        self.assertFalse(rm.has_position("GHOSTUSDT"))
+
+    def test_n1_startup_exit_reconciliation_handles_offline_oco_partial_before_validate(self):
+        fc, conn, rm, nt, eng, cfg = self._live_stack()[1:]
+        pos = rm.open_position("AAAUSDT", 100.0, 1.0, kind="scanner", atr_value=1.0, entry_score=80,
+                               details={"oco_order_list_id": 7})
+        self.assertIsNotNone(pos)
+        # Simulate offline partial fill (0.6 sold on TP leg, 0.4 left on exchange)
+        fc.balances = [{"asset": "USDT", "free": "163", "locked": "0"},
+                       {"asset": "AAA", "free": "0.4", "locked": "0"}]
+        fc.orders = [
+            {"side": "SELL", "status": "FILLED", "orderListId": 7, "orderId": 11,
+             "updateTime": int(time.time() * 1000) + 1000, "executedQty": "0.6",
+             "cummulativeQuoteQty": "63.0", "type": "LIMIT_MAKER"},
+            {"side": "SELL", "status": "EXPIRED", "orderListId": 7, "orderId": 12,
+             "updateTime": int(time.time() * 1000) + 1000, "executedQty": "0",
+             "cummulativeQuoteQty": "0", "type": "STOP_LOSS_LIMIT"},
+        ]
+        fc.get_order_list = lambda orderListId: {
+            "orderListId": orderListId, "listOrderStatus": "ALL_DONE",
+            "orders": [{"orderId": 11}, {"orderId": 12}],
+        }
+
+        eng._reconcile_startup_exits()
+        rm.validate_positions(conn)
+
+        self.assertTrue(rm.has_position("AAAUSDT"))
+        self.assertAlmostEqual(rm.get_position("AAAUSDT").quantity, 0.4, places=6)
+        trades = read_json(cfg.TRADE_LOG_FILE)
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0]["reason"], "PARTIAL_OCO_TAKE_PROFIT")
+
+    def test_issue_b_loss_state_crash_prevents_double_loss_count_on_restart(self):
+        from risk_manager import RiskManager
+        bot, fc, conn, rm, nt, eng, cfg = self._live_stack()
+        pos = rm.open_position("AAAUSDT", 100.0, 1.0, kind="scanner", atr_value=1.0, entry_score=80)
+        sell_oid = "S_LOSS_1"
+        pos.details["pending_sell_client_oid"] = sell_oid
+        pos.details["pending_sell_reason"] = "STOP_LOSS"
+        rm.persist_positions()
+
+        # Simulate crash AFTER loss_state.json committed losses=1 + applied_fill_ids=[sell_oid]
+        # BEFORE trade_log.json was written and before positions.json was cleared.
+        with open("loss_state.json", "w") as f:
+            json.dump({
+                "losses": 1, "halt_until": 0, "daily_start_bal": 200.0,
+                "today": str(rm._today), "applied_fill_ids": [sell_oid],
+            }, f)
+
+        fc.orders = []
+        fc.get_order = lambda symbol, origClientOrderId: {
+            "symbol": symbol, "clientOrderId": origClientOrderId, "orderId": 501,
+            "status": "FILLED", "executedQty": "1.0", "cummulativeQuoteQty": "94.0",
+            "updateTime": int(time.time() * 1000),
+        }
+
+        rm2 = RiskManager(cfg)
+        rm2.set_exchange(conn)
+        eng2 = bot.ScannerEngine(conn, rm2, nt)
+        eng2._monitor_tick()
+
+        self.assertFalse(rm2.has_position("AAAUSDT"))
+        self.assertEqual(rm2.consecutive_losses, 1)  # MUST stay 1, not double to 2!
+        trades = read_json(cfg.TRADE_LOG_FILE)
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0]["fill_id"], sell_oid)
+
+    def test_n2_close_position_reconciles_oco_fill_on_2011_race_instead_of_selling(self):
+        from binance.exceptions import BinanceAPIException
+        bot, fc, conn, rm, nt, eng, cfg = self._live_stack()
+        pos = rm.open_position("AAAUSDT", 100.0, 1.0, kind="scanner", atr_value=1.0, entry_score=80,
+                               details={"oco_order_list_id": 7})
+        sell_calls = []
+        fc.order_market_sell = lambda **kw: sell_calls.append(kw)
+        fc.balances = [{"asset": "USDT", "free": "205", "locked": "0"},
+                       {"asset": "AAA", "free": "0.0", "locked": "0"}]
+
+        def raise_2011(symbol):
+            raise BinanceAPIException("Unknown order sent", code=-2011) if "code" in BinanceAPIException.__init__.__code__.co_varnames else Exception()
+
+        # Construct real/stub -2011 BinanceAPIException compatibly whether real python-binance or stub is loaded
+        err_2011 = BinanceAPIException.__new__(BinanceAPIException)
+        err_2011.code = -2011
+        err_2011.message = "Unknown order sent"
+        Exception.__init__(err_2011, "APIError(code=-2011): Unknown order sent")
+        fc.cancel_open_orders = lambda symbol: (_ for _ in ()).throw(err_2011)
+
+        fc.orders = [
+            {"side": "SELL", "status": "FILLED", "orderListId": 7, "orderId": 21,
+             "updateTime": int(time.time() * 1000) + 1000, "executedQty": "1.0",
+             "cummulativeQuoteQty": "105.0", "type": "LIMIT_MAKER"},
+        ]
+        fc.get_order_list = lambda orderListId: {
+            "orderListId": orderListId, "listOrderStatus": "ALL_DONE", "orders": [{"orderId": 21}],
+        }
+
+        eng._close_position("AAAUSDT", pos, 95.0, "STOP_LOSS")
+        self.assertEqual(len(sell_calls), 0)
+        self.assertFalse(rm.has_position("AAAUSDT"))
+        self.assertEqual(len(nt.closed), 1)
+        self.assertAlmostEqual(read_json(cfg.TRADE_LOG_FILE)[-1]["exit_price"], 105.0)
+
+    def test_n2_sync_oco_reconciles_partial_fill_and_replaces_only_remainder(self):
+        from binance.exceptions import BinanceAPIException
+        bot, fc, conn, rm, nt, eng, cfg = self._live_stack()
+        pos = rm.open_position("AAAUSDT", 100.0, 1.0, kind="scanner", atr_value=1.0, entry_score=80,
+                               details={"oco_order_list_id": 7, "oco_needs_sync": True})
+        pos.stop_loss = 100.3
+        pos.take_profit = 110.0
+        fc.price = 103.0
+        fc.balances = [{"asset": "USDT", "free": "163", "locked": "0"},
+                       {"asset": "AAA", "free": "5.0", "locked": "0"}]
+
+        err_2011 = BinanceAPIException.__new__(BinanceAPIException)
+        err_2011.code = -2011
+        err_2011.message = "Unknown order sent"
+        Exception.__init__(err_2011, "APIError(code=-2011): Unknown order sent")
+        fc.cancel_open_orders = lambda symbol: (_ for _ in ()).throw(err_2011)
+
+        fc.orders = [
+            {"side": "SELL", "status": "FILLED", "orderListId": 7, "orderId": 22,
+             "updateTime": int(time.time() * 1000) + 1000, "executedQty": "0.6",
+             "cummulativeQuoteQty": "63.0", "type": "LIMIT_MAKER"},
+        ]
+        fc.get_order_list = lambda orderListId: {
+            "orderListId": orderListId, "listOrderStatus": "ALL_DONE", "orders": [{"orderId": 22}],
+        }
+
+        eng._sync_oco_stop("AAAUSDT", pos, 103.0)
+        self.assertTrue(rm.has_position("AAAUSDT"))
+        self.assertAlmostEqual(rm.get_position("AAAUSDT").quantity, 0.4, places=6)
+        self.assertEqual(len(fc.oco_calls), 1)
+        self.assertAlmostEqual(float(fc.oco_calls[0]["quantity"]), 0.4, places=6)
+
+    def test_n2_close_refuses_phantom_sell_when_free_balance_is_zero(self):
+        bot, fc, conn, rm, nt, eng, cfg = self._live_stack()
+        pos = rm.open_position("AAAUSDT", 100.0, 1.0, kind="scanner", atr_value=1.0, entry_score=80)
+        fc.balances = [{"asset": "USDT", "free": "100", "locked": "0"},
+                       {"asset": "AAA", "free": "0.0", "locked": "0"}]
+        sell_calls = []
+        fc.order_market_sell = lambda **kw: sell_calls.append(kw)
+
+        eng._close_position("AAAUSDT", pos, 95.0, "STOP_LOSS")
+        self.assertEqual(len(sell_calls), 0)
+        self.assertTrue(rm.has_position("AAAUSDT"))
+        self.assertGreater(len(nt.alerts), 0)
+
+    def test_n3_n5_n9_n10_exchange_hardening(self):
+        from binance.exceptions import BinanceAPIException
+        bot, fc, conn, rm, nt, eng, cfg = self._live_stack()
+
+        # N3: stopPrice triggers at SL (9.50) and stopLimitPrice sits below it (9.42 at 0.8% offset)
+        conn.create_oco_sell("AAAUSDT", 1.0, 11.0, 9.50)
+        self.assertEqual(len(fc.oco_calls), 1)
+        self.assertAlmostEqual(float(fc.oco_calls[0]["stopPrice"]), 9.50, places=2)
+        self.assertAlmostEqual(float(fc.oco_calls[0]["stopLimitPrice"]), 9.42, places=2)
+
+        # N9: market_sell below minQty must never escalate to selling unrelated free balance
+        sell_calls = []
+        fc.balances = [{"asset": "USDT", "free": "100", "locked": "0"},
+                       {"asset": "ZZZ", "free": "5.0", "locked": "0"}]
+        conn._info_cache["ZZZUSDT"] = {
+            "filters": [
+                {"filterType": "LOT_SIZE", "stepSize": "0.0001", "minQty": "0.001"},
+                {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+            ]
+        }
+        fc.order_market_sell = lambda **kw: sell_calls.append(kw)
+        self.assertIsNone(conn.market_sell("ZZZUSDT", 0.0005))
+        self.assertTrue(conn.last_order_confirmed_unsent)
+        self.assertEqual(len(sell_calls), 0)
+
+        # N5: get_portfolio_value uses fallback price instead of dropping position value to 0
+        fc.get_symbol_ticker = lambda symbol: (_ for _ in ()).throw(RuntimeError("ticker timeout"))
+        val = conn.get_portfolio_value(symbols=["AAAUSDT"], quantities={"AAAUSDT": 2.0}, fallback_prices={"AAAUSDT": 50.0})
+        self.assertAlmostEqual(val, 200.0, places=2)
+
+        # N10: -1021 in _retry re-syncs server time before retrying
+        err_1021 = BinanceAPIException.__new__(BinanceAPIException)
+        err_1021.code = -1021
+        err_1021.message = "Timestamp outside recvWindow"
+        Exception.__init__(err_1021, "APIError(code=-1021): Timestamp outside recvWindow")
+        attempts = {"n": 0}
+        def flaky_time_fn():
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise err_1021
+            return "ok"
+        fc.get_server_time = lambda: {"serverTime": int(time.time() * 1000) + 2500}
+        res = conn._retry(flaky_time_fn)
+        self.assertEqual(res, "ok")
+        self.assertGreater(abs(fc.timestamp_offset), 1500)
+
+    def test_n6_n7_n8_s1_operational_hardening(self):
+        from scanner import ScanResult
+        from scan_logger import update_forward_returns, MAX_SCAN_LOG_LINES
+        import scan_logger
+
+        bot, fc, conn, rm, nt, eng, cfg = self._live_stack(MAX_DAILY_LOSS=5.0, MAX_SIGNAL_AGE_SEC=480)
+
+        # N7: COOLDOWN_AFTER_SL_SEC (43200s) persisted across ScannerEngine restarts
+        eng._record_cooldown("AAAUSDT", "STOP_LOSS")
+        saved_cd = read_json("scanner_state.json").get("symbol_cooldowns", {})
+        self.assertIn("AAAUSDT", saved_cd)
+        self.assertGreater(saved_cd["AAAUSDT"] - time.time(), 40000)
+        eng2 = bot.ScannerEngine(conn, rm, nt)
+        self.assertIn("AAAUSDT", eng2._symbol_cooldowns)
+
+        # N6: Circuit breaker notifies once per UTC day instead of every scan tick
+        rm._daily_start_bal = 1000.0
+        fc.balances = [{"asset": "USDT", "free": "900", "locked": "0"}]  # 10% loss >= 5%
+        eng._scan_tick()
+        eng._scan_tick()
+        self.assertEqual(len(nt.alerts), 1)
+
+        # S1: Stale 15m signal (closed > 480s ago) is rejected before ordering
+        stale_open = int(time.time()) - (900 + 600)  # closed 600s ago
+        stale_res = ScanResult(
+            symbol="BBBUSDT", score=88.0, raw_score=85.0, pump_penalty=0.0,
+            ema_score=25.0, rsi_score=25.0, vol_score=25.0, breakout_score=8.0, ob_score=5.0,
+            close_price=20.0, rsi=18.0, volume_ratio=2.5, breakout_atr_ratio=0.0,
+            bid_ask_ratio=1.4, atr=0.5, pct_change_24h=-5.0,
+            reason="CAPITULATION", last_closed_time=stale_open, timeframe="15m",
+        )
+        fresh_open = int(time.time()) - (900 + 10)   # closed 10s ago
+        fresh_res = ScanResult(
+            symbol="BBBUSDT", score=88.0, raw_score=85.0, pump_penalty=0.0,
+            ema_score=25.0, rsi_score=25.0, vol_score=25.0, breakout_score=8.0, ob_score=5.0,
+            close_price=20.0, rsi=18.0, volume_ratio=2.5, breakout_atr_ratio=0.0,
+            bid_ask_ratio=1.4, atr=0.5, pct_change_24h=-5.0,
+            reason="CAPITULATION", last_closed_time=fresh_open, timeframe="15m",
+        )
+        self.assertTrue(eng._is_signal_stale(stale_res))
+        self.assertFalse(eng._is_signal_stale(fresh_res))
+
+        # N8: scan_logger trims scan_history.jsonl to MAX_SCAN_LOG_LINES
+        orig_log_path = scan_logger.SCAN_LOG_FILE
+        try:
+            tmp_log = orig_log_path.__class__(os.path.join(self.tmp, "scan_history.jsonl"))
+            scan_logger.SCAN_LOG_FILE = tmp_log
+            with open(tmp_log, "w", encoding="utf-8") as f:
+                for idx in range(MAX_SCAN_LOG_LINES + 50):
+                    f.write(json.dumps({"ts": time.time(), "symbol": "AAAUSDT", "price_at_scan": 100.0, "seq": idx}) + "\n")
+            update_forward_returns(conn)
+            with open(tmp_log, "r", encoding="utf-8") as f:
+                lines = [ln for ln in f if ln.strip()]
+            self.assertEqual(len(lines), MAX_SCAN_LOG_LINES)
+            self.assertEqual(json.loads(lines[0])["seq"], 50)
+        finally:
+            scan_logger.SCAN_LOG_FILE = orig_log_path
 
 
 if __name__ == "__main__":

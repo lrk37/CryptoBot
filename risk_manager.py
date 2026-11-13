@@ -140,6 +140,7 @@ class RiskManager:
         self.exchange = None
         self._consecutive_losses = 0
         self._loss_halt_until = 0
+        self._applied_loss_fill_ids: List[str] = []
         self._trade_log: List[dict] = []
 
         self._load_trade_log()
@@ -151,13 +152,43 @@ class RiskManager:
         self.exchange = exchange
 
     def validate_positions(self, exchange):
-        """Validate persisted positions against actual Binance holdings."""
+        """Validate persisted positions against actual Binance holdings without deleting active exits/partial fills."""
         cleaned = 0
         with self._lock:
             stale = []
             for symbol, pos in list(self._positions.items()):
+                dt = pos.details or {}
+                if dt.get('pending_sell_client_oid'):
+                    log.info(
+                        f"[CLEANUP] Deferring validation for {symbol}: "
+                        f"pending sell {dt.get('pending_sell_client_oid')} active"
+                    )
+                    continue
+                if dt.get('oco_order_list_id') is not None:
+                    log.info(
+                        f"[CLEANUP] Deferring validation for {symbol}: "
+                        f"exchange OCO {dt.get('oco_order_list_id')} linked"
+                    )
+                    continue
                 try:
                     if not exchange.verify_asset_holding(symbol, pos.quantity):
+                        total_held = exchange.get_asset_total(symbol) if hasattr(exchange, 'get_asset_total') else 0.0
+                        if total_held > 0:
+                            try:
+                                px = exchange.get_price(symbol)
+                            except Exception:
+                                px = pos.entry_price
+                            sellable = (
+                                exchange.is_sellable_qty(symbol, total_held, px)
+                                if hasattr(exchange, 'is_sellable_qty')
+                                else True
+                            )
+                            if sellable:
+                                log.warning(
+                                    f"[CLEANUP] {symbol} holds reduced sellable balance ({total_held} vs expected {pos.quantity}); "
+                                    f"preserving position so monitor can protect/reconcile it."
+                                )
+                                continue
                         log.warning(f"[CLEANUP] Stale position found: {symbol} (expected {pos.quantity}, not held) - removing")
                         stale.append(symbol)
                 except Exception as e:
@@ -224,6 +255,7 @@ class RiskManager:
 
             prev_losses = self._consecutive_losses
             prev_halt = self._loss_halt_until
+            prev_applied_ids = list(self._applied_loss_fill_ids)
             eff_qty = float(executed_qty) if (executed_qty is not None and executed_qty > 0) else pos.quantity
             closed_slice = Position(
                 symbol=pos.symbol, entry_price=pos.entry_price, quantity=eff_qty,
@@ -244,36 +276,46 @@ class RiskManager:
             already_in_applied = bool(
                 fill_id and fill_id in (pos.details or {}).get('applied_sell_ids', [])
             )
+            already_in_loss_state = bool(
+                fill_id and fill_id in self._applied_loss_fill_ids
+            )
 
             if exit_price > 0 and not already_logged and not already_in_applied:
-                pnl = closed_slice.pnl_pct(exit_price)
-                # F-20: Account for round-trip fees when determining if trade is a net loss
-                fees_pct = getattr(self.cfg, 'ROUND_TRIP_FEE_PCT', 0.2)
-                is_loss = pnl < fees_pct or 'SL' in exit_reason or 'Stop-Loss' in exit_reason
-                if is_loss:
-                    self._consecutive_losses += 1
-                    max_consec = getattr(self.cfg, 'MAX_CONSECUTIVE_LOSSES', 2)
-                    if self._consecutive_losses >= max_consec:
-                        cooldown = getattr(self.cfg, 'CONSECUTIVE_LOSS_COOLDOWN_SEC', 1800)
-                        self._loss_halt_until = time.time() + cooldown
-                        log.error(f"[CONSECUTIVE LOSSES] {self._consecutive_losses} losses in a row - pausing {cooldown}s")
-                else:
-                    self._consecutive_losses = 0
+                if not already_in_loss_state:
+                    pnl = closed_slice.pnl_pct(exit_price)
+                    # F-20: Account for round-trip fees when determining if trade is a net loss
+                    fees_pct = getattr(self.cfg, 'ROUND_TRIP_FEE_PCT', 0.2)
+                    is_loss = pnl < fees_pct or 'SL' in exit_reason or 'Stop-Loss' in exit_reason
+                    if is_loss:
+                        self._consecutive_losses += 1
+                        max_consec = getattr(self.cfg, 'MAX_CONSECUTIVE_LOSSES', 2)
+                        if self._consecutive_losses >= max_consec:
+                            cooldown = getattr(self.cfg, 'CONSECUTIVE_LOSS_COOLDOWN_SEC', 1800)
+                            self._loss_halt_until = time.time() + cooldown
+                            log.error(f"[CONSECUTIVE LOSSES] {self._consecutive_losses} losses in a row - pausing {cooldown}s")
+                    else:
+                        self._consecutive_losses = 0
 
-                if not self._save_loss_state():
-                    self._consecutive_losses = prev_losses
-                    self._loss_halt_until = prev_halt
-                    self._exiting_symbols.discard(symbol)
-                    log.error(
-                        f"[CLOSE PERSIST ERROR] Failed saving loss_state.json for {symbol}; "
-                        f"preserving position record until retry."
-                    )
-                    return False
+                    if fill_id:
+                        self._applied_loss_fill_ids = (self._applied_loss_fill_ids + [fill_id])[-200:]
+
+                    if not self._save_loss_state():
+                        self._consecutive_losses = prev_losses
+                        self._loss_halt_until = prev_halt
+                        self._applied_loss_fill_ids = prev_applied_ids
+                        self._exiting_symbols.discard(symbol)
+                        log.error(
+                            f"[CLOSE PERSIST ERROR] Failed saving loss_state.json for {symbol}; "
+                            f"preserving position record until retry."
+                        )
+                        return False
 
                 if not self._log_trade(closed_slice, exit_price, exit_reason, fill_id=fill_id):
-                    self._consecutive_losses = prev_losses
-                    self._loss_halt_until = prev_halt
-                    self._save_loss_state()
+                    if not already_in_loss_state:
+                        self._consecutive_losses = prev_losses
+                        self._loss_halt_until = prev_halt
+                        self._applied_loss_fill_ids = prev_applied_ids
+                        self._save_loss_state()
                     self._exiting_symbols.discard(symbol)
                     log.error(
                         f"[CLOSE PERSIST ERROR] Failed saving trade_log.json for {symbol}; "
@@ -594,7 +636,8 @@ class RiskManager:
                 'losses': self._consecutive_losses,
                 'halt_until': self._loss_halt_until,
                 'daily_start_bal': self._daily_start_bal,
-                'today': str(self._today)
+                'today': str(self._today),
+                'applied_fill_ids': list(self._applied_loss_fill_ids[-200:]),
             }
             tmp_fn = 'loss_state.json.tmp'
             with open(tmp_fn, 'w') as f:
@@ -612,6 +655,8 @@ class RiskManager:
                     data = json.load(f)
                     self._consecutive_losses = data.get('losses', 0)
                     self._loss_halt_until = data.get('halt_until', 0)
+                    applied = data.get('applied_fill_ids') or []
+                    self._applied_loss_fill_ids = [str(x) for x in applied if x][-200:]
                     # F-19: Restore daily start balance if still same day
                     saved_today = data.get('today', '')
                     utc_today = datetime.now(timezone.utc).date()

@@ -85,7 +85,7 @@ Simulating the live Dual-Timeframe mode (`--interval 15m`: `1h` signals on `BTC`
 - **Portfolio Net Return:** **`+1.24%`** (`+$12.40` -> `$1,012.40` final equity; note `$100` / trade = `10%` position sizing)
 - **Mark-to-Market Max Drawdown:** **`1.24%`** (vs `0.89%` realized-only)
 
-> *Note: OHLCV backtests omit live L2 spread (`<= 0.25%`), order-book depth imbalance, and cross-pair BTC `1h EMA200` filtering.*
+> *Note: Backtests model closed-bar Dual-Timeframe entries and cross-pair BTC `1h EMA200` regime filtering; live L2 spread (`<= 0.25%`) and top-20 order-book depth imbalance are applied during live scanning.*
 
 ---
 
@@ -93,19 +93,19 @@ Simulating the live Dual-Timeframe mode (`--interval 15m`: `1h` signals on `BTC`
 
 | File | Purpose |
 |---|---|
-| `bot.py` | Main daemon entry point (`ScannerEngine`: 5-minute market scan thread + 30-second position monitor thread). |
-| `scanner.py` | Dual-Timeframe (`15m` + `1h`) market scanner, closed-candle BTC `1h EMA200` regime filter (fail-closed), spread filter (`<= 0.25%`), and Capitulation scoring engine. |
-| `risk_manager.py` | Position tracking (`positions.json`), partial-fill reconciliation, ATR stop/TP computation, Break-Even lock, Trailing Stop, `EMA21` exit, and UTC circuit breakers. |
-| `exchange.py` | Binance Spot API connector (`python-binance`). Uses idempotent `newClientOrderId` order reconciliation (`NEW`/`PENDING_NEW`/`PARTIALLY_FILLED`/timeout recovery with remainder cancellation), `orderListId`-scoped OCO inspection, and live public market data for scanning on Testnet (`USE_TESTNET=True`). |
+| `bot.py` | Main daemon entry point (`ScannerEngine`: candle-aligned 5-minute market scan thread with stale-signal guard + 30-second position monitor thread, startup exit/OCO reconciliation before stale cleanup, persisted cooldowns, rotating logs, and deduplicated/throttled critical alerts). |
+| `scanner.py` | Dual-Timeframe (`15m` + `1h`) market scanner with `500`-candle EMA200 warmup, closed-candle BTC `1h EMA200` regime filter (fail-closed), spread filter (`<= 0.25%`), and Capitulation scoring engine. |
+| `risk_manager.py` | Position tracking (`positions.json`), partial-fill reconciliation, `applied_fill_ids` deduplication in `loss_state.json`, safe startup cleanup (never drops pending exits or OCO-protected remainders), ATR stop/TP computation, Break-Even lock, Trailing Stop, `EMA21` exit, and UTC circuit breakers. |
+| `exchange.py` | Binance Spot API connector (`python-binance`). Uses idempotent `newClientOrderId` order reconciliation (`NEW`/`PENDING_NEW`/`PARTIALLY_FILLED`/timeout recovery with remainder cancellation), `orderListId`-scoped OCO inspection, stop-limit slippage buffer (`0.8%` below stop trigger), `-1021` auto time-resync, fallback portfolio pricing, and live public market data for scanning on Testnet (`USE_TESTNET=True`). |
 | `config.py` | Central configuration file for strategy modes, timeframes, risk limits, and indicator parameters (defaults safely to `USE_TESTNET=True`). |
 | `notifier.py` | Telegram `MarkdownV2` notifications (includes DST-aware `Europe/Belgrade` `Opened`/`Closed` execution timestamps, `[15m]`/`[1h]` timeframe tag, estimated hold window, `%` and `USDT` P&L, and duration). |
 | `chart_logger.py` | Automatically saves dark-themed PNG candlestick/indicator charts (`Price`, `EMA9/21/50`, `Lower BB(20,2)`, `RSI`, `MACD`, `Entry/Exit/SL/TP`) to `charts/`. |
-| `scan_logger.py` | Logs top scan candidates and tracks empirical 1h/4h forward returns in `scan_logs.json`. |
+| `scan_logger.py` | Logs top scan candidates and tracks empirical 1h/4h forward returns in `scan_history.jsonl` (bounded to the latest 1,000 entries, updated after trade decisions). |
 | `check_perms.py` | Diagnostic CLI tool to verify Binance API keys, server time sync, Spot trading permissions, and account balances. |
-| `backtest.py` | Single-symbol and multi-symbol quantitative backtester with Monte Carlo random-entry baseline comparison. |
-| `validate.py` | Out-of-sample validation suite (`walk_forward`, `basket` with Mark-to-Market portfolio drawdown including exit-candle lows/MAE, `monte_carlo`, `slippage`). |
+| `backtest.py` | Single-symbol and multi-symbol quantitative backtester with optional closed-candle BTC `1h EMA200` regime gating and Monte Carlo random-entry baseline comparison. |
+| `validate.py` | Out-of-sample validation suite (`walk_forward`, `basket` with cross-pair BTC `1h EMA200` regime filtering and Mark-to-Market portfolio drawdown including exit-candle lows/MAE, `monte_carlo`, `slippage`). |
 | `experiment.py` | Gate 0 accounting & no-lookahead verification harness + Stage A strategy family comparison suite. |
-| `tests/test_patches.py` | 63 automated unit tests (run via `.github/workflows/ci.yml` on push/PR) covering fail-closed disk persistence for orders, positions, OCO IDs (cancelling/reconciling unpersisted OCOs), and full/partial sell finalization (idempotent `fill_id` deduplication across restarts), restart-safe `SUBMITTING` confirmation grace recovery, remainder cancellation on `PARTIALLY_FILLED`, `orderListId`-scoped OCO reconciliation, spread/regime filters, DST timestamps, dual-timeframe + `24h <= -1.5%` altcoin fallback routing, and MTM drawdown invariants. |
+| `tests/test_patches.py` | 72 automated unit tests (run via `.github/workflows/ci.yml` on push/PR) covering fail-closed disk persistence for orders, positions, OCO IDs (cancelling/reconciling unpersisted OCOs, auto re-sync on vanished OCOs), full/partial sell finalization (`applied_fill_ids` deduplication across `loss_state.json` and `trade_log.json`), OCO cancel `-2011` fill-race reconciliation, startup reconciliation before stale cleanup, stop-limit OCO buffer, `-1021` clock re-sync, fallback portfolio valuation, bounded `market_sell`, persisted SL cooldowns, single daily breaker alerts, stale-signal rejection, BTC `1h EMA200` backtest gating, DST timestamps, and MTM drawdown invariants. |
 | `deploy/` | `vps_setup.sh` (automated Ubuntu 22.04/24.04 installer) and `cryptobot.service` (`systemd` 24/7 background daemon config). |
 
 ---
@@ -120,7 +120,7 @@ python -m venv .venv
 # Linux / macOS:
 ./.venv/bin/pip install -r requirements.txt
 
-# 2. Run the 63 unit tests & Gate 0 accounting audit
+# 2. Run the 72 unit tests & Gate 0 accounting audit
 python -m unittest discover -s tests -v
 
 # 3. Run the 15-coin Dual-Timeframe basket validation (90 days)
