@@ -2114,6 +2114,85 @@ class TestHardeningRegressionSuite(InTempDir):
         finally:
             scan_logger.SCAN_LOG_FILE = orig_log_path
 
+    def test_oco_fill_saves_exit_chart_and_subcent_price_formatting(self):
+        import importlib.util
+        from notifier import TelegramNotifier
+
+        spec = importlib.util.spec_from_file_location("real_chart_logger", os.path.join(ROOT, "chart_logger.py"))
+        real_cl = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(real_cl)
+        _fmt_price = real_cl._fmt_price
+
+        # Dynamic price formatting for sub-cent coins (e.g. PEPEUSDT)
+        self.assertEqual(_fmt_price(0.00000456), "0.00000456")
+        self.assertEqual(_fmt_price(0.1202), "0.120200")
+        self.assertEqual(_fmt_price(67.47), "67.4700")
+
+        # TelegramNotifier.alert deduplicates leading warning emoji
+        sent_msgs = []
+        tn = TelegramNotifier(make_cfg(ENABLE_TELEGRAM=True, TELEGRAM_TOKEN="T", TELEGRAM_CHAT_ID="C"))
+        tn.send = lambda msg, parse_mode=None: (sent_msgs.append(msg), True)[1]
+        tn.alert("⚠️ Failed cancelling open OCO for ENAUSDT; close deferred until next tick.")
+        self.assertEqual(sent_msgs[-1], "⚠️ Failed cancelling open OCO for ENAUSDT; close deferred until next tick.")
+
+        # _process_oco_fill saves an exit chart snapshot when exchange OCO closes the position
+        bot, fc, conn, rm, nt, eng, cfg = self._live_stack()
+        conn.get_candles = lambda symbol, interval="15m", limit=100: make_series(1)
+        pos = rm.open_position("INJUSDT", 7.449, 2.68, kind="scanner", atr_value=0.08, entry_score=82,
+                               details={"oco_order_list_id": 55, "timeframe": "15m"})
+        chart_calls = []
+        orig_save = bot.save_trade_chart
+        bot.save_trade_chart = lambda *a, **k: chart_calls.append((a, k))
+        try:
+            outcome = eng._process_oco_fill(
+                "INJUSDT", pos, 55,
+                {"price": 7.602, "qty": 2.68, "type": "LIMIT_MAKER", "order_id": 901, "time": time.time()}
+            )
+            self.assertEqual(outcome, "FULL_CLOSED")
+            self.assertEqual(len(chart_calls), 1)
+            args, _ = chart_calls[0]
+            self.assertEqual(args[0], "INJUSDT")
+            self.assertAlmostEqual(args[2], 7.449, places=4)
+            self.assertAlmostEqual(args[3], 7.602, places=4)
+            self.assertEqual(args[6], "OCO_TAKE_PROFIT")
+        finally:
+            bot.save_trade_chart = orig_save
+
+    def test_monitor_defers_to_active_oco_inside_band_and_acts_on_breach(self):
+        bot, fc, conn, rm, nt, eng, cfg = self._live_stack(OCO_STOP_LIMIT_OFFSET_PCT=0.8)
+        pos = rm.open_position(
+            "ENAUSDT", 0.1202, 166.38, kind="scanner", atr_value=0.0015, entry_score=80,
+            details={"oco_order_list_id": 88, "oco_needs_sync": False},
+        )
+        pos.stop_loss = 0.113206
+        pos.take_profit = 0.123114
+        pos.details["oco_stop_loss"] = 0.113206
+        rm.persist_positions()
+
+        # OCO is still OPEN on Binance
+        fc.get_order_list = lambda orderListId: {
+            "orderListId": orderListId, "listOrderStatus": "EXECUTING",
+            "orders": [{"orderId": 1}, {"orderId": 2}],
+            "orderReports": [
+                {"orderId": 1, "side": "SELL", "status": "NEW", "executedQty": "0", "type": "STOP_LOSS_LIMIT"},
+                {"orderId": 2, "side": "SELL", "status": "NEW", "executedQty": "0", "type": "LIMIT_MAKER"},
+            ],
+        }
+        close_calls = []
+        eng._close_position = lambda *a, **k: close_calls.append(a)
+
+        # 1. Price at 0.113200 is inside [sl_floor=0.112300, sl=0.113206] -> defer to active OCO (no cancel race)
+        fc.price = 0.113200
+        eng._monitor_tick()
+        self.assertEqual(len(close_calls), 0)
+
+        # 2. Price breaches below OCO stopLimitPrice floor (0.111000 < 0.112300) while OCO still open -> emergency close
+        fc.price = 0.111000
+        eng._monitor_tick()
+        self.assertEqual(len(close_calls), 1)
+        self.assertEqual(close_calls[0][0], "ENAUSDT")
+        self.assertEqual(close_calls[0][3], "STOP_LOSS")
+
 
 if __name__ == "__main__":
     unittest.main()

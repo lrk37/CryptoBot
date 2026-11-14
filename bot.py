@@ -683,6 +683,15 @@ class ScannerEngine:
             symbol, f"OCO_{reason}", pos.entry_price, exit_px, pnl_pct,
             duration_sec=dur_sec, pnl_usdt=pnl_usdt, open_time=pos.open_time, close_time=fill_ts
         )
+        try:
+            tf = (pos.details or {}).get('timeframe', getattr(cfg, 'SCANNER_INTERVAL', '15m'))
+            df = self.exchange.get_candles(symbol, interval=tf, limit=100)
+            save_trade_chart(
+                symbol, df, pos.entry_price, exit_px, pnl_pct, pnl_usdt,
+                f"OCO_{reason}", pos.stop_loss, pos.take_profit
+            )
+        except Exception as e:
+            log.warning(f"[CHART LOGGER] Exit chart failed: {e}")
         return 'FULL_CLOSED'
 
     def _check_position_oco_status(self, symbol: str, pos) -> bool:
@@ -778,6 +787,41 @@ class ScannerEngine:
             if pos and (pos.details or {}).get('oco_order_list_id') is not None:
                 self._check_position_oco_status(symbol, pos)
 
+    def _should_defer_exit_to_active_oco(self, symbol: str, pos, curr_price: float, action: str, prev_sl: float) -> bool:
+        """Return True when `action` is an SL/TP hit that is already covered by a synced active
+        exchange OCO within its execution band, avoiding cancel/market-sell races mid-trigger.
+        If price breaches below the OCO stopLimitPrice floor (or above the TP band) without the
+        OCO filling, returns False so the client-side emergency market sell executes."""
+        if not getattr(cfg, 'USE_EXCHANGE_OCO', True):
+            return False
+        details = pos.details or {}
+        oco_id = details.get('oco_order_list_id')
+        if oco_id is None or details.get('oco_needs_sync'):
+            return False
+
+        oco_sl = float(details.get('oco_stop_loss', 0.0) or 0.0)
+        if pos.stop_loss > prev_sl or (oco_sl > 0 and abs(pos.stop_loss - oco_sl) > 1e-9):
+            return False
+
+        offset_pct = float(getattr(cfg, 'OCO_STOP_LIMIT_OFFSET_PCT', 0.8) or 0.8)
+        if action == "STOP_LOSS":
+            sl_floor = pos.stop_loss * (1.0 - offset_pct / 100.0)
+            if curr_price >= sl_floor:
+                log.info(
+                    f"[MONITOR OCO ACTIVE] {symbol} price {curr_price:.6f} within OCO stop-limit band "
+                    f"[{sl_floor:.6f}, {pos.stop_loss:.6f}]; deferring to exchange OCO {oco_id}"
+                )
+                return True
+        elif action == "TAKE_PROFIT" and pos.take_profit > 0 and curr_price >= pos.take_profit:
+            tp_ceil = pos.take_profit * (1.0 + offset_pct / 100.0)
+            if curr_price <= tp_ceil:
+                log.info(
+                    f"[MONITOR OCO ACTIVE] {symbol} price {curr_price:.6f} at OCO take-profit "
+                    f"{pos.take_profit:.6f}; deferring to exchange OCO {oco_id}"
+                )
+                return True
+        return False
+
     def _monitor_tick(self):
         self._reconcile_pending_buys()
 
@@ -811,6 +855,8 @@ class ScannerEngine:
             prev_sl = pos.stop_loss
             action = self.risk_mgr.evaluate(pos, curr_price)
             if action != "HOLD":
+                if self._should_defer_exit_to_active_oco(symbol, pos, curr_price, action, prev_sl):
+                    continue
                 log.info(f"[MONITOR EXIT TRIGGERED] {symbol} -> {action} at {curr_price:.6f}")
                 self._close_position(symbol, pos, curr_price, action)
             elif getattr(cfg, 'USE_EXCHANGE_OCO', True):

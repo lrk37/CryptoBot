@@ -52,6 +52,23 @@ def _calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['macd_hist'] = df['macd'] - df['macd_signal']
     return df
 
+def _fmt_price(px: Optional[float]) -> str:
+    """Format price dynamically so sub-cent coins (e.g. PEPE at 0.00000456) never display as 0.0000."""
+    if px is None:
+        return "0.0000"
+    val = float(px)
+    abs_val = abs(val)
+    if abs_val == 0:
+        return "0.0000"
+    if abs_val >= 1.0:
+        return f"{val:.4f}"
+    if abs_val >= 0.01:
+        return f"{val:.6f}"
+    if abs_val >= 0.000001:
+        return f"{val:.8f}"
+    return f"{val:.10f}"
+
+
 def save_trade_chart(symbol: str, df: pd.DataFrame, entry_price: float, exit_price: float,
                      pnl_pct: float, pnl_usdt: float = 0.0, exit_reason: str = "",
                      stop_loss: Optional[float] = None, take_profit: Optional[float] = None,
@@ -80,13 +97,13 @@ def save_trade_chart(symbol: str, df: pd.DataFrame, entry_price: float, exit_pri
         ax1.plot(df_ind.index, df_ind['bb_low'], label='Lower BB(20,2)', color='#00FA9A', linewidth=1, linestyle='--')
         ax1.plot(df_ind.index, df_ind['high20'], label='20-bar High', color='#ADFF2F', linewidth=0.8, linestyle=':')
 
-        ax1.axhline(y=entry_price, color='#FFD700', linestyle='--', label=f'Entry: {entry_price:.4f}')
-        ax1.axhline(y=exit_price, color='#00BFFF', linestyle=':', label=f'Exit: {exit_price:.4f}')
+        ax1.axhline(y=entry_price, color='#FFD700', linestyle='--', label=f'Entry: {_fmt_price(entry_price)}')
+        ax1.axhline(y=exit_price, color='#00BFFF', linestyle=':', label=f'Exit: {_fmt_price(exit_price)}')
 
         if stop_loss:
-            ax1.axhline(y=stop_loss, color='#FF3333', linestyle='-.', label=f'SL: {stop_loss:.4f}')
+            ax1.axhline(y=stop_loss, color='#FF3333', linestyle='-.', label=f'SL: {_fmt_price(stop_loss)}')
         if take_profit:
-            ax1.axhline(y=take_profit, color='#33FF33', linestyle='-.', label=f'TP: {take_profit:.4f}')
+            ax1.axhline(y=take_profit, color='#33FF33', linestyle='-.', label=f'TP: {_fmt_price(take_profit)}')
 
         ax1.set_ylabel('Price (USDT)')
         ax1.legend(loc='upper left', fontsize=8, framealpha=0.3)

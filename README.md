@@ -51,7 +51,7 @@ All indicators are computed strictly on the **last closed candle (`iloc[-2]`)** 
 ### C. Dynamic 3-Stage Exit Engine (`risk_manager.py`)
 Instead of using a tight `-1.5%` stop-loss that gets hunted by normal crypto wicks and a greedy `+6%` target that rarely hits, the bot manages risk dynamically across three stages:
 1. **Stage 1 — Wide Initial Catastrophe Bracket + Exchange OCO:**
-   - Places an ATR-scaled catastrophe Stop-Loss (`4.8x ATR`, clamped to `1.5%–7.0%`) and Take-Profit (`2.0x ATR`, floored at `1.8%`) directly on Binance's matching engine via a native **OCO (One-Cancels-the-Other)** order (`USE_EXCHANGE_OCO = True`). Even if your server loses internet, your position is protected on Binance.
+   - Places an ATR-scaled catastrophe Stop-Loss (`4.8x ATR`, clamped to `1.5%–5.0%`) and Take-Profit (`2.0x ATR`, floored at `1.8%`) directly on Binance's matching engine via a native **OCO (One-Cancels-the-Other)** order (`USE_EXCHANGE_OCO = True`). Even if your server loses internet, your position is protected on Binance.
 2. **Stage 2 — Fast Risk Elimination (Break-Even & Trailing Stop):**
    - **Trailing Stop (`+1.8%` effective trigger, `0.7%` offset):** Once profit reaches `+1.8%` (`MIN_TRAILING_PROFIT_PCT + ROUND_TRIP_FEE_PCT`), a tight `0.7%` trailing stop arms to follow the rebound upward.
    - **Break-Even Lock (`+2.2%` trigger + OCO Sync):** Once profit reaches `+2.2%`, the Stop-Loss floor is automatically raised above your entry price (`entry * 1.003`, covering `0.20%` round-trip fees plus a `0.10%` slippage allowance) and **synchronized with your exchange-side OCO order on Binance**.
@@ -76,14 +76,14 @@ Tested across the 15-coin liquid basket (`BTC`, `ETH`, `BNB`, `SOL`, `XRP`, `ADA
 |---|---|---|
 | **Profitable Coins in Basket** | `0 / 15` (`0%`) | **`14 / 15` (`93%` — `BROAD EDGE ✓`)** |
 | **Overall Win Rate** | `18% – 28%` | **`84.5%` (`82` Wins / `15` Losses across `97` trades)** |
-| **Pooled Profit Factor** | `0.34` | **`3.05` (`+$73.75` unconstrained net P&L)** |
+| **Pooled Profit Factor** | `0.34` | **`3.22` (`+$75.74` unconstrained net P&L)** |
 | **Median Expectancy / Trade** | `-1.12%` | **`+0.87%` net per trade** |
 
 ### B. Shared-Capital Portfolio Simulation (`MAX_OPEN_TRADES = 1`, `$1,000` Capital, `$100` / Trade)
 Simulating the live Dual-Timeframe mode (`--interval 15m`: `1h` signals on `BTC`/`ETH`/`SOL`/`XRP`, `15m + 1h` fallback on altcoins) with the 1-position-at-a-time constraint chronologically across all 15 coins and bar-by-bar Mark-to-Market drawdown accounting ([`validation_results/basket_15m_90d.json`](validation_results/basket_15m_90d.json)):
 - **Trades Executed:** `33` taken (`64` concurrent signals skipped due to `MAX_OPEN_TRADES = 1`)
-- **Portfolio Net Return:** **`+1.24%`** (`+$12.40` -> `$1,012.40` final equity; note `$100` / trade = `10%` position sizing)
-- **Mark-to-Market Max Drawdown:** **`1.24%`** (vs `0.89%` realized-only)
+- **Portfolio Net Return:** **`+1.44%`** (`+$14.39` -> `$1,014.39` final equity; note `$100` / trade = `10%` position sizing)
+- **Mark-to-Market Max Drawdown:** **`1.04%`**
 
 > *Note: Backtests model closed-bar Dual-Timeframe entries and cross-pair BTC `1h EMA200` regime filtering; live L2 spread (`<= 0.25%`) and top-20 order-book depth imbalance are applied during live scanning.*
 
@@ -105,7 +105,7 @@ Simulating the live Dual-Timeframe mode (`--interval 15m`: `1h` signals on `BTC`
 | `backtest.py` | Single-symbol and multi-symbol quantitative backtester with optional closed-candle BTC `1h EMA200` regime gating and Monte Carlo random-entry baseline comparison. |
 | `validate.py` | Out-of-sample validation suite (`walk_forward`, `basket` with cross-pair BTC `1h EMA200` regime filtering and Mark-to-Market portfolio drawdown including exit-candle lows/MAE, `monte_carlo`, `slippage`). |
 | `experiment.py` | Gate 0 accounting & no-lookahead verification harness + Stage A strategy family comparison suite. |
-| `tests/test_patches.py` | 72 automated unit tests (run via `.github/workflows/ci.yml` on push/PR) covering fail-closed disk persistence for orders, positions, OCO IDs (cancelling/reconciling unpersisted OCOs, auto re-sync on vanished OCOs), full/partial sell finalization (`applied_fill_ids` deduplication across `loss_state.json` and `trade_log.json`), OCO cancel `-2011` fill-race reconciliation, startup reconciliation before stale cleanup, stop-limit OCO buffer, `-1021` clock re-sync, fallback portfolio valuation, bounded `market_sell`, persisted SL cooldowns, single daily breaker alerts, stale-signal rejection, BTC `1h EMA200` backtest gating, DST timestamps, and MTM drawdown invariants. |
+| `tests/test_patches.py` | 74 automated unit tests (run via `.github/workflows/ci.yml` on push/PR) covering fail-closed disk persistence for orders, positions, OCO IDs (cancelling/reconciling unpersisted OCOs, auto re-sync on vanished OCOs), full/partial sell finalization (`applied_fill_ids` deduplication across `loss_state.json` and `trade_log.json`), OCO cancel `-2011` fill-race reconciliation, active-OCO execution band deferral, OCO exit chart generation, dynamic sub-cent chart formatting, startup reconciliation before stale cleanup, stop-limit OCO buffer, `-1021` clock re-sync, fallback portfolio valuation, bounded `market_sell`, persisted SL cooldowns, single daily breaker alerts, stale-signal rejection, BTC `1h EMA200` backtest gating, DST timestamps, and MTM drawdown invariants. |
 | `deploy/` | `vps_setup.sh` (automated Ubuntu 22.04/24.04 installer) and `cryptobot.service` (`systemd` 24/7 background daemon config). |
 
 ---
@@ -120,7 +120,7 @@ python -m venv .venv
 # Linux / macOS:
 ./.venv/bin/pip install -r requirements.txt
 
-# 2. Run the 72 unit tests & Gate 0 accounting audit
+# 2. Run the 74 unit tests & Gate 0 accounting audit
 python -m unittest discover -s tests -v
 
 # 3. Run the 15-coin Dual-Timeframe basket validation (90 days)

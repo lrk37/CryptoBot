@@ -105,7 +105,10 @@ class TelegramNotifier:
         self.send(msg, parse_mode='MarkdownV2')
 
     def alert(self, msg):
-        return self.send(f"⚠️ {msg}")
+        text = str(msg).lstrip()
+        if text.startswith("⚠️"):
+            text = text.removeprefix("⚠️").lstrip()
+        return self.send(f"⚠️ {text}")
 
     def error(self, msg):
         return self.send(f"🚨 *CRITICAL ERROR*:\n{msg}")
