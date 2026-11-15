@@ -2201,6 +2201,85 @@ class TestHardeningRegressionSuite(InTempDir):
         self.assertEqual(close_calls[0][0], "ENAUSDT")
         self.assertEqual(close_calls[0][3], "STOP_LOSS")
 
+    def test_python_binance_client_cancel_open_orders_and_get_order_list(self):
+        """Real python-binance 1.0.19 Client has _delete('openOrders') and _get('orderList')
+        instead of cancel_open_orders() or get_order_list(). Verify BinanceConnector supports both.
+        """
+        delete_calls = []
+        get_calls = []
+
+        class RealStyleBinanceClient:
+            def get_server_time(self):
+                return {"serverTime": int(time.time() * 1000)}
+
+            def _delete(self, path, signed=False, **kwargs):
+                delete_calls.append((path, signed, kwargs))
+                return [{"symbol": "SOLUSDT", "orderId": 101, "status": "CANCELED"}]
+
+            def _get(self, path, signed=False, **kwargs):
+                get_calls.append((path, signed, kwargs))
+                if path == "orderList":
+                    return {
+                        "orderListId": 555,
+                        "listOrderStatus": "ALL_DONE",
+                        "orders": [{"symbol": "SOLUSDT", "orderId": 101}, {"symbol": "SOLUSDT", "orderId": 102}],
+                        "orderReports": [
+                            {
+                                "symbol": "SOLUSDT",
+                                "orderId": 101,
+                                "orderListId": 555,
+                                "type": "LIMIT_MAKER",
+                                "status": "FILLED",
+                                "price": "72.090000",
+                                "origQty": "0.286",
+                                "executedQty": "0.286",
+                                "cummulativeQuoteQty": str(72.09 * 0.286),
+                            },
+                            {
+                                "symbol": "SOLUSDT",
+                                "orderId": 102,
+                                "orderListId": 555,
+                                "type": "STOP_LOSS_LIMIT",
+                                "status": "EXPIRED",
+                                "price": "64.4413",
+                                "stopPrice": "64.8303",
+                                "origQty": "0.286",
+                                "executedQty": "0.0",
+                                "cummulativeQuoteQty": "0.0",
+                            },
+                        ],
+                    }
+                return {}
+
+            def get_open_orders(self, symbol=None):
+                return []
+
+            def get_all_orders(self, symbol=None, limit=20):
+                return []
+
+        bot, fc, conn, rm, nt, eng, cfg = self._live_stack()
+        conn.client = RealStyleBinanceClient()
+
+        self.assertFalse(hasattr(conn.client, "cancel_open_orders"))
+        self.assertFalse(hasattr(conn.client, "get_order_list"))
+
+        ok = conn.cancel_open_orders("SOLUSDT")
+        self.assertTrue(ok)
+        self.assertEqual(len(delete_calls), 1)
+        self.assertEqual(delete_calls[0][0], "openOrders")
+        self.assertTrue(delete_calls[0][1])
+        self.assertEqual(delete_calls[0][2].get("data"), {"symbol": "SOLUSDT"})
+
+        fill = conn.get_oco_fill("SOLUSDT", order_list_id=555)
+        self.assertIsNotNone(fill)
+        self.assertEqual(fill["status"], "FILLED")
+        self.assertEqual(fill["type"], "LIMIT_MAKER")
+        self.assertAlmostEqual(fill["price"], 72.09, places=4)
+        self.assertEqual(len(get_calls), 1)
+        self.assertEqual(get_calls[0][0], "orderList")
+        self.assertTrue(get_calls[0][1])
+        self.assertEqual(get_calls[0][2].get("data"), {"orderListId": 555})
+
 
 if __name__ == "__main__":
     unittest.main()

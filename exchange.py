@@ -656,7 +656,20 @@ class BinanceConnector:
         Returns True if open orders were cancelled (or none existed), False on API failure.
         """
         try:
-            self._retry(self.client.cancel_open_orders, symbol=symbol)
+            if hasattr(self.client, 'cancel_open_orders'):
+                self._retry(self.client.cancel_open_orders, symbol=symbol)
+            elif hasattr(self.client, '_delete'):
+                self._retry(self.client._delete, 'openOrders', True, data={'symbol': symbol})
+            else:
+                open_orders = self._retry(self.client.get_open_orders, symbol=symbol) or []
+                for o in open_orders:
+                    oid = o.get('orderId')
+                    if oid is not None:
+                        try:
+                            self._retry(self.client.cancel_order, symbol=symbol, orderId=oid)
+                        except BinanceAPIException as ce:
+                            if getattr(ce, 'code', None) != -2011:
+                                raise
             log.info(f"[ORDERS] Cancelled open orders for {symbol}")
             return True
         except BinanceAPIException as e:
@@ -739,9 +752,12 @@ class BinanceConnector:
         list_status = ''
         had_api_success = False
 
-        if hasattr(self.client, 'get_order_list'):
+        if hasattr(self.client, 'get_order_list') or hasattr(self.client, '_get'):
             try:
-                ol = self._retry(self.client.get_order_list, orderListId=target_lid)
+                if hasattr(self.client, 'get_order_list'):
+                    ol = self._retry(self.client.get_order_list, orderListId=target_lid)
+                else:
+                    ol = self._retry(self.client._get, 'orderList', True, data={'orderListId': target_lid})
                 had_api_success = True
                 if isinstance(ol, dict):
                     list_status = str(ol.get('listOrderStatus', '')).upper()
