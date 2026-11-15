@@ -2181,12 +2181,20 @@ class TestHardeningRegressionSuite(InTempDir):
         close_calls = []
         eng._close_position = lambda *a, **k: close_calls.append(a)
 
-        # 1. Price at 0.113200 is inside [sl_floor=0.112300, sl=0.113206] -> defer to active OCO (no cancel race)
+        # 1. Price at 0.113200 is inside [sl_floor=0.112300, sl=0.113206] -> defer on Tick 1 (no cancel race)
         fc.price = 0.113200
         eng._monitor_tick()
         self.assertEqual(len(close_calls), 0)
 
-        # 2. Price breaches below OCO stopLimitPrice floor (0.111000 < 0.112300) while OCO still open -> emergency close
+        # 2. If OCO is still stuck open on Tick 2 at 0.113200 -> falls back to client-side close
+        eng._monitor_tick()
+        self.assertEqual(len(close_calls), 1)
+        self.assertEqual(close_calls[0][0], "ENAUSDT")
+        self.assertEqual(close_calls[0][3], "STOP_LOSS")
+
+        # 3. Price breaches below OCO stopLimitPrice floor (0.111000 < 0.112300) on Tick 1 -> immediate emergency close
+        close_calls.clear()
+        pos.details.pop("oco_band_defer_action", None)
         fc.price = 0.111000
         eng._monitor_tick()
         self.assertEqual(len(close_calls), 1)

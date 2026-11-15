@@ -788,13 +788,15 @@ class ScannerEngine:
                 self._check_position_oco_status(symbol, pos)
 
     def _should_defer_exit_to_active_oco(self, symbol: str, pos, curr_price: float, action: str, prev_sl: float) -> bool:
-        """Return True when `action` is an SL/TP hit that is already covered by a synced active
-        exchange OCO within its execution band, avoiding cancel/market-sell races mid-trigger.
-        If price breaches below the OCO stopLimitPrice floor (or above the TP band) without the
-        OCO filling, returns False so the client-side emergency market sell executes."""
+        """Return True on the FIRST monitor tick when `action` is an SL/TP hit already covered by
+        a synced active exchange OCO within its execution band, avoiding cancel/market-sell races
+        mid-trigger. If price breaches past the OCO stopLimitPrice floor (or if the OCO still has
+        not filled on the next monitor tick), returns False so the client-side market sell executes."""
         if not getattr(cfg, 'USE_EXCHANGE_OCO', True):
             return False
-        details = pos.details or {}
+        if pos.details is None:
+            pos.details = {}
+        details = pos.details
         oco_id = details.get('oco_order_list_id')
         if oco_id is None or details.get('oco_needs_sync'):
             return False
@@ -802,25 +804,39 @@ class ScannerEngine:
         oco_sl = float(details.get('oco_stop_loss', 0.0) or 0.0)
         if pos.stop_loss > prev_sl or (oco_sl > 0 and abs(pos.stop_loss - oco_sl) > 1e-9):
             return False
+        if action == "STOP_LOSS" and oco_sl <= 0 and float(getattr(pos, 'min_be_price', 0.0) or 0.0) > 0:
+            return False
 
         offset_pct = float(getattr(cfg, 'OCO_STOP_LIMIT_OFFSET_PCT', 0.8) or 0.8)
+        in_band = False
         if action == "STOP_LOSS":
             sl_floor = pos.stop_loss * (1.0 - offset_pct / 100.0)
             if curr_price >= sl_floor:
-                log.info(
-                    f"[MONITOR OCO ACTIVE] {symbol} price {curr_price:.6f} within OCO stop-limit band "
-                    f"[{sl_floor:.6f}, {pos.stop_loss:.6f}]; deferring to exchange OCO {oco_id}"
-                )
-                return True
+                in_band = True
         elif action == "TAKE_PROFIT" and pos.take_profit > 0 and curr_price >= pos.take_profit:
             tp_ceil = pos.take_profit * (1.0 + offset_pct / 100.0)
             if curr_price <= tp_ceil:
-                log.info(
-                    f"[MONITOR OCO ACTIVE] {symbol} price {curr_price:.6f} at OCO take-profit "
-                    f"{pos.take_profit:.6f}; deferring to exchange OCO {oco_id}"
-                )
-                return True
-        return False
+                in_band = True
+
+        if not in_band:
+            details.pop('oco_band_defer_action', None)
+            return False
+
+        # Defer at most once per consecutive band entry so a stuck/untriggered OCO never stalls exit
+        if details.get('oco_band_defer_action') == action:
+            details.pop('oco_band_defer_action', None)
+            log.warning(
+                f"[MONITOR OCO FALLBACK] {symbol} OCO {oco_id} still open on second tick at {action} "
+                f"({curr_price:.6f}); proceeding with client-side close"
+            )
+            return False
+
+        details['oco_band_defer_action'] = action
+        log.info(
+            f"[MONITOR OCO ACTIVE] {symbol} price {curr_price:.6f} within active OCO {oco_id} "
+            f"{action} band; deferring 1 tick to let exchange OCO fill"
+        )
+        return True
 
     def _monitor_tick(self):
         self._reconcile_pending_buys()
@@ -859,16 +875,19 @@ class ScannerEngine:
                     continue
                 log.info(f"[MONITOR EXIT TRIGGERED] {symbol} -> {action} at {curr_price:.6f}")
                 self._close_position(symbol, pos, curr_price, action)
-            elif getattr(cfg, 'USE_EXCHANGE_OCO', True):
-                oco_id = pos.details.get('oco_order_list_id')
-                oco_sl = float(pos.details.get('oco_stop_loss', 0.0) or 0.0)
-                stop_changed = (pos.stop_loss > prev_sl) or (
-                    oco_id is not None and oco_sl > 0 and abs(pos.stop_loss - oco_sl) > 1e-9
-                )
-                if stop_changed and (oco_id is not None or pos.details.get('oco_needs_sync')):
-                    pos.details['oco_needs_sync'] = True
-                if pos.details.get('oco_needs_sync'):
-                    self._sync_oco_stop(symbol, pos, curr_price)
+            else:
+                if pos.details:
+                    pos.details.pop('oco_band_defer_action', None)
+                if getattr(cfg, 'USE_EXCHANGE_OCO', True):
+                    oco_id = pos.details.get('oco_order_list_id')
+                    oco_sl = float(pos.details.get('oco_stop_loss', 0.0) or 0.0)
+                    stop_changed = (pos.stop_loss > prev_sl) or (
+                        oco_id is not None and oco_sl > 0 and abs(pos.stop_loss - oco_sl) > 1e-9
+                    )
+                    if stop_changed and (oco_id is not None or pos.details.get('oco_needs_sync')):
+                        pos.details['oco_needs_sync'] = True
+                    if pos.details.get('oco_needs_sync'):
+                        self._sync_oco_stop(symbol, pos, curr_price)
 
     def _record_or_rollback_oco(self, symbol: str, pos, oco, stop_loss_px: float, tag: str = "OCO") -> bool:
         """Persist a newly created OCO orderListId; if persistence fails, cancel the exchange OCO

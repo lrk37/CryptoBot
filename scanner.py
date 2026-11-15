@@ -248,40 +248,6 @@ class MarketScanner:
                     log.info(f"[SCANNER] {symbol} skipped - doji on last closed candle (body={body_ratio:.0%} < {doji_thresh:.0%})")
                     return None
 
-            # --- HARD BLOCK 3a: Bid-Ask Spread Filter ---
-            max_spread = getattr(self.cfg, 'MAX_SPREAD_PCT', 0.25)
-            if hasattr(self.exchange, 'get_spread_pct'):
-                try:
-                    spread_pct = float(self.exchange.get_spread_pct(symbol))
-                except Exception:
-                    spread_pct = 99.0
-                if spread_pct > max_spread:
-                    log.info(f"[SCANNER] {symbol} skipped - spread too wide ({spread_pct:.3f}% > {max_spread:.2f}%)")
-                    return None
-
-            # --- HARD BLOCK 3b: Orderbook ratio ---
-            min_ob = getattr(self.cfg, 'MIN_ORDERBOOK_RATIO', 0.70)
-            try:
-                ob_ratio = float(self.exchange.get_orderbook_imbalance(symbol, depth=10))
-            except Exception:
-                ob_ratio = 0.0
-            if ob_ratio < min_ob:
-                log.info(f"[SCANNER] {symbol} skipped - orderbook ratio ({ob_ratio:.2f} < {min_ob:.2f})")
-                return None
-
-            ob_score = 0.0
-            if ob_ratio >= 2.0:
-                ob_score = 10.0
-            elif ob_ratio >= 1.5:
-                ob_score = 8.0
-            elif ob_ratio >= 1.2:
-                ob_score = 6.0
-            elif ob_ratio >= 1.0:
-                ob_score = 3.0
-            if strategy_mode == 'capitulation':
-                # Cap orderbook bonus at +5 so Tier 2 (base 78 -> max 83) never crosses Tier 1 threshold (85)
-                ob_score = min(ob_score, 5.0)
-
             # Calculate ATR & Volatility
             tr = pd.concat([
                 high - low,
@@ -415,6 +381,66 @@ class MarketScanner:
                     else:
                         breakout_score = 10.0
                         reasons.append("Minor breakout")
+
+            # Fast-path: in capitulation mode, skip expensive L2 orderbook HTTP calls when candle
+            # cannot possibly reach tradeable threshold (max orderbook bonus is +5).
+            base_score = ema_score + rsi_score + vol_score + breakout_score + pump_penalty
+            if strategy_mode == 'capitulation' and base_score + 5.0 < 60.0:
+                return ScanResult(
+                    symbol=symbol,
+                    score=base_score,
+                    raw_score=ema_score + rsi_score + vol_score + breakout_score,
+                    pump_penalty=pump_penalty,
+                    reason=", ".join(reasons),
+                    close_price=curr_market_price,
+                    rsi=float(rsi),
+                    volume_ratio=float(vol_ratio),
+                    pct_change_24h=float(pct_24h),
+                    atr=float(atr_val) if not np.isnan(atr_val) else 0.0,
+                    breakout_atr_ratio=round(breakout_atr_ratio, 3),
+                    bid_ask_ratio=1.0,
+                    last_closed_time=last_closed_time,
+                    ema_score=ema_score,
+                    rsi_score=rsi_score,
+                    vol_score=vol_score,
+                    breakout_score=breakout_score,
+                    ob_score=0.0,
+                    timeframe=tf
+                )
+
+            # --- HARD BLOCK 3a: Bid-Ask Spread Filter (only queried for actual setup candidates) ---
+            max_spread = getattr(self.cfg, 'MAX_SPREAD_PCT', 0.25)
+            if hasattr(self.exchange, 'get_spread_pct'):
+                try:
+                    spread_pct = float(self.exchange.get_spread_pct(symbol))
+                except Exception:
+                    spread_pct = 99.0
+                if spread_pct > max_spread:
+                    log.info(f"[SCANNER] {symbol} skipped - spread too wide ({spread_pct:.3f}% > {max_spread:.2f}%)")
+                    return None
+
+            # --- HARD BLOCK 3b: Orderbook ratio ---
+            min_ob = getattr(self.cfg, 'MIN_ORDERBOOK_RATIO', 0.70)
+            try:
+                ob_ratio = float(self.exchange.get_orderbook_imbalance(symbol, depth=10))
+            except Exception:
+                ob_ratio = 0.0
+            if ob_ratio < min_ob:
+                log.info(f"[SCANNER] {symbol} skipped - orderbook ratio ({ob_ratio:.2f} < {min_ob:.2f})")
+                return None
+
+            ob_score = 0.0
+            if ob_ratio >= 2.0:
+                ob_score = 10.0
+            elif ob_ratio >= 1.5:
+                ob_score = 8.0
+            elif ob_ratio >= 1.2:
+                ob_score = 6.0
+            elif ob_ratio >= 1.0:
+                ob_score = 3.0
+            if strategy_mode == 'capitulation':
+                # Cap orderbook bonus at +5 so Tier 2 (base 78 -> max 83) never crosses Tier 1 threshold (85)
+                ob_score = min(ob_score, 5.0)
 
             # 5. Orderbook Boost
             if ob_score > 0:
