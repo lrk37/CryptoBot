@@ -95,8 +95,9 @@ MIN_ORDERBOOK_RATIO = 0.70
 PARABOLIC_PUMP_MAX_PCT = 25.0
 MAX_24H_DUMP_PCT = -18.0
 
-# Stablecoins & wrapped tokens excluded from scanning
+# Stablecoins, wrapped tokens & fee token (BNB) excluded from scanning
 SNIPE_BLACKLIST = [
+    'BNBUSDT',
     'USDCUSDT',
     'BUSDUSDT',
     'TUSDUSDT',
