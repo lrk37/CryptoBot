@@ -443,6 +443,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
 
 <script>
+function fmtPx(px) {
+  const v = Number(px || 0);
+  const a = Math.abs(v);
+  if (a === 0) return '0.0000';
+  if (a >= 1.0) return v.toFixed(4).replace(/\.?0+$/, '');
+  if (a >= 0.01) return v.toFixed(6).replace(/\.?0+$/, '');
+  return v.toFixed(8).replace(/\.?0+$/, '');
+}
+
 function fmtDur(sec) {
   sec = Math.max(0, Math.floor(sec || 0));
   if (sec < 60) return sec + 's';
@@ -535,11 +544,11 @@ async function refreshState() {
             <div class="${pCls}" style="font-size:1.25rem;font-weight:800;">${sign}${p.unrealized_pct.toFixed(2)}% (${sign}$${p.unrealized_usdt.toFixed(2)})</div>
           </div>
           <div class="pos-stats">
-            <div><span>Entry Price</span><b>${p.entry_price}</b></div>
-            <div><span>Live Price</span><b class="cyan">${p.live_price}</b></div>
+            <div><span>Entry Price</span><b>${fmtPx(p.entry_price)}</b></div>
+            <div><span>Live Price</span><b class="cyan">${fmtPx(p.live_price)}</b></div>
             <div><span>Position Size</span><b>$${p.notional_usdt.toFixed(2)} (${p.quantity})</b></div>
-            <div><span>Stop-Loss (OCO)</span><b class="neg">${p.stop_loss}</b></div>
-            <div><span>Take-Profit (OCO)</span><b class="pos">${p.take_profit}</b></div>
+            <div><span>Stop-Loss (OCO)</span><b class="neg">${fmtPx(p.stop_loss)}</b></div>
+            <div><span>Take-Profit (OCO)</span><b class="pos">${fmtPx(p.take_profit)}</b></div>
             <div><span>Time Held / Score</span><b>${fmtDur(p.held_sec)} (Score ${p.score})</b></div>
           </div>
           <div class="gauge-track">
@@ -547,9 +556,9 @@ async function refreshState() {
             <div class="gauge-fill" style="left:${p.progress_pct}%;" title="Live Price"></div>
           </div>
           <div class="gauge-labels">
-            <span>SL: ${p.stop_loss}</span>
-            <span>Entry: ${p.entry_price}</span>
-            <span>TP: ${p.take_profit}</span>
+            <span>SL: ${fmtPx(p.stop_loss)}</span>
+            <span>Entry: ${fmtPx(p.entry_price)}</span>
+            <span>TP: ${fmtPx(p.take_profit)}</span>
           </div>
         </div>`;
       }).join('');
@@ -571,7 +580,7 @@ async function refreshState() {
         return `<tr>
           <td style="color:var(--muted)">${ts}</td>
           <td><b>${t.symbol}</b></td>
-          <td>${t.entry_price} &rarr; ${t.exit_price}</td>
+          <td>${fmtPx(t.entry_price)} &rarr; ${fmtPx(t.exit_price)}</td>
           <td class="${cls}"><b>${netP >= 0 ? '+' : ''}${netP.toFixed(2)}% (${netU >= 0 ? '+$' : '-$'}${Math.abs(netU).toFixed(2)})</b></td>
           <td>${Number(t.final_score || 0).toFixed(0)}</td>
           <td><span class="pos">+${Number(t.mfe_pct || 0).toFixed(2)}%</span> / <span class="neg">${Number(t.mae_pct || 0).toFixed(2)}%</span></td>
