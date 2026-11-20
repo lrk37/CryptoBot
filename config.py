@@ -137,6 +137,7 @@ TRADE_LOG_FILE = 'trade_log.json'
 # --- 8. Telegram & Logging ---
 ENABLE_TELEGRAM = os.getenv('ENABLE_TELEGRAM', 'False').lower() in ('true', '1', 't')
 ENABLE_DAILY_HEARTBEAT = True    # Send once-daily Telegram status & expectancy summary
+TELEGRAM_SEND_CHARTS = True      # Automatically attach Entry/Exit PNG chart snapshots to Telegram
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 DISPLAY_TIMEZONE = os.getenv('DISPLAY_TIMEZONE', 'Europe/Belgrade')  # DST-aware CET/CEST (UTC+1/UTC+2)

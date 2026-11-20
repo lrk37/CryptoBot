@@ -465,10 +465,12 @@ class ScannerEngine:
             # Save chart snapshot on entry (fetch 100 bars so 50-bar chart has warmed-up indicators)
             try:
                 df = self.exchange.get_candles(symbol, interval=tf, limit=100)
-                save_trade_chart(
+                chart_path = save_trade_chart(
                     symbol, df, fill_price, fill_price, 0.0, 0.0,
                     "ENTRY", target_pos.stop_loss, target_pos.take_profit
                 )
+                if chart_path and hasattr(self.notifier, 'send_photo'):
+                    self.notifier.send_photo(chart_path, caption=f"📈 {symbol} [{tf}] — ENTRY @ {fill_price:.6g}")
             except Exception as e:
                 log.warning(f"[CHART LOGGER] Entry chart failed: {e}")
         return True
@@ -722,10 +724,15 @@ class ScannerEngine:
         try:
             tf = (pos.details or {}).get('timeframe', getattr(cfg, 'SCANNER_INTERVAL', '15m'))
             df = self.exchange.get_candles(symbol, interval=tf, limit=100)
-            save_trade_chart(
+            chart_path = save_trade_chart(
                 symbol, df, pos.entry_price, exit_px, pnl_pct, pnl_usdt,
                 f"OCO_{reason}", pos.stop_loss, pos.take_profit
             )
+            if chart_path and hasattr(self.notifier, 'send_photo'):
+                self.notifier.send_photo(
+                    chart_path,
+                    caption=f"📊 {symbol} — OCO_{reason} ({pnl_pct:+.2f}% | {pnl_usdt:+.2f} USDT)"
+                )
         except Exception as e:
             log.warning(f"[CHART LOGGER] Exit chart failed: {e}")
         return 'FULL_CLOSED'
@@ -1156,7 +1163,12 @@ class ScannerEngine:
         try:
             tf = (pos.details or {}).get('timeframe', getattr(cfg, 'SCANNER_INTERVAL', '15m'))
             df = self.exchange.get_candles(symbol, interval=tf, limit=100)
-            save_trade_chart(symbol, df, pos.entry_price, exit_price, pnl_pct, pnl_usdt, reason, pos.stop_loss, pos.take_profit)
+            chart_path = save_trade_chart(symbol, df, pos.entry_price, exit_price, pnl_pct, pnl_usdt, reason, pos.stop_loss, pos.take_profit)
+            if chart_path and hasattr(self.notifier, 'send_photo'):
+                self.notifier.send_photo(
+                    chart_path,
+                    caption=f"📊 {symbol} — {reason} ({pnl_pct:+.2f}% | {pnl_usdt:+.2f} USDT)"
+                )
         except Exception as e:
             log.warning(f"[CHART LOGGER] Exit chart failed: {e}")
 

@@ -2345,6 +2345,46 @@ class TestHardeningRegressionSuite(InTempDir):
         self.assertEqual(len(bought_amounts), 1)
         self.assertAlmostEqual(bought_amounts[0][1], 30.0, places=2)
 
+    def test_telegram_card_design_and_dashboard_state(self):
+        from notifier import TelegramNotifier
+        import dashboard
+        bot, fc, conn, rm, nt, eng, cfg = self._live_stack()
+
+        # 1. Verify redesigned Telegram card formatting
+        tn = TelegramNotifier(make_cfg(
+            ENABLE_TELEGRAM=True, TELEGRAM_TOKEN="T", TELEGRAM_CHAT_ID="C",
+            DISPLAY_TIMEZONE="Europe/Belgrade", DISPLAY_TZ_OFFSET_HOURS=1,
+        ))
+        sent_msgs = []
+        tn.send = lambda msg, parse_mode=None: sent_msgs.append((msg, parse_mode)) or True
+        tn.trade_opened("UNIUSDT", "BUY", 4.9230, 12.18, 4.7176, 5.0116, timeframe="15m", open_time=1795097705.0)
+        self.assertIn("SIGNAL EXECUTED", sent_msgs[-1][0])
+        self.assertIn("UNIUSDT", sent_msgs[-1][0])
+        self.assertIn("$59.96 USDT", sent_msgs[-1][0])
+
+        tn.trade_closed("INTCBUSDT", "OCO_TAKE_PROFIT", 53.36, 55.02, 3.11, duration_sec=9900, pnl_usdt=1.87)
+        self.assertIn("TRADE CLOSED", sent_msgs[-1][0])
+        self.assertIn("WIN", sent_msgs[-1][0])
+        self.assertIn("INTCBUSDT", sent_msgs[-1][0])
+
+        # 2. Verify read-only dashboard state collector
+        pos = rm.open_position("UNIUSDT", 4.9230, 12.18, kind="scanner", atr_value=0.04, entry_score=85)
+        rm.close_position("UNIUSDT", 5.0120, "OCO_TAKE_PROFIT", fill_id="F_UNI")
+        os.makedirs("charts", exist_ok=True)
+        with open(os.path.join("charts", "UNIUSDT_test.png"), "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n")
+
+        dashboard._PRICE_CACHE["SOLUSDT"] = (72.0, time.time())
+        rm.open_position("SOLUSDT", 70.0, 0.85, kind="scanner", atr_value=1.0, entry_score=85)
+
+        st = dashboard.collect_dashboard_state(".")
+        self.assertEqual(st["stats"]["total_trades"], 1)
+        self.assertEqual(st["stats"]["wins"], 1)
+        self.assertEqual(st["stats"]["win_rate_pct"], 100.0)
+        self.assertEqual(len(st["open_positions"]), 1)
+        self.assertEqual(st["open_positions"][0]["symbol"], "SOLUSDT")
+        self.assertEqual(len(st["charts"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
