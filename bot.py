@@ -63,6 +63,7 @@ class ScannerEngine:
         self._symbol_cooldowns: dict[str, float] = {}
         self._last_alerts: dict[str, float] = {}
         self._breaker_alerted_date: str | None = None
+        self._heartbeat_sent_date: str | None = str(datetime.now(timezone.utc).date())
 
         self._prev_high_scores: dict[str, dict] = {}
         self._curr_high_scores: dict[str, dict] = {}
@@ -177,8 +178,11 @@ class ScannerEngine:
             if self._breaker_alerted_date != today_str:
                 self._breaker_alerted_date = today_str
                 if hasattr(self.notifier, 'alert'):
-                    self.notifier.alert("🛑 Circuit breaker tripped! Daily loss limit reached. Trading halted.")
+                    halt_rsn = getattr(self.risk_mgr, 'last_halt_reason', '') or 'Daily loss limit reached'
+                    self.notifier.alert(f"🛑 Circuit breaker tripped! {halt_rsn}. Trading halted.")
             return
+
+        self._maybe_send_daily_heartbeat(portfolio_val)
 
         self._reconcile_pending_buys()
 
@@ -469,6 +473,27 @@ class ScannerEngine:
                 log.warning(f"[CHART LOGGER] Entry chart failed: {e}")
         return True
 
+    def _maybe_send_daily_heartbeat(self, portfolio_val: float):
+        if not getattr(cfg, 'ENABLE_DAILY_HEARTBEAT', False):
+            return
+        today_str = str(datetime.now(timezone.utc).date())
+        if self._heartbeat_sent_date == today_str:
+            return
+        self._heartbeat_sent_date = today_str
+        try:
+            stats = self.risk_mgr.get_expectancy_stats() if hasattr(self.risk_mgr, 'get_expectancy_stats') else {}
+            peak_val = getattr(self.risk_mgr, 'peak_balance', None) or portfolio_val
+            open_cnt = self.risk_mgr.open_count()
+            log.info(
+                f"[HEARTBEAT] Equity=${portfolio_val:.2f} (Peak=${peak_val:.2f}) | Open={open_cnt} | "
+                f"Trades={stats.get('total_trades', 0)} ({stats.get('win_rate_pct', 0.0):.1f}% WR, "
+                f"Exp=${stats.get('expectancy_usdt', 0.0):+.2f})"
+            )
+            if hasattr(self.notifier, 'daily_heartbeat'):
+                self.notifier.daily_heartbeat(portfolio_val, peak_val, open_cnt, stats)
+        except Exception as e:
+            log.warning(f"[HEARTBEAT ERROR] {e}")
+
     def _execute_entry(self, res: ScanResult):
         symbol = res.symbol
         price = res.close_price
@@ -479,8 +504,19 @@ class ScannerEngine:
         trade_pct = getattr(cfg, 'SCANNER_TRADE_PCT', 99) / 100.0
         usable_bal = bal * trade_pct if bal < max_usdt else max_usdt
         usdt_amount = min(usable_bal, max_usdt)
+        min_notional = getattr(cfg, 'MIN_NOTIONAL_USDT', 11.0)
 
-        if usdt_amount < getattr(cfg, 'MIN_NOTIONAL_USDT', 11.0):
+        if getattr(cfg, 'USE_RISK_BASED_SIZING', False) and price > 0 and usdt_amount >= min_notional:
+            from risk_manager import compute_stops
+            sl_px, _, _, _ = compute_stops(cfg, 'scanner', price, float(getattr(res, 'atr', 0.0) or 0.0))
+            sl_dist_pct = ((price - sl_px) / price) * 100.0 if sl_px < price else 0.0
+            risk_pct = float(getattr(cfg, 'MAX_RISK_PER_TRADE_PCT', 2.5) or 2.5)
+            if sl_dist_pct > 0 and risk_pct > 0:
+                risk_budget_usdt = usdt_amount * (risk_pct / 100.0)
+                risk_sized_usdt = risk_budget_usdt / (sl_dist_pct / 100.0)
+                usdt_amount = max(min_notional, min(usdt_amount, risk_sized_usdt))
+
+        if usdt_amount < min_notional:
             log.warning(f"[ENTRY FAILED] Insufficient balance for {symbol}: ${usdt_amount:.2f}")
             return
 

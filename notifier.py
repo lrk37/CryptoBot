@@ -110,6 +110,20 @@ class TelegramNotifier:
             text = text.removeprefix("⚠️").lstrip()
         return self.send(f"⚠️ {text}")
 
+    def daily_heartbeat(self, portfolio_val: float, peak_val: float, open_count: int, stats: dict):
+        total = int((stats or {}).get('total_trades', 0))
+        wins = int((stats or {}).get('wins', 0))
+        losses = int((stats or {}).get('losses', 0))
+        wr = float((stats or {}).get('win_rate_pct', 0.0))
+        exp = float((stats or {}).get('expectancy_usdt', 0.0))
+        net = float((stats or {}).get('net_pnl_usdt', 0.0))
+        msg = (
+            f"💓 Daily Status | Equity: ${portfolio_val:.2f} (Peak: ${peak_val:.2f}) | "
+            f"Open: {open_count} | Record: {wins}W/{losses}L ({wr:.1f}%) | "
+            f"Net: ${net:+.2f} (Exp: ${exp:+.2f}/trade)"
+        )
+        return self.send(msg)
+
     def error(self, msg):
         return self.send(f"🚨 *CRITICAL ERROR*:\n{msg}")
 

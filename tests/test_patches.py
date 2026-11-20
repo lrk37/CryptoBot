@@ -2280,6 +2280,71 @@ class TestHardeningRegressionSuite(InTempDir):
         self.assertTrue(get_calls[0][1])
         self.assertEqual(get_calls[0][2].get("data"), {"orderListId": 555})
 
+    def test_peak_equity_drawdown_breaker_expectancy_heartbeat_and_risk_sizing(self):
+        from risk_manager import RiskManager
+        from scanner import ScanResult
+        bot, fc, conn, rm, nt, eng, cfg = self._live_stack()
+        cfg.MAX_DAILY_LOSS = 6.0
+        cfg.MAX_TOTAL_DRAWDOWN_PCT = 12.0
+
+        # 1. Peak balance tracks upward and persists across day rollover / restart
+        self.assertFalse(rm.check_circuit_breaker(63.0))
+        self.assertFalse(rm.check_circuit_breaker(67.05))
+        self.assertAlmostEqual(rm.peak_balance, 67.05, places=2)
+
+        # Simulate new day where daily start balance resets to 60.0 (only -2.5% today at 58.5, so daily 6% is NOT tripped),
+        # but total drawdown from 67.05 peak is (67.05 - 58.50)/67.05 = 12.75% >= 12.0% -> halts!
+        rm2 = RiskManager(cfg)
+        self.assertAlmostEqual(rm2.peak_balance, 67.05, places=2)
+        rm2._daily_start_bal = 60.0
+        self.assertTrue(rm2.check_circuit_breaker(58.50))
+        self.assertIn("Peak equity drawdown", rm2.last_halt_reason)
+
+        # 2. Expectancy stats & daily heartbeat
+        pos1 = rm.open_position("INTCBUSDT", 53.36, 1.1244, kind="scanner", atr_value=0.8)
+        rm.close_position("INTCBUSDT", 55.02, "OCO_TAKE_PROFIT", fill_id="F1")
+        stats = rm.get_expectancy_stats()
+        self.assertEqual(stats["total_trades"], 1)
+        self.assertEqual(stats["wins"], 1)
+        self.assertEqual(stats["win_rate_pct"], 100.0)
+        self.assertGreater(stats["expectancy_usdt"], 1.5)
+
+        hb_calls = []
+        nt.daily_heartbeat = lambda pv, pk, oc, st: hb_calls.append((pv, pk, oc, st))
+        cfg.ENABLE_DAILY_HEARTBEAT = True
+        eng._heartbeat_sent_date = "2026-01-01"
+        eng._maybe_send_daily_heartbeat(67.05)
+        self.assertEqual(len(hb_calls), 1)
+        self.assertAlmostEqual(hb_calls[0][0], 67.05, places=2)
+        # Calling again on the same UTC date does not send a second heartbeat
+        eng._maybe_send_daily_heartbeat(67.05)
+        self.assertEqual(len(hb_calls), 1)
+
+        # 3. Risk-based position sizing scales wide-SL trades down while keeping tight-SL trades at full size
+        cfg.MAX_TRADE_USDT = 60.0
+        cfg.USE_RISK_BASED_SIZING = True
+        cfg.MAX_RISK_PER_TRADE_PCT = 2.5
+        cfg.SCANNER_MAX_STOP_LOSS_PCT = 5.0
+        cfg.SCANNER_ATR_SL_MULTIPLIER = 4.8
+
+        bought_amounts = []
+        eng._call_market_buy = lambda sym, usdt_amount=0.0, client_oid=None: (
+            bought_amounts.append((sym, usdt_amount)) or {
+                "symbol": sym, "orderId": len(bought_amounts), "status": "FILLED",
+                "executedQty": "1.0", "cummulativeQuoteQty": str(usdt_amount),
+                "fills": [{"price": "100.0", "qty": "1.0", "commission": "0.0", "commissionAsset": "BNB"}],
+            }
+        )
+        # Wide stop (ATR=2.0 on $100 -> 4.8*ATR = 9.6%, capped at 5.0% SL -> 2.5%/5.0% * $60 = $30.00)
+        res_wide = ScanResult(
+            symbol="WIDEUSDT", score=85.0, raw_score=85.0, pump_penalty=0.0, reason="Test",
+            close_price=100.0, rsi=18.0, volume_ratio=2.5, pct_change_24h=-5.0, atr=2.0,
+            breakout_atr_ratio=2.0, bid_ask_ratio=1.5, last_closed_time=int(time.time()) - 60,
+        )
+        eng._execute_entry(res_wide)
+        self.assertEqual(len(bought_amounts), 1)
+        self.assertAlmostEqual(bought_amounts[0][1], 30.0, places=2)
+
 
 if __name__ == "__main__":
     unittest.main()

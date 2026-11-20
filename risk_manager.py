@@ -134,8 +134,10 @@ class RiskManager:
         self._lock = threading.Lock()
         self._positions: Dict[str, Position] = {}
         self._daily_start_bal = None
+        self._peak_balance = None
         self._today = datetime.now(timezone.utc).date()
         self._halted = False
+        self._last_halt_reason = ""
         self._exiting_symbols: Set[str] = set()
         self.exchange = None
         self._consecutive_losses = 0
@@ -577,32 +579,93 @@ class RiskManager:
             return self._save_positions()
 
     def check_circuit_breaker(self, current_balance: float) -> bool:
-        """Check daily loss circuit breaker. Pass total portfolio value, not just USDT cash."""
+        """Check daily loss and multi-day peak-equity drawdown circuit breakers.
+        Pass total portfolio value, not just USDT cash.
+        """
         if current_balance <= 0:
             log.warning(f"[CIRCUIT BREAKER] Ignoring non-positive portfolio balance ({current_balance})")
             return self._halted
+
+        state_dirty = False
+        if self._peak_balance is None or self._peak_balance <= 0 or current_balance > self._peak_balance:
+            self._peak_balance = current_balance
+            state_dirty = True
 
         today = datetime.now(timezone.utc).date()
         if today != self._today:
             self._today = today
             self._daily_start_bal = current_balance
             self._halted = False
-            self._save_loss_state()  # F-19: Persist daily balance across restarts
+            self._last_halt_reason = ""
+            state_dirty = True
 
         if self._daily_start_bal is None or self._daily_start_bal <= 0:
             self._daily_start_bal = current_balance
-            self._save_loss_state()
-            return False
+            state_dirty = True
+
+        if state_dirty:
+            self._save_loss_state()  # F-19: Persist daily & peak balance across restarts
 
         loss_pct = ((self._daily_start_bal - current_balance) / self._daily_start_bal) * 100.0
         max_loss = getattr(self.cfg, 'MAX_DAILY_LOSS', 6.0)
         if loss_pct >= max_loss:
             if not self._halted:
-                log.error(f"[CIRCUIT BREAKER] Daily loss {loss_pct:.2f}% >= {max_loss}%. HALTING.")
+                self._last_halt_reason = f"Daily loss {loss_pct:.2f}% >= {max_loss}%"
+                log.error(f"[CIRCUIT BREAKER] {self._last_halt_reason}. HALTING.")
                 self._halted = True
             return True
 
+        max_total_dd = float(getattr(self.cfg, 'MAX_TOTAL_DRAWDOWN_PCT', 0.0) or 0.0)
+        if max_total_dd > 0 and self._peak_balance and self._peak_balance > 0:
+            total_dd_pct = ((self._peak_balance - current_balance) / self._peak_balance) * 100.0
+            if total_dd_pct >= max_total_dd:
+                if not self._halted:
+                    self._last_halt_reason = (
+                        f"Peak equity drawdown {total_dd_pct:.2f}% >= {max_total_dd}% "
+                        f"(Peak=${self._peak_balance:.2f}, Current=${current_balance:.2f})"
+                    )
+                    log.error(f"[CIRCUIT BREAKER] {self._last_halt_reason}. HALTING.")
+                    self._halted = True
+                return True
+
         return False
+
+    @property
+    def peak_balance(self) -> Optional[float]:
+        return self._peak_balance
+
+    @property
+    def last_halt_reason(self) -> str:
+        return self._last_halt_reason
+
+    def get_expectancy_stats(self) -> dict:
+        """Compute win rate, average win/loss, profit factor, and net expectancy per trade from trade_log."""
+        with self._lock:
+            trades = list(self._trade_log)
+        total = len(trades)
+        if total == 0:
+            return {
+                'total_trades': 0, 'wins': 0, 'losses': 0, 'win_rate_pct': 0.0,
+                'net_pnl_usdt': 0.0, 'avg_win_usdt': 0.0, 'avg_loss_usdt': 0.0,
+                'expectancy_usdt': 0.0, 'profit_factor': 0.0,
+            }
+        pnls = [float(t.get('net_pnl_usdt', t.get('pnl_usdt', 0.0)) or 0.0) for t in trades]
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p <= 0]
+        net_total = sum(pnls)
+        gross_win = sum(wins)
+        gross_loss = abs(sum(losses))
+        return {
+            'total_trades': total,
+            'wins': len(wins),
+            'losses': len(losses),
+            'win_rate_pct': round((len(wins) / total) * 100.0, 1),
+            'net_pnl_usdt': round(net_total, 4),
+            'avg_win_usdt': round(gross_win / len(wins), 4) if wins else 0.0,
+            'avg_loss_usdt': round(-gross_loss / len(losses), 4) if losses else 0.0,
+            'expectancy_usdt': round(net_total / total, 4),
+            'profit_factor': round(gross_win / gross_loss, 2) if gross_loss > 0 else (99.9 if gross_win > 0 else 0.0),
+        }
 
     def _save_positions(self) -> bool:
         # F-30: Atomic write — write to tmp then rename
@@ -630,12 +693,13 @@ class RiskManager:
             log.error(f"Failed to load positions: {e}")
 
     def _save_loss_state(self) -> bool:
-        # F-19: Also persist daily start balance and date. F-30: Atomic write.
+        # F-19: Also persist daily start balance, peak equity, and date. F-30: Atomic write.
         try:
             data = {
                 'losses': self._consecutive_losses,
                 'halt_until': self._loss_halt_until,
                 'daily_start_bal': self._daily_start_bal,
+                'peak_bal': self._peak_balance,
                 'today': str(self._today),
                 'applied_fill_ids': list(self._applied_loss_fill_ids[-200:]),
             }
@@ -657,6 +721,9 @@ class RiskManager:
                     self._loss_halt_until = data.get('halt_until', 0)
                     applied = data.get('applied_fill_ids') or []
                     self._applied_loss_fill_ids = [str(x) for x in applied if x][-200:]
+                    peak_bal = data.get('peak_bal')
+                    if peak_bal is not None and float(peak_bal) > 0:
+                        self._peak_balance = float(peak_bal)
                     # F-19: Restore daily start balance if still same day
                     saved_today = data.get('today', '')
                     utc_today = datetime.now(timezone.utc).date()

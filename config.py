@@ -64,6 +64,8 @@ REQUIRE_CONFIRMATION = False
 SCANNER_TRADE_PCT = 99
 MAX_TRADE_USDT = 20
 MIN_NOTIONAL_USDT = 11
+USE_RISK_BASED_SIZING = False    # Scale trade size inversely with SL distance when True
+MAX_RISK_PER_TRADE_PCT = 2.5     # Max % of MAX_TRADE_USDT risked at stop-loss when USE_RISK_BASED_SIZING=True
 USE_QUOTE_ORDER_QTY = True
 USE_EXCHANGE_OCO = True
 OCO_STOP_LIMIT_OFFSET_PCT = 0.8  # Place OCO stopLimitPrice 0.8% below stopPrice trigger
@@ -117,6 +119,7 @@ SNIPE_BLACKLIST = [
 
 # --- 7. Portfolio Risk & Circuit Breaker Limits ---
 MAX_DAILY_LOSS = 6
+MAX_TOTAL_DRAWDOWN_PCT = 12.0    # Multi-day kill-switch: halt if equity drops 12% below peak balance
 MAX_OPEN_TRADES = 1
 MAX_CONSECUTIVE_LOSSES = 2
 CONSECUTIVE_LOSS_COOLDOWN_SEC = 1800
@@ -133,6 +136,7 @@ TRADE_LOG_FILE = 'trade_log.json'
 
 # --- 8. Telegram & Logging ---
 ENABLE_TELEGRAM = os.getenv('ENABLE_TELEGRAM', 'False').lower() in ('true', '1', 't')
+ENABLE_DAILY_HEARTBEAT = True    # Send once-daily Telegram status & expectancy summary
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 DISPLAY_TIMEZONE = os.getenv('DISPLAY_TIMEZONE', 'Europe/Belgrade')  # DST-aware CET/CEST (UTC+1/UTC+2)
