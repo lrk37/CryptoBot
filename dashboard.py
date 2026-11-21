@@ -17,6 +17,8 @@ Usage:
   python dashboard.py --port 8050
 """
 import argparse
+import base64
+import hmac
 import json
 import os
 import time
@@ -629,11 +631,34 @@ setInterval(refreshState, 10000);
 
 class DashboardHandler(BaseHTTPRequestHandler):
     base_dir = "."
+    auth_password = ""
 
     def log_message(self, format, *args):
         return  # Keep console clean
 
+    def _is_authorized(self) -> bool:
+        expected = self.auth_password or os.getenv("DASHBOARD_PASSWORD", "")
+        if not expected:
+            return True
+        auth_hdr = self.headers.get("Authorization", "")
+        if not auth_hdr.startswith("Basic "):
+            return False
+        try:
+            decoded = base64.b64decode(auth_hdr.split(" ", 1)[1].strip()).decode("utf-8", errors="replace")
+            _, pwd = decoded.split(":", 1) if ":" in decoded else ("", decoded)
+            return hmac.compare_digest(pwd, expected)
+        except Exception:
+            return False
+
     def do_GET(self):
+        if not self._is_authorized():
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="CryptoBot Command Center"')
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"Authentication required")
+            return
+
         path = unquote(self.path.split("?")[0])
         if path in ("/", "/index.html"):
             body = DASHBOARD_HTML.encode("utf-8")

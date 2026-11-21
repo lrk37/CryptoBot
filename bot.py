@@ -886,51 +886,54 @@ class ScannerEngine:
 
         symbols = self.risk_mgr.all_position_symbols()
         for symbol in symbols:
-            pos = self.risk_mgr.get_position(symbol)
-            if not pos or pos.kind != "scanner":
-                continue
-
-            if pos.details.get('pending_sell_client_oid'):
-                try:
-                    fallback_px = self.exchange.get_price(symbol)
-                except Exception:
-                    fallback_px = pos.entry_price
-                rec_state = self._reconcile_pending_sell(symbol, pos, fallback_px)
-                if rec_state in ('FINALIZED', 'BLOCKED'):
-                    continue
-
             try:
-                curr_price = self.exchange.get_price(symbol)
-            except Exception as e:
-                # F-27: Log warning and skip — hold timeout is based on open_time,
-                # not consecutive poll failures, so brief outages are safe.
-                log.warning(f"[MONITOR] Failed to get price for {symbol}: {e}")
-                continue
-
-            # Did the exchange-side OCO already close or partially fill this position?
-            if self._check_position_oco_status(symbol, pos):
-                continue
-
-            prev_sl = pos.stop_loss
-            action = self.risk_mgr.evaluate(pos, curr_price)
-            if action != "HOLD":
-                if self._should_defer_exit_to_active_oco(symbol, pos, curr_price, action, prev_sl):
+                pos = self.risk_mgr.get_position(symbol)
+                if not pos or pos.kind != "scanner":
                     continue
-                log.info(f"[MONITOR EXIT TRIGGERED] {symbol} -> {action} at {curr_price:.6f}")
-                self._close_position(symbol, pos, curr_price, action)
-            else:
-                if pos.details:
-                    pos.details.pop('oco_band_defer_action', None)
-                if getattr(cfg, 'USE_EXCHANGE_OCO', True):
-                    oco_id = pos.details.get('oco_order_list_id')
-                    oco_sl = float(pos.details.get('oco_stop_loss', 0.0) or 0.0)
-                    stop_changed = (pos.stop_loss > prev_sl) or (
-                        oco_id is not None and oco_sl > 0 and abs(pos.stop_loss - oco_sl) > 1e-9
-                    )
-                    if stop_changed and (oco_id is not None or pos.details.get('oco_needs_sync')):
-                        pos.details['oco_needs_sync'] = True
-                    if pos.details.get('oco_needs_sync'):
-                        self._sync_oco_stop(symbol, pos, curr_price)
+
+                if pos.details.get('pending_sell_client_oid'):
+                    try:
+                        fallback_px = self.exchange.get_price(symbol)
+                    except Exception:
+                        fallback_px = pos.entry_price
+                    rec_state = self._reconcile_pending_sell(symbol, pos, fallback_px)
+                    if rec_state in ('FINALIZED', 'BLOCKED'):
+                        continue
+
+                try:
+                    curr_price = self.exchange.get_price(symbol)
+                except Exception as e:
+                    # F-27: Log warning and skip — hold timeout is based on open_time,
+                    # not consecutive poll failures, so brief outages are safe.
+                    log.warning(f"[MONITOR] Failed to get price for {symbol}: {e}")
+                    continue
+
+                # Did the exchange-side OCO already close or partially fill this position?
+                if self._check_position_oco_status(symbol, pos):
+                    continue
+
+                prev_sl = pos.stop_loss
+                action = self.risk_mgr.evaluate(pos, curr_price)
+                if action != "HOLD":
+                    if self._should_defer_exit_to_active_oco(symbol, pos, curr_price, action, prev_sl):
+                        continue
+                    log.info(f"[MONITOR EXIT TRIGGERED] {symbol} -> {action} at {curr_price:.6f}")
+                    self._close_position(symbol, pos, curr_price, action)
+                else:
+                    if pos.details:
+                        pos.details.pop('oco_band_defer_action', None)
+                    if getattr(cfg, 'USE_EXCHANGE_OCO', True):
+                        oco_id = pos.details.get('oco_order_list_id')
+                        oco_sl = float(pos.details.get('oco_stop_loss', 0.0) or 0.0)
+                        stop_changed = (pos.stop_loss > prev_sl) or (
+                            oco_id is not None and oco_sl > 0 and abs(pos.stop_loss - oco_sl) > 1e-9
+                        )
+                        if stop_changed and (oco_id is not None or pos.details.get('oco_needs_sync')):
+                            pos.details['oco_needs_sync'] = True
+                        if pos.details.get('oco_needs_sync'):
+                            self._sync_oco_stop(symbol, pos, curr_price)
+            except Exception as e:
+                log.error(f"[MONITOR SYMBOL ERROR] {symbol}: {e}", exc_info=True)
 
     def _record_or_rollback_oco(self, symbol: str, pos, oco, stop_loss_px: float, tag: str = "OCO") -> bool:
         """Persist a newly created OCO orderListId; if persistence fails, cancel the exchange OCO

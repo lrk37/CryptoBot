@@ -2385,6 +2385,79 @@ class TestHardeningRegressionSuite(InTempDir):
         self.assertEqual(st["open_positions"][0]["symbol"], "SOLUSDT")
         self.assertEqual(len(st["charts"]), 1)
 
+    def test_decimal_step_tick_rate_limit_cache_ttl_and_monitor_isolation(self):
+        from binance.exceptions import BinanceAPIException
+        bot, fc, conn, rm, nt, eng, cfg = self._live_stack()
+
+        # 1. Exact Decimal rounding for non-power-of-10 stepSize (0.05) and tickSize (0.25)
+        fc.get_symbol_info = lambda symbol=None: {
+            "filters": [
+                {"filterType": "LOT_SIZE", "stepSize": "0.05000000", "minQty": "0.05"},
+                {"filterType": "PRICE_FILTER", "tickSize": "0.25000000"},
+            ]
+        }
+        conn._info_cache.clear()
+        self.assertAlmostEqual(conn._round_lot("ODDUSDT", 1.29), 1.25, places=6)
+        self.assertAlmostEqual(conn._round_price("ODDUSDT", 10.38), 10.50, places=6)
+        self.assertAlmostEqual(conn._round_price("ODDUSDT", 10.12), 10.00, places=6)
+
+        # 2. Inverted sl >= tp is rejected safely in create_oco_sell
+        self.assertIsNone(conn.create_oco_sell("ODDUSDT", 1.0, take_profit=10.0, stop_loss=10.5))
+
+        # 3. _retry handles -1003 Retry-After and fails fast on HTTP 418
+        slept = []
+        orig_sleep = time.sleep
+        time.sleep = lambda s: slept.append(s)
+        try:
+            err_429 = BinanceAPIException.__new__(BinanceAPIException)
+            err_429.code = -1003
+            err_429.status_code = 429
+            err_429.message = "Too many requests"
+            err_429.response = types.SimpleNamespace(headers={"Retry-After": "12"})
+            Exception.__init__(err_429, "APIError(code=-1003): Too many requests")
+            calls = [0]
+            def flaky():
+                calls[0] += 1
+                if calls[0] == 1:
+                    raise err_429
+                return "OK"
+            self.assertEqual(conn._retry(flaky), "OK")
+            self.assertEqual(calls[0], 2)
+            self.assertTrue(any(s >= 12.0 for s in slept))
+
+            err_418 = BinanceAPIException.__new__(BinanceAPIException)
+            err_418.code = -1003
+            err_418.status_code = 418
+            err_418.message = "IP banned"
+            Exception.__init__(err_418, "APIError(code=-1003): IP banned")
+            ban_calls = [0]
+            def banned():
+                ban_calls[0] += 1
+                raise err_418
+            with self.assertRaises(BinanceAPIException):
+                conn._retry(banned)
+            self.assertEqual(ban_calls[0], 1)  # Fail fast on 418, no retries
+        finally:
+            time.sleep = orig_sleep
+
+        # 4. Monitor loop isolates per-symbol exceptions so symbol #2 still gets monitored
+        cfg.MAX_OPEN_TRADES = 2
+        rm.open_position("BADUSDT", 100.0, 1.0, kind="scanner", atr_value=1.0)
+        rm.open_position("GOODUSDT", 100.0, 1.0, kind="scanner", atr_value=1.0)
+        evaluated = []
+        orig_eval = rm.evaluate
+        def eval_spy(pos, px):
+            if pos.symbol == "BADUSDT":
+                raise RuntimeError("boom on BADUSDT")
+            evaluated.append(pos.symbol)
+            return "HOLD"
+        rm.evaluate = eval_spy
+        try:
+            eng._monitor_tick()
+            self.assertIn("GOODUSDT", evaluated)
+        finally:
+            rm.evaluate = orig_eval
+
 
 if __name__ == "__main__":
     unittest.main()

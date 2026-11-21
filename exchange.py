@@ -13,6 +13,7 @@ import math
 import time
 import uuid
 import threading
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, InvalidOperation
 import pandas as pd
 import requests as req_lib
 from binance.client import Client
@@ -47,6 +48,7 @@ class BinanceConnector:
         log.info(f"Binance connected [{mode}]")
 
         self._info_cache = {}
+        self._info_cache_ts = {}
         self._balance_cache = {}
         self._balance_cache_time = 0
         self._balance_lock = threading.Lock()
@@ -75,14 +77,34 @@ class BinanceConnector:
             try:
                 return fn(*args, **kwargs)
             except BinanceAPIException as e:
-                if e.code in NON_RETRYABLE_CODES:
+                status_code = getattr(e, 'status_code', None)
+                code = getattr(e, 'code', None)
+                if code == -1013 and 'symbol' in kwargs:
+                    # Exchange filter may have changed; evict cached symbol filters
+                    self._info_cache.pop(kwargs['symbol'], None)
+                    if hasattr(self, '_info_cache_ts'):
+                        self._info_cache_ts.pop(kwargs['symbol'], None)
+                if status_code == 418:
+                    log.error(f"[RATE LIMIT] Binance HTTP 418 IP ban response; aborting retries: {e}")
                     raise
-                if e.code == -1021:
+                if code in NON_RETRYABLE_CODES:
+                    raise
+                if code == -1021:
                     log.warning("[TIME SYNC] Binance -1021 timestamp error, re-syncing server clock")
                     self._sync_time()
                 if i == retries - 1:
                     raise
-                time.sleep(delay * (i + 1))
+                sleep_sec = delay * (i + 1)
+                if code == -1003 or status_code == 429:
+                    resp = getattr(e, 'response', None)
+                    ra_hdr = resp.headers.get('Retry-After') if (resp is not None and hasattr(resp, 'headers')) else None
+                    try:
+                        ra_val = float(ra_hdr) if ra_hdr is not None else 0.0
+                    except (TypeError, ValueError):
+                        ra_val = 0.0
+                    sleep_sec = max(sleep_sec, min(max(ra_val, 5.0), 60.0))
+                    log.warning(f"[RATE LIMIT] Binance -1003/429 rate limit; backing off {sleep_sec:.1f}s")
+                time.sleep(sleep_sec)
             except Exception as e:
                 if i == retries - 1:
                     raise
@@ -473,47 +495,63 @@ class BinanceConnector:
             log.warning(f"Failed to refresh balances: {e}")
 
     def _get_symbol_info(self, symbol):
-        if symbol not in self._info_cache:
+        now = time.time()
+        ttl = float(getattr(self.cfg, 'SYMBOL_INFO_CACHE_TTL', 21600))
+        ts_map = getattr(self, '_info_cache_ts', None)
+        if ts_map is None:
+            self._info_cache_ts = {}
+            ts_map = self._info_cache_ts
+        cached_at = ts_map.get(symbol, 0.0)
+        if symbol not in self._info_cache or (ttl > 0 and (now - cached_at) > ttl):
             try:
                 info = self._retry(self.client.get_symbol_info, symbol=symbol)
                 if info:
                     self._info_cache[symbol] = info
+                    ts_map[symbol] = now
             except Exception as e:
                 log.warning(f"Failed to get symbol info for {symbol}: {e}")
-                return None
+                return self._info_cache.get(symbol)
         return self._info_cache.get(symbol)
 
     def _round_lot(self, symbol, quantity):
         info = self._get_symbol_info(symbol)
         if not info:
             return quantity
-        step_size = None
+        step_str = None
         for f in info.get('filters', []):
             if f.get('filterType') == 'LOT_SIZE':
-                step_size = float(f.get('stepSize', 0))
+                step_str = str(f.get('stepSize', '0'))
                 break
-        if step_size and step_size > 0:
-            precision = int(round(-math.log10(step_size)))
-            precision = max(0, min(precision, 8))  # Clamp to sane range
-            if precision <= 0:
-                return math.floor(quantity)
-            return math.floor(quantity * (10 ** precision)) / (10 ** precision)
+        if step_str:
+            try:
+                d_step = Decimal(step_str).normalize()
+                if d_step > 0:
+                    d_qty = Decimal(str(quantity))
+                    floored = (d_qty / d_step).to_integral_value(rounding=ROUND_DOWN) * d_step
+                    return float(floored)
+            except (InvalidOperation, ValueError, ZeroDivisionError):
+                pass
         return quantity
 
     def _round_price(self, symbol, price):
-        """Round price according to PRICE_FILTER tickSize."""
+        """Round price to the nearest exact multiple of PRICE_FILTER tickSize."""
         info = self._get_symbol_info(symbol)
         if not info or price <= 0:
             return price
-        tick_size = None
+        tick_str = None
         for f in info.get('filters', []):
             if f.get('filterType') == 'PRICE_FILTER':
-                tick_size = float(f.get('tickSize', 0))
+                tick_str = str(f.get('tickSize', '0'))
                 break
-        if tick_size and tick_size > 0:
-            precision = int(round(-math.log10(tick_size)))
-            precision = max(0, min(precision, 8))
-            return round(price, precision)
+        if tick_str:
+            try:
+                d_tick = Decimal(tick_str).normalize()
+                if d_tick > 0:
+                    d_px = Decimal(str(price))
+                    rounded = (d_px / d_tick).to_integral_value(rounding=ROUND_HALF_UP) * d_tick
+                    return float(rounded)
+            except (InvalidOperation, ValueError, ZeroDivisionError):
+                pass
         return price
 
     def _get_min_qty(self, symbol):
@@ -894,7 +932,7 @@ class BinanceConnector:
         if sl_limit <= 0 or sl_limit > stop_trigger:
             sl_limit = stop_trigger
 
-        if qty <= 0 or tp_price <= 0 or sl_price <= 0:
+        if qty <= 0 or tp_price <= 0 or sl_price <= 0 or sl_price >= tp_price:
             log.warning(f"[OCO ERROR] Invalid parameters for {symbol}: qty={qty}, tp={tp_price}, sl={sl_price}")
             return None
 
