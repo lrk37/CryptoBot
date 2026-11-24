@@ -142,7 +142,7 @@ class TelegramNotifier:
     def trade_closed(self, symbol, reason, entry, close, pnl, duration_sec: float = None, pnl_usdt: float = None,
                      open_time: float = None, close_time: float = None):
         is_win = pnl >= 0
-        badge = "\U0001f3c6 *TRADE CLOSED \\— WIN* \u2705" if is_win else "\U0001f534 *TRADE CLOSED \\— LOSS* \U0001f6e1"
+        badge = "\U0001f3c6 *TRADE CLOSED — WIN* \u2705" if is_win else "\U0001f534 *TRADE CLOSED — LOSS* \U0001f6e1"
         rsn = _escape_md2(reason)
         pnl_str = f"`{pnl:+.2f}%` \\(`{pnl_usdt:+.2f} USDT`\\)" if pnl_usdt is not None else f"`{pnl:+.2f}%`"
         now_ts = close_time if close_time is not None else time.time()

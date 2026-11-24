@@ -173,6 +173,9 @@ class ScannerEngine:
             )
         except TypeError:
             portfolio_val = self.exchange.get_portfolio_value(symbols=pos_symbols, quantities=pos_qty)
+        if portfolio_val > 0:
+            self._maybe_send_daily_heartbeat(portfolio_val)
+
         if self.risk_mgr.check_circuit_breaker(portfolio_val):
             today_str = str(datetime.now(timezone.utc).date())
             if self._breaker_alerted_date != today_str:
@@ -181,8 +184,6 @@ class ScannerEngine:
                     halt_rsn = getattr(self.risk_mgr, 'last_halt_reason', '') or 'Daily loss limit reached'
                     self.notifier.alert(f"🛑 Circuit breaker tripped! {halt_rsn}. Trading halted.")
             return
-
-        self._maybe_send_daily_heartbeat(portfolio_val)
 
         self._reconcile_pending_buys()
 

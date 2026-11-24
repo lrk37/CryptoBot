@@ -138,6 +138,7 @@ class MarketScanner:
         max_scan = getattr(self.cfg, 'MAX_SCAN_CANDIDATES', 60)
         passed_prefilter = passed_prefilter[:max_scan]
 
+        self._last_tickers_24h = tickers_24h
         results = []
         for sym in passed_prefilter:
             res = self._analyze_symbol(sym)
@@ -155,6 +156,14 @@ class MarketScanner:
 
         return final_results
 
+    def _is_1h_window_fresh(self) -> bool:
+        """Return False during the second half of the hour when closed 1h signals exceed MAX_SIGNAL_AGE_SEC."""
+        base_max_age = float(getattr(self.cfg, 'MAX_SIGNAL_AGE_SEC', 0) or 0)
+        if base_max_age <= 0:
+            return True
+        max_1h_age = max(base_max_age, 1800.0)
+        return (time.time() % 3600.0) <= max_1h_age
+
     def _analyze_symbol(self, symbol: str) -> Optional[ScanResult]:
         default_tf = getattr(self.cfg, 'SCANNER_INTERVAL', '15m')
         dual_tf = getattr(self.cfg, 'ENABLE_DUAL_TIMEFRAME', True)
@@ -162,11 +171,23 @@ class MarketScanner:
         min_score = getattr(self.cfg, 'MIN_SCORE_TO_TRADE', 75)
 
         if dual_tf and symbol in one_hour_only:
+            if not self._is_1h_window_fresh():
+                return None
             return self._analyze_symbol_tf(symbol, '1h')
 
         res = self._analyze_symbol_tf(symbol, default_tf)
         if dual_tf and default_tf == '15m' and (res is None or res.score < min_score):
-            if res is None or res.pct_change_24h <= -1.5:
+            if not self._is_1h_window_fresh():
+                return res
+            pct_hint = None
+            t_map = getattr(self, '_last_tickers_24h', None) or {}
+            if symbol in t_map:
+                try:
+                    pct_hint = float((t_map.get(symbol) or {}).get('priceChangePercent', 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    pct_hint = None
+            dip_24h = res.pct_change_24h if res is not None else pct_hint
+            if dip_24h is None or dip_24h <= -1.5:
                 res_1h = self._analyze_symbol_tf(symbol, '1h')
                 if res_1h and res_1h.score >= min_score:
                     return res_1h

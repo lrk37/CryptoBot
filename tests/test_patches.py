@@ -2458,6 +2458,74 @@ class TestHardeningRegressionSuite(InTempDir):
         finally:
             rm.evaluate = orig_eval
 
+    def test_strict_portfolio_balance_refresh_md2_emdash_heartbeat_on_halt_and_1h_freshness(self):
+        from notifier import TelegramNotifier
+        from scanner import MarketScanner
+        bot, fc, conn, rm, nt, eng, cfg = self._live_stack()
+        cfg.MAX_DAILY_LOSS = 6.0
+        cfg.MAX_TOTAL_DRAWDOWN_PCT = 12.0
+
+        # 1. Pre-buy balance $63.80 -> buy $59.94 -> invalidate_balance_cache clears both balance & portfolio caches.
+        # If get_account() transiently fails on next scan, get_portfolio_value MUST NOT return $0 cash + $59.94 pos
+        # (false 6% daily halt) NOR stale $63.80 cash + $59.94 pos ($123.74 poisoned peak_bal).
+        fc.balances = [{"asset": "USDT", "free": "63.80", "locked": "0"}]
+        v0 = conn.get_portfolio_value()
+        self.assertAlmostEqual(v0, 63.80, places=2)
+        self.assertFalse(rm.check_circuit_breaker(v0))
+
+        conn.invalidate_balance_cache()
+        self.assertEqual(conn._balance_cache, {})
+        self.assertEqual(conn._portfolio_cache_time, 0)
+
+        orig_get_acct = fc.get_account
+        fc.get_account = lambda: (_ for _ in ()).throw(RuntimeError("transient timeout"))
+        try:
+            v_during_outage = conn.get_portfolio_value(
+                symbols=["ANTBUSDT"], quantities={"ANTBUSDT": 0.769}, fallback_prices={"ANTBUSDT": 77.95}
+            )
+            # Returns last known good portfolio value (63.80) instead of 59.94 (-6.05% false halt) or 123.74 (2x peak)
+            self.assertAlmostEqual(v_during_outage, 63.80, places=2)
+            self.assertFalse(rm.check_circuit_breaker(v_during_outage))
+            self.assertAlmostEqual(rm.peak_balance, 63.80, places=2)
+        finally:
+            fc.get_account = orig_get_acct
+
+        # 2. TelegramNotifier.trade_closed must NOT escape em-dash with backslash (valid MarkdownV2)
+        tn = TelegramNotifier(make_cfg(ENABLE_TELEGRAM=True, TELEGRAM_TOKEN="T", TELEGRAM_CHAT_ID="C"))
+        sent_md = []
+        tn.send = lambda msg, parse_mode=None: sent_md.append((msg, parse_mode)) or True
+        tn.trade_closed("ANTBUSDT", "OCO_TAKE_PROFIT", 77.95, 81.32, 4.32, duration_sec=3600, pnl_usdt=2.59)
+        self.assertNotIn("\\—", sent_md[-1][0])
+        self.assertIn("TRADE CLOSED — WIN", sent_md[-1][0])
+
+        # 3. Daily heartbeat still fires on _scan_tick even when circuit breaker trips
+        hb_events = []
+        nt.daily_heartbeat = lambda pv, pk, oc, st: hb_events.append(pv)
+        cfg.ENABLE_DAILY_HEARTBEAT = True
+        eng._heartbeat_sent_date = "2026-01-01"
+        fc.balances = [{"asset": "USDT", "free": "55.00", "locked": "0"}]
+        conn.invalidate_balance_cache()
+        eng._scan_tick()  # 55.00 vs 63.80 = -13.8% -> trips circuit breaker, AFTER sending heartbeat
+        self.assertEqual(len(hb_events), 1)
+        self.assertAlmostEqual(hb_events[0], 55.00, places=2)
+
+        # 4. Scanner skips redundant 1h candle fetches when >30m into the hour or when 24h hint > -1.5%
+        tf_calls = []
+        sc = MarketScanner(conn, make_cfg(
+            SCANNER_INTERVAL="15m", ENABLE_DUAL_TIMEFRAME=True, MAX_SIGNAL_AGE_SEC=480,
+            ONE_HOUR_ONLY_SYMBOLS=["BTCUSDT"], MIN_SCORE_TO_TRADE=75,
+        ))
+        sc._analyze_symbol_tf = lambda sym, tf: tf_calls.append((sym, tf)) or None
+        sc._last_tickers_24h = {"ZECUSDT": {"priceChangePercent": "3.2"}}  # green +3.2% coin
+        sc._is_1h_window_fresh = lambda: True
+        sc._analyze_symbol("ZECUSDT")
+        self.assertEqual(tf_calls, [("ZECUSDT", "15m")])  # skipped pointless 1h call on green coin
+
+        tf_calls.clear()
+        sc._is_1h_window_fresh = lambda: False  # e.g. :45 past the hour -> 1h signal would be stale
+        sc._analyze_symbol("BTCUSDT")
+        self.assertEqual(tf_calls, [])  # skipped stale 1h call
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -50,6 +50,7 @@ class BinanceConnector:
         self._info_cache = {}
         self._info_cache_ts = {}
         self._balance_cache = {}
+        self._total_balance_cache = {}
         self._balance_cache_time = 0
         self._balance_lock = threading.Lock()
         self._portfolio_cache = 0
@@ -421,7 +422,13 @@ class BinanceConnector:
             if now - self._portfolio_cache_time < 30 and self._portfolio_cache > 0:
                 return self._portfolio_cache
 
-        usdt = self.get_usdt_balance()
+        usdt = self._get_cached_balance_strict('USDT', include_locked=True)
+        if usdt is None:
+            log.warning("[PORTFOLIO] USDT balance refresh failed; returning cached portfolio value to avoid false circuit breaker")
+            with self._portfolio_lock:
+                if self._portfolio_cache > 0:
+                    return self._portfolio_cache
+            return 0.0
         val = usdt
         degraded = False
         unpriced = False
@@ -472,9 +479,15 @@ class BinanceConnector:
         return actual >= expected_qty * 0.9
 
     def invalidate_balance_cache(self):
-        """Force refresh on next balance call (called after trades)."""
+        """Force refresh on next balance & portfolio call (called after trades)."""
         with self._balance_lock:
             self._balance_cache_time = 0
+            self._balance_cache = {}
+            if hasattr(self, '_total_balance_cache'):
+                self._total_balance_cache = {}
+        if hasattr(self, '_portfolio_lock'):
+            with self._portfolio_lock:
+                self._portfolio_cache_time = 0
 
     def _get_cached_balance(self, asset):
         now = time.time()
@@ -483,16 +496,34 @@ class BinanceConnector:
                 self._refresh_balances()
             return self._balance_cache.get(asset, 0.0)
 
-    def _refresh_balances(self):
+    def _get_cached_balance_strict(self, asset, include_locked=False) -> Optional[float]:
+        """Like _get_cached_balance, but returns None on API refresh failure instead of 0.0 or stale pre-trade cash."""
+        now = time.time()
+        with self._balance_lock:
+            if now - self._balance_cache_time > getattr(self.cfg, 'BALANCE_CACHE_TTL', 10):
+                if not self._refresh_balances():
+                    return None
+            if include_locked and hasattr(self, '_total_balance_cache') and self._total_balance_cache:
+                return self._total_balance_cache.get(asset, 0.0)
+            return self._balance_cache.get(asset, 0.0)
+
+    def _refresh_balances(self) -> bool:
         try:
             acct = self._retry(self.client.get_account)
             bal_map = {}
+            tot_map = {}
             for b in acct.get('balances', []):
-                bal_map[b['asset']] = float(b['free'])
+                free_v = float(b['free'])
+                locked_v = float(b.get('locked', 0) or 0)
+                bal_map[b['asset']] = free_v
+                tot_map[b['asset']] = free_v + locked_v
             self._balance_cache = bal_map
+            self._total_balance_cache = tot_map
             self._balance_cache_time = time.time()
+            return True
         except Exception as e:
             log.warning(f"Failed to refresh balances: {e}")
+            return False
 
     def _get_symbol_info(self, symbol):
         now = time.time()
