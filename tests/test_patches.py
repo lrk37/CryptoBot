@@ -2728,6 +2728,148 @@ class TestHardeningRegressionSuite(InTempDir):
         self.assertEqual(cd_be, cfg.SYMBOL_COOLDOWN_SEC)
         self.assertEqual(cd_ti, cfg.COOLDOWN_AFTER_SL_SEC)
 
+    def test_listing_age_filter_and_futures_oi_funding_confirmation(self):
+        from scanner import MarketScanner
+        bot, fc, conn, rm, nt, eng, cfg = self._live_stack()
+
+        # 1. Listing age caching: >= 60 days is cached permanently without repeating klines API calls
+        kline_calls = []
+        fc.get_klines = lambda symbol, interval, limit=65: (kline_calls.append(symbol) or [[0] * 12 for _ in range(65)])
+        conn.market_client = fc
+        self.assertEqual(conn.get_listing_age_days("SOLUSDT", min_days=60), 64)
+        self.assertEqual(conn.get_listing_age_days("SOLUSDT", min_days=60), 64)
+        self.assertEqual(len(kline_calls), 1)  # Cached permanently once >= 60d
+
+        # Build a clean Tier-2 bull-pullback setup (base score = 78.0)
+        n = 220
+        closes = np.linspace(80.0, 106.0, n)
+        vols = np.full(n, 10.0)
+        closes[-42:-2] = 106.0
+        closes[-2] = 103.2  # ~2.6% below EMA21, above EMA200 -> Tier-2 (base 78.0)
+        vols[-2] = 35.0
+        closes[-1] = 103.3
+        df_t2 = pd.DataFrame({
+            "open": closes, "high": closes + 0.2, "low": closes - 0.2, "close": closes,
+            "volume": vols, "quote_vol": closes * vols,
+        }, index=pd.date_range("2026-11-20", periods=n, freq="15min", tz="UTC"))
+
+        state = {"age": 12, "oi": 0.0, "fund": 0.0}
+        ex_mock = types.SimpleNamespace(
+            get_candles=lambda *a, **k: df_t2,
+            get_listing_age_days=lambda s, min_days=60: state["age"],
+            get_spread_pct=lambda s: 0.04,
+            get_orderbook_imbalance=lambda s, depth=10: 1.6,  # +8 raw OB
+            get_futures_sentiment=lambda s, period="15m": {
+                "available": True, "oi_change_pct": state["oi"], "funding_pct": state["fund"],
+            },
+        )
+        sc = MarketScanner(ex_mock, make_cfg(
+            STRATEGY_MODE="capitulation", ENABLE_LISTING_AGE_FILTER=True, MIN_LISTING_AGE_DAYS=60,
+            ENABLE_FUTURES_CONFIRMATION=True, FUTURES_MAX_OI_SPIKE_PCT=5.0, FUTURES_MAX_FUNDING_PCT=0.05,
+        ))
+
+        # A. Brand-new listing (12d < 60d) -> blocked
+        self.assertIsNone(sc._analyze_symbol_tf("NEWCOINUSDT", "15m"))
+
+        # B. Seasoned coin (90d), but Futures OI spiking +7.5% into the crash (short pile-on) -> blocked
+        state.update({"age": 90, "oi": 7.5, "fund": 0.0})
+        self.assertIsNone(sc._analyze_symbol_tf("SHORTPILEUSDT", "15m"))
+
+        # C. Seasoned coin, but Futures funding overcrowded long (+0.08% > +0.05%) -> blocked
+        state.update({"age": 90, "oi": -1.0, "fund": 0.08})
+        self.assertIsNone(sc._analyze_symbol_tf("CROWDLONGUSDT", "15m"))
+
+        # D. Genuine liquidation flush (OI -3.5%, funding -0.02%) -> boosted, yet Tier-2 stays <= 84 (< 85 Bear gate!)
+        state.update({"age": 90, "oi": -3.5, "fund": -0.02})
+        res = sc._analyze_symbol_tf("SOLUSDT", "15m")
+        self.assertIsNotNone(res)
+        self.assertEqual(res.score, 84.0)
+        self.assertLess(res.score, 85.0)
+        self.assertIn("Futures OI flush", res.reason)
+
+    def test_limit_maker_entry_fill_fallback_and_bounce_abort(self):
+        from scanner import ScanResult
+        bot, fc, conn, rm, nt, eng, cfg = self._live_stack(
+            USE_LIMIT_MAKER_ENTRY=True, LIMIT_MAKER_WAIT_SEC=1.0, MAX_TRADE_USDT=60.0,
+        )
+        conn.market_client = fc
+        fc.get_order_book = lambda symbol, limit=5: {"bids": [["50.00", "100"]], "asks": [["50.05", "100"]]}
+        fc.price = 50.02
+
+        orig_sleep = time.sleep
+        time.sleep = lambda s: None
+        try:
+            # Case 1: LIMIT_MAKER fills immediately as maker -> 0 market buy calls!
+            lm_calls = []
+            mkt_calls = []
+            fc.create_order = lambda **kw: (lm_calls.append(kw) or {
+                "symbol": kw["symbol"], "clientOrderId": kw["newClientOrderId"],
+                "status": "FILLED", "executedQty": "1.200", "cummulativeQuoteQty": "60.00",
+                "fills": [{"price": "50.00", "qty": "1.200", "commission": "0.0", "commissionAsset": "BNB"}],
+            })
+            fc.order_market_buy = lambda **kw: (mkt_calls.append(kw) or {})
+            sig1 = ScanResult(
+                symbol="SOLUSDT", score=88.0, raw_score=85.0, pump_penalty=0.0, reason="Test",
+                close_price=50.02, rsi=18.0, volume_ratio=2.5, pct_change_24h=-4.0, atr=0.8,
+                breakout_atr_ratio=2.0, bid_ask_ratio=1.5, last_closed_time=int(time.time()) - 30,
+            )
+            self.assertTrue(eng._execute_entry(sig1))
+            self.assertEqual(len(lm_calls), 1)
+            self.assertEqual(lm_calls[0]["type"], "LIMIT_MAKER")
+            self.assertEqual(lm_calls[0]["price"], "50")
+            self.assertEqual(len(mkt_calls), 0)
+            self.assertTrue(rm.has_position("SOLUSDT"))
+            rm.close_position("SOLUSDT", 51.0, "TAKE_PROFIT", fill_id="CLOSE_SOL")
+
+            # Case 2: LIMIT_MAKER stays NEW, cancels with 0 fill, price calm -> rotates OID & executes Market fallback
+            lm_calls.clear()
+            mkt_calls.clear()
+            lm_state = {"status": "NEW"}
+            fc.create_order = lambda **kw: (lm_calls.append(kw) or {
+                "symbol": kw["symbol"], "clientOrderId": kw["newClientOrderId"],
+                "status": "NEW", "executedQty": "0.0", "cummulativeQuoteQty": "0.0",
+            })
+            fc.get_order = lambda symbol, origClientOrderId: {
+                "symbol": symbol, "clientOrderId": origClientOrderId,
+                "status": lm_state["status"], "executedQty": "0.0", "cummulativeQuoteQty": "0.0",
+            }
+            fc.cancel_order = lambda symbol, origClientOrderId: (
+                lm_state.update({"status": "CANCELED"}) or {"status": "CANCELED", "clientOrderId": origClientOrderId}
+            )
+            fc.order_market_buy = lambda **kw: (mkt_calls.append(kw) or {
+                "symbol": kw["symbol"], "clientOrderId": kw["newClientOrderId"],
+                "status": "FILLED", "executedQty": "1.198", "cummulativeQuoteQty": "60.00",
+                "fills": [{"price": "50.08", "qty": "1.198", "commission": "0.0", "commissionAsset": "BNB"}],
+            })
+            sig2 = ScanResult(
+                symbol="AVAXUSDT", score=88.0, raw_score=85.0, pump_penalty=0.0, reason="Test",
+                close_price=50.02, rsi=18.0, volume_ratio=2.5, pct_change_24h=-4.0, atr=0.8,
+                breakout_atr_ratio=2.0, bid_ask_ratio=1.5, last_closed_time=int(time.time()) - 30,
+            )
+            self.assertTrue(eng._execute_entry(sig2))
+            self.assertEqual(len(lm_calls), 1)
+            self.assertEqual(len(mkt_calls), 1)
+            self.assertNotEqual(lm_calls[0]["newClientOrderId"], mkt_calls[0]["newClientOrderId"])
+            self.assertTrue(rm.has_position("AVAXUSDT"))
+            rm.close_position("AVAXUSDT", 51.0, "TAKE_PROFIT", fill_id="CLOSE_AVAX")
+
+            # Case 3: LIMIT_MAKER unfilled AND price already bounced +1.0% away -> aborts without late market chase!
+            lm_calls.clear()
+            mkt_calls.clear()
+            lm_state["status"] = "NEW"
+            fc.price = 50.60  # +1.2% above 50.00 bid (> +0.45% max bounce)
+            sig3 = ScanResult(
+                symbol="LINKUSDT", score=88.0, raw_score=85.0, pump_penalty=0.0, reason="Test",
+                close_price=50.02, rsi=18.0, volume_ratio=2.5, pct_change_24h=-4.0, atr=0.8,
+                breakout_atr_ratio=2.0, bid_ask_ratio=1.5, last_closed_time=int(time.time()) - 30,
+            )
+            self.assertFalse(eng._execute_entry(sig3))
+            self.assertEqual(len(lm_calls), 1)
+            self.assertEqual(len(mkt_calls), 0)  # Refused late market chase!
+            self.assertFalse(rm.has_position("LINKUSDT"))
+        finally:
+            time.sleep = orig_sleep
+
 
 if __name__ == "__main__":
     unittest.main()

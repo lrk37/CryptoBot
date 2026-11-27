@@ -72,6 +72,13 @@ class BinanceConnector:
         self._last_prices: Dict[str, float] = {}
         self._last_order_unsent = False
         self._last_oco_filter_rejected = False
+        self._listing_age_cache: Dict[str, tuple] = {}
+        self._funding_cache: Dict[str, float] = {}
+        self._funding_cache_time: float = 0.0
+        self._oi_cache: Dict[tuple, tuple] = {}
+        self._fapi_lock = threading.Lock()
+        self._fapi_session = req_lib.Session()
+        self._fapi_session.mount('https://', adapter)
 
     def _sync_time(self) -> bool:
         """Synchronize local client clock offset with Binance server time."""
@@ -365,6 +372,98 @@ class BinanceConnector:
         except Exception as e:
             log.warning(f"Orderbook imbalance check failed for {symbol}: {e}")
             return 0.0
+
+    def get_listing_age_days(self, symbol: str, min_days: int = 60) -> Optional[int]:
+        """Return completed daily candles on Binance Spot (cached permanently once >= min_days)."""
+        now = time.time()
+        cached = self._listing_age_cache.get(symbol)
+        if cached is not None:
+            age_d, ts = cached
+            if age_d >= min_days or (now - ts) < 21600.0:
+                return age_d
+        try:
+            req_limit = max(int(min_days) + 5, 65)
+            raw = self._retry(self.market_client.get_klines, symbol=symbol, interval='1d', limit=req_limit)
+            if raw is None:
+                return None
+            # Subtract 1 for the currently forming daily candle
+            age_days = max(0, len(raw) - 1)
+            self._listing_age_cache[symbol] = (age_days, now)
+            return age_days
+        except Exception as e:
+            log.warning(f"Listing age lookup failed for {symbol}: {e}")
+            return None
+
+    def get_futures_sentiment(self, symbol: str, period: str = '15m') -> dict:
+        """Query free public Binance USD-M Futures endpoints (no keys required) for funding rate & 3-bar coin OI delta.
+
+        Gracefully returns {'available': False} if the Spot pair has no Futures contract or if fapi is unreachable.
+        """
+        now = time.time()
+        with self._fapi_lock:
+            need_funding = (now - self._funding_cache_time) > 300.0 or not self._funding_cache
+        if need_funding:
+            try:
+                resp = self._fapi_session.get('https://fapi.binance.com/fapi/v1/premiumIndex', timeout=3.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, list):
+                        f_map = {}
+                        for item in data:
+                            s_name = item.get('symbol')
+                            if s_name and 'lastFundingRate' in item:
+                                try:
+                                    f_map[s_name] = float(item['lastFundingRate']) * 100.0
+                                except (TypeError, ValueError):
+                                    pass
+                        with self._fapi_lock:
+                            self._funding_cache = f_map
+                            self._funding_cache_time = now
+            except Exception as e:
+                log.debug(f"[FUTURES] Public funding refresh skipped: {e}")
+
+        with self._fapi_lock:
+            if not self._funding_cache or symbol not in self._funding_cache:
+                return {'available': False}
+            funding_pct = self._funding_cache[symbol]
+            oi_period = period if period in ('5m', '15m', '30m', '1h', '4h') else '15m'
+            cache_key = (symbol, oi_period)
+            cached_oi = self._oi_cache.get(cache_key)
+            if cached_oi and (now - cached_oi[1]) < 120.0:
+                return {
+                    'available': True,
+                    'funding_pct': funding_pct,
+                    'oi_change_pct': cached_oi[0],
+                }
+
+        oi_change_pct = 0.0
+        try:
+            r_oi = self._fapi_session.get(
+                'https://fapi.binance.com/futures/data/openInterestHist',
+                params={'symbol': symbol, 'period': oi_period, 'limit': 5},
+                timeout=3.0,
+            )
+            if r_oi.status_code == 200:
+                rows = r_oi.json()
+                if isinstance(rows, list) and len(rows) >= 2:
+                    oi_latest = float(rows[-1].get('sumOpenInterest', 0) or 0)
+                    ref_idx = max(0, len(rows) - 4)  # 3-bar flush window (45m on 15m, 3h on 1h)
+                    oi_ref = float(rows[ref_idx].get('sumOpenInterest', 0) or 0)
+                    oi_prev1 = float(rows[-2].get('sumOpenInterest', 0) or 0)
+                    chg_3 = ((oi_latest - oi_ref) / oi_ref * 100.0) if oi_ref > 0 else 0.0
+                    chg_1 = ((oi_latest - oi_prev1) / oi_prev1 * 100.0) if oi_prev1 > 0 else 0.0
+                    # If 1-bar or 3-bar shows a sharp short pile-on spike, surface it; else use 3-bar window
+                    oi_change_pct = max(chg_1, chg_3) if max(chg_1, chg_3) > 3.0 else chg_3
+                    with self._fapi_lock:
+                        self._oi_cache[cache_key] = (oi_change_pct, now)
+        except Exception as e:
+            log.debug(f"[FUTURES] Public OI lookup skipped for {symbol}: {e}")
+
+        return {
+            'available': True,
+            'funding_pct': funding_pct,
+            'oi_change_pct': oi_change_pct,
+        }
 
     def get_all_usdt_symbols(self):
         """Return all currently tradeable USDT spot pairs."""
@@ -688,13 +787,158 @@ class BinanceConnector:
             return False
         return True
 
-    def market_buy(self, symbol, quantity=0, usdt_amount=0, client_oid: str = None):
-        """Place a market buy order."""
+    def market_buy(self, symbol, quantity=0, usdt_amount=0, client_oid: str = None, on_oid_update=None):
+        """Place a buy order (attempts short post-only LIMIT_MAKER bid chase first when enabled, then Market fallback)."""
         self._last_order_unsent = False
         use_quote = getattr(self.cfg, 'USE_QUOTE_ORDER_QTY', False)
         if use_quote and usdt_amount > 0:
+            if (
+                getattr(self.cfg, 'USE_LIMIT_MAKER_ENTRY', False)
+                and hasattr(self.client, 'create_order')
+                and hasattr(self.market_client, 'get_order_book')
+            ):
+                return self._limit_maker_buy_with_fallback(
+                    symbol, usdt_amount, client_oid=client_oid, on_oid_update=on_oid_update
+                )
             return self._market_buy_quote(symbol, usdt_amount, client_oid=client_oid)
         return self._market_buy_base(symbol, quantity, client_oid=client_oid)
+
+    def _limit_maker_buy_with_fallback(self, symbol, usdt_amount, client_oid: str = None, on_oid_update=None):
+        """Post-only LIMIT_MAKER bid chase to capture spread + maker fee, with crash-safe Market fallback."""
+        usdt_amount = math.floor(usdt_amount * 100) / 100
+        if usdt_amount < 1:
+            log.warning(f"USDT amount too small for {symbol}: ${usdt_amount:.2f}")
+            self._last_order_unsent = True
+            return None
+        min_notional = self._get_min_notional(symbol)
+        if usdt_amount < min_notional:
+            log.warning(f"{symbol}: ${usdt_amount:.2f} below MIN_NOTIONAL ${min_notional}")
+            self._last_order_unsent = True
+            return None
+
+        try:
+            book = self._retry(self.market_client.get_order_book, symbol=symbol, limit=5)
+            best_bid = float(book['bids'][0][0]) if (book and book.get('bids')) else 0.0
+        except Exception:
+            best_bid = 0.0
+
+        if best_bid <= 0:
+            return self._market_buy_quote(symbol, usdt_amount, client_oid=client_oid)
+
+        raw_qty = usdt_amount / best_bid
+        maker_qty = self._round_lot(symbol, raw_qty)
+        min_qty = self._get_min_qty(symbol)
+        if maker_qty <= 0 or maker_qty < min_qty or (maker_qty * best_bid) < min_notional:
+            return self._market_buy_quote(symbol, usdt_amount, client_oid=client_oid)
+
+        maker_qty_str = self._format_qty(symbol, raw_qty)
+        bid_str = self._format_price(symbol, best_bid)
+        lm_oid = client_oid or self._new_client_order_id(symbol, 'BUY')
+        wait_sec = max(1.0, min(float(getattr(self.cfg, 'LIMIT_MAKER_WAIT_SEC', 6.0) or 6.0), 15.0))
+
+        log.info(f"[BUY MAKER] Posting LIMIT_MAKER for {symbol}: qty={maker_qty_str} @ bid={bid_str} (wait={wait_sec:.0f}s)")
+        try:
+            lm_order = self.client.create_order(
+                symbol=symbol,
+                side='BUY',
+                type='LIMIT_MAKER',
+                quantity=maker_qty_str,
+                price=bid_str,
+                newClientOrderId=lm_oid,
+            )
+        except (BinanceAPIException, BinanceOrderException) as e:
+            code = getattr(e, 'code', None)
+            if code == -2010:
+                # Ask crossed our bid or post-only rejected -> rotate OID safely and buy immediately at market
+                mkt_oid = self._new_client_order_id(symbol, 'BUY')
+                if on_oid_update and not on_oid_update(mkt_oid):
+                    log.error(f"[BUY MAKER] Failed persisting rotated client_oid for {symbol}; aborting fallback")
+                    self._last_order_unsent = True
+                    return None
+                log.info(f"[BUY MAKER -> MARKET] {symbol} post-only crossed (-2010); executing immediate market buy")
+                return self._market_buy_quote(symbol, usdt_amount, client_oid=mkt_oid)
+            log.warning(f"[BUY MAKER] {symbol} LIMIT_MAKER rejected ({e}); falling back to market buy")
+            mkt_oid = self._new_client_order_id(symbol, 'BUY')
+            if on_oid_update and not on_oid_update(mkt_oid):
+                self._last_order_unsent = True
+                return None
+            return self._market_buy_quote(symbol, usdt_amount, client_oid=mkt_oid)
+        except Exception as e:
+            log.warning(f"[BUY MAKER] {symbol} submission error ({e}); reconciling before any fallback")
+            lm_order = None
+
+        if isinstance(lm_order, dict) and str(lm_order.get('status', '')).upper() == 'FILLED':
+            lm_order.setdefault('clientOrderId', lm_oid)
+            self.invalidate_balance_cache()
+            log.info(f"[BUY MAKER FILLED] {symbol} filled immediately as maker @ {bid_str}")
+            return lm_order
+
+        # Poll briefly in 2s slices so fast fills return without waiting the full window
+        deadline = time.time() + wait_sec
+        while time.time() < deadline:
+            time.sleep(min(2.0, max(0.1, deadline - time.time())))
+            try:
+                polled = self.client.get_order(symbol=symbol, origClientOrderId=lm_oid)
+                if isinstance(polled, dict):
+                    st = str(polled.get('status', '')).upper()
+                    if st == 'FILLED':
+                        polled.setdefault('clientOrderId', lm_oid)
+                        self.invalidate_balance_cache()
+                        log.info(f"[BUY MAKER FILLED] {symbol} filled as maker @ {bid_str}")
+                        return polled
+                    if st in TERMINAL_ORDER_STATUSES:
+                        break
+            except Exception:
+                pass
+
+        # Window elapsed: cancel remainder and strictly verify terminal state before considering market fallback
+        state, final_lm = self.reconcile_client_order_strict(symbol, lm_oid)
+        if state != 'FOUND' or not final_lm or not self.is_order_terminal(final_lm):
+            log.warning(f"[BUY MAKER UNRESOLVED] {symbol} {lm_oid} state={state}; deferring to pending_buy reconciliation")
+            return final_lm
+
+        exec_qty = float(final_lm.get('executedQty', 0) or 0)
+        exec_quote = float(final_lm.get('cummulativeQuoteQty', 0) or 0)
+        if exec_qty > 0:
+            self.invalidate_balance_cache()
+            if exec_quote >= min_notional or self.is_sellable_qty(symbol, exec_qty, best_bid):
+                log.info(f"[BUY MAKER PARTIAL/FULL] {symbol} filled {exec_qty} (${exec_quote:.2f}) as maker")
+                return final_lm
+            # Tiny dust maker fill (< min_notional): top up remainder at market if >= min_notional
+            rem_usdt = math.floor((usdt_amount - exec_quote) * 100) / 100
+            if rem_usdt >= min_notional:
+                mkt_oid = self._new_client_order_id(symbol, 'BUY')
+                if not on_oid_update or on_oid_update(mkt_oid):
+                    top_up = self._market_buy_quote(symbol, rem_usdt, client_oid=mkt_oid)
+                    if isinstance(top_up, dict) and float(top_up.get('executedQty', 0) or 0) > 0:
+                        merged = dict(top_up)
+                        merged['executedQty'] = str(exec_qty + float(top_up.get('executedQty', 0) or 0))
+                        merged['cummulativeQuoteQty'] = str(exec_quote + float(top_up.get('cummulativeQuoteQty', 0) or 0))
+                        merged['fills'] = list(final_lm.get('fills') or []) + list(top_up.get('fills') or [])
+                        return merged
+            return final_lm
+
+        # Confirmed CANCELED/EXPIRED with 0 fills: verify price has not bounced out of entry zone
+        max_bounce_pct = float(getattr(self.cfg, 'MAX_FORMING_BOUNCE_PCT', 0.45) or 0.45)
+        try:
+            curr_px = self.get_price(symbol)
+            if curr_px > best_bid * (1.0 + max_bounce_pct / 100.0):
+                log.info(
+                    f"[BUY MAKER ABORTED] {symbol} bounced from bid {best_bid:.6f} to {curr_px:.6f} "
+                    f"(> +{max_bounce_pct:.2f}%) during maker wait; skipping late market chase"
+                )
+                self._last_order_unsent = True
+                return None
+        except Exception:
+            pass
+
+        mkt_oid = self._new_client_order_id(symbol, 'BUY')
+        if on_oid_update and not on_oid_update(mkt_oid):
+            log.error(f"[BUY MAKER] Failed persisting rotated market client_oid for {symbol}; aborting")
+            self._last_order_unsent = True
+            return None
+        log.info(f"[BUY MAKER -> MARKET] {symbol} unfilled after {wait_sec:.0f}s; executing market fallback")
+        return self._market_buy_quote(symbol, usdt_amount, client_oid=mkt_oid)
 
     def _market_buy_quote(self, symbol, usdt_amount, client_oid: str = None):
         usdt_amount = math.floor(usdt_amount * 100) / 100

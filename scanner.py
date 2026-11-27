@@ -465,7 +465,16 @@ class MarketScanner:
                     timeframe=tf
                 )
 
-            # --- HARD BLOCK 3a: Bid-Ask Spread Filter (only queried for actual setup candidates) ---
+            # --- HARD BLOCK 3a: Listing Age Filter (skip brand-new unseasoned listings < MIN_LISTING_AGE_DAYS) ---
+            if strategy_mode == 'capitulation' and getattr(self.cfg, 'ENABLE_LISTING_AGE_FILTER', True):
+                min_age_days = int(getattr(self.cfg, 'MIN_LISTING_AGE_DAYS', 60) or 0)
+                if min_age_days > 0 and hasattr(self.exchange, 'get_listing_age_days'):
+                    age_days = self.exchange.get_listing_age_days(symbol, min_days=min_age_days)
+                    if age_days is not None and age_days < min_age_days:
+                        log.info(f"[SCANNER] {symbol} skipped - new listing ({age_days}d < {min_age_days}d minimum)")
+                        return None
+
+            # --- HARD BLOCK 3b: Bid-Ask Spread Filter (only queried for actual setup candidates) ---
             max_spread = getattr(self.cfg, 'MAX_SPREAD_PCT', 0.25)
             if hasattr(self.exchange, 'get_spread_pct'):
                 try:
@@ -476,7 +485,7 @@ class MarketScanner:
                     log.info(f"[SCANNER] {symbol} skipped - spread too wide ({spread_pct:.3f}% > {max_spread:.2f}%)")
                     return None
 
-            # --- HARD BLOCK 3b: Orderbook ratio ---
+            # --- HARD BLOCK 3c: Orderbook ratio ---
             min_ob = getattr(self.cfg, 'MIN_ORDERBOOK_RATIO', 0.70)
             try:
                 ob_ratio = float(self.exchange.get_orderbook_imbalance(symbol, depth=10))
@@ -485,6 +494,39 @@ class MarketScanner:
             if ob_ratio < min_ob:
                 log.info(f"[SCANNER] {symbol} skipped - orderbook ratio ({ob_ratio:.2f} < {min_ob:.2f})")
                 return None
+
+            # --- HARD BLOCK 3d & BONUS: Public Futures OI + Funding Confirmation ---
+            futures_bonus = 0.0
+            if strategy_mode == 'capitulation' and getattr(self.cfg, 'ENABLE_FUTURES_CONFIRMATION', True):
+                if hasattr(self.exchange, 'get_futures_sentiment'):
+                    try:
+                        f_sent = self.exchange.get_futures_sentiment(symbol, period=tf)
+                    except Exception:
+                        f_sent = None
+                    if f_sent and f_sent.get('available'):
+                        oi_chg = float(f_sent.get('oi_change_pct', 0.0) or 0.0)
+                        fund_pct = float(f_sent.get('funding_pct', 0.0) or 0.0)
+                        max_oi_spike = float(getattr(self.cfg, 'FUTURES_MAX_OI_SPIKE_PCT', 5.0))
+                        max_fund = float(getattr(self.cfg, 'FUTURES_MAX_FUNDING_PCT', 0.05))
+                        oi_flush_thr = float(getattr(self.cfg, 'FUTURES_OI_FLUSH_PCT', -1.5))
+                        if oi_chg > max_oi_spike:
+                            log.info(
+                                f"[SCANNER] {symbol} ({tf}) skipped - Futures OI surging into dump "
+                                f"(OI={oi_chg:+.2f}% > +{max_oi_spike:.1f}%, short pile-on)"
+                            )
+                            return None
+                        if fund_pct > max_fund:
+                            log.info(
+                                f"[SCANNER] {symbol} ({tf}) skipped - Futures funding still overcrowded long "
+                                f"(funding={fund_pct:+.4f}% > +{max_fund:.4f}%)"
+                            )
+                            return None
+                        if oi_chg <= oi_flush_thr:
+                            futures_bonus += 2.0
+                            reasons.append(f"Futures OI flush ({oi_chg:+.1f}%)")
+                        if fund_pct <= -0.005:
+                            futures_bonus += 2.0
+                            reasons.append(f"Neg funding ({fund_pct:+.3f}%)")
 
             ob_score = 0.0
             if ob_ratio >= 2.0:
@@ -496,12 +538,14 @@ class MarketScanner:
             elif ob_ratio >= 1.0:
                 ob_score = 3.0
             if strategy_mode == 'capitulation':
-                # Cap orderbook bonus at +5 so Tier 2 (base 78 -> max 83) never crosses Tier 1 threshold (85)
-                ob_score = min(ob_score, 5.0)
+                # Cap combined orderbook + futures bonus at +6 on Tier-2 (base 78 -> max 84 < 85 Bear gate)
+                pre_bonus = ema_score + rsi_score + vol_score + breakout_score
+                max_total_bonus = 6.0 if pre_bonus < 85.0 else 9.0
+                ob_score = min(ob_score + futures_bonus, max_total_bonus)
 
-            # 5. Orderbook Boost
+            # 5. Orderbook / Futures Boost
             if ob_score > 0:
-                reasons.append(f"Orderbook boost +{ob_score:.0f} (ratio={ob_ratio:.2f})")
+                reasons.append(f"Microstructure boost +{ob_score:.0f} (OB={ob_ratio:.2f})")
 
             # 6. 24h Pump Penalty
             if pump_penalty < 0:

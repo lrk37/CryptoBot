@@ -351,8 +351,15 @@ class ScannerEngine:
             return bool(self.exchange.is_order_terminal(order))
         return BinanceConnector.is_order_terminal(order)
 
-    def _call_market_buy(self, symbol: str, usdt_amount: float = 0.0, client_oid: str = None):
+    def _call_market_buy(self, symbol: str, usdt_amount: float = 0.0, client_oid: str = None, on_oid_update=None):
         if client_oid is not None:
+            if on_oid_update is not None:
+                try:
+                    return self.exchange.market_buy(
+                        symbol, usdt_amount=usdt_amount, client_oid=client_oid, on_oid_update=on_oid_update
+                    )
+                except TypeError:
+                    pass
             try:
                 return self.exchange.market_buy(symbol, usdt_amount=usdt_amount, client_oid=client_oid)
             except TypeError:
@@ -647,8 +654,26 @@ class ScannerEngine:
                         )
                         return False
 
+        def _rotate_buy_oid(new_oid: str) -> bool:
+            nonlocal buy_oid
+            with self._state_lock:
+                if symbol in self._pending_buys:
+                    self._pending_buys[symbol]['client_oid'] = new_oid
+                    self._pending_buys[symbol]['state'] = 'SUBMITTING'
+            if self._save_scanner_state():
+                buy_oid = new_oid
+                meta['client_oid'] = new_oid
+                return True
+            return False
+
         try:
-            order = self._call_market_buy(symbol, usdt_amount=usdt_amount, client_oid=buy_oid)
+            try:
+                order = self._call_market_buy(
+                    symbol, usdt_amount=usdt_amount, client_oid=buy_oid,
+                    on_oid_update=_rotate_buy_oid if buy_oid else None,
+                )
+            except TypeError:
+                order = self._call_market_buy(symbol, usdt_amount=usdt_amount, client_oid=buy_oid)
 
             with self._order_reconcile_lock:
                 if not order:
@@ -1486,22 +1511,21 @@ class ScannerEngine:
 
 
 def print_banner():
+    max_t = float(getattr(cfg, 'MAX_TRADE_USDT', 20.0) or 0.0)
+    size_str = f"${max_t:.2f} USDT" if max_t > 0 else f"AUTO ({getattr(cfg, 'SCANNER_TRADE_PCT', 99)}% of USDT)"
+    rbs_str = f"ON ({getattr(cfg, 'MAX_RISK_PER_TRADE_PCT', 2.5)}% max risk)" if getattr(cfg, 'USE_RISK_BASED_SIZING', False) else "OFF"
+    lm_str = f"LIMIT_MAKER ({getattr(cfg, 'LIMIT_MAKER_WAIT_SEC', 6.0):.0f}s bid -> Market)" if getattr(cfg, 'USE_LIMIT_MAKER_ENTRY', False) else "MARKET"
     log.info("==============================================================")
     log.info("  CRYPTOBOT - Automated Spot Scanner & Trading Engine")
     log.info(f"  Testnet      : {getattr(cfg, 'USE_TESTNET', False)}")
-    log.info(f"  Scanner      : ON [ALL COINS]")
-    log.info(f"  Top-N        : {getattr(cfg, 'SCANNER_TOP_N', 3)}")
-    log.info(f"  Min Score    : {getattr(cfg, 'MIN_SCORE_TO_TRADE', 60)}")
-    log.info(f"  Rescan       : {getattr(cfg, 'SCANNER_RESCAN_INTERVAL', 300)}s")
-    log.info(f"  Timeframe    : {getattr(cfg, 'SCANNER_INTERVAL', '15m')}")
-    log.info(f"  BTC Filter   : {'ON' if getattr(cfg, 'ENABLE_BTC_REGIME_FILTER', True) else 'OFF'}")
-    log.info(f"  Confirmation : {'ON (2 closed 15m candles)' if getattr(cfg, 'REQUIRE_CONFIRMATION', True) else 'OFF'}")
-    log.info(f"  Max trades   : {getattr(cfg, 'MAX_OPEN_TRADES', 1)}")
-    log.info(f"  Daily SL     : {getattr(cfg, 'MAX_DAILY_LOSS', 6.0)}%")
-    log.info(f"  Consec loss  : {getattr(cfg, 'MAX_CONSECUTIVE_LOSSES', 2)} -> {getattr(cfg, 'CONSECUTIVE_LOSS_COOLDOWN_SEC', 1800)}s pause")
-    log.info(f"  ATR stops    : {getattr(cfg, 'SCANNER_USE_ATR_STOPS', True)}")
-    log.info(f"  Trailing     : {getattr(cfg, 'SCANNER_TRAILING_OFFSET', 1.5)}% offset")
-    log.info(f"  Cooldown     : {getattr(cfg, 'SYMBOL_COOLDOWN_SEC', 3600)}s per symbol after close")
+    log.info(f"  Max Trade    : {size_str} | Risk-Sizing: {rbs_str}")
+    log.info(f"  Entry Mode   : {lm_str} | Max Open: {getattr(cfg, 'MAX_OPEN_TRADES', 1)}")
+    log.info(f"  Min 24h Vol  : ${float(getattr(cfg, 'MIN_SCAN_VOLUME_USDT', 20000000)):,.0f} | Min Age: {getattr(cfg, 'MIN_LISTING_AGE_DAYS', 60)}d")
+    log.info(f"  Futures Gate : {'ON (Public OI + Funding)' if getattr(cfg, 'ENABLE_FUTURES_CONFIRMATION', True) else 'OFF'}")
+    log.info(f"  BTC Filter   : {'ON' if getattr(cfg, 'ENABLE_BTC_REGIME_FILTER', True) else 'OFF'} | BNB Warn: {'ON' if getattr(cfg, 'WARN_ZERO_BNB', True) else 'OFF'}")
+    log.info(f"  Daily / DD   : {getattr(cfg, 'MAX_DAILY_LOSS', 6.0)}% daily | {getattr(cfg, 'MAX_TOTAL_DRAWDOWN_PCT', 12.0)}% peak DD")
+    log.info(f"  Stops / BE   : Max SL {getattr(cfg, 'SCANNER_MAX_STOP_LOSS_PCT', 4.8)}% | Min TP {getattr(cfg, 'MIN_TP_PCT', 2.0)}% | BE +{getattr(cfg, 'BREAK_EVEN_TRIGGER_PCT', 1.8)}%")
+    log.info(f"  Cooldown     : {getattr(cfg, 'SYMBOL_COOLDOWN_SEC', 3600)}s normal / {getattr(cfg, 'COOLDOWN_AFTER_SL_SEC', 43200)}s after losing SL")
     log.info("==============================================================")
 
 def main():

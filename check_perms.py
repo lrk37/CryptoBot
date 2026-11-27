@@ -9,6 +9,7 @@ Validates:
 """
 
 import sys
+import subprocess
 import logging
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
@@ -23,7 +24,26 @@ def main():
     print("=" * 60)
 
     mode = "TESTNET" if getattr(cfg, 'USE_TESTNET', False) else "LIVE SPOT"
+    try:
+        git_rev = subprocess.check_output(['git', 'log', '-n', '1', '--oneline'], stderr=subprocess.DEVNULL, text=True).strip()
+    except Exception:
+        git_rev = "unknown"
+    max_t = float(getattr(cfg, 'MAX_TRADE_USDT', 20.0) or 0.0)
+    size_desc = f"${max_t:.2f} USDT" if max_t > 0 else f"AUTO-COMPOUND ({getattr(cfg, 'SCANNER_TRADE_PCT', 99)}%)"
+    rbs_on = getattr(cfg, 'USE_RISK_BASED_SIZING', False)
+    lm_on = getattr(cfg, 'USE_LIMIT_MAKER_ENTRY', False)
+    print(f"[*] Git Version        : {git_rev}")
     print(f"[*] Target Environment : {mode}")
+    print("\n--- Active Trading & Risk Settings (.env + config.py) ---")
+    print(f"  MAX_TRADE_USDT       : {size_desc}")
+    print(f"  USE_RISK_BASED_SIZING: {'ON (' + str(getattr(cfg, 'MAX_RISK_PER_TRADE_PCT', 2.5)) + '% max risk/trade)' if rbs_on else 'OFF'}")
+    print(f"  MAX_OPEN_TRADES      : {getattr(cfg, 'MAX_OPEN_TRADES', 1)}")
+    print(f"  USE_LIMIT_MAKER_ENTRY: {'ON (' + str(getattr(cfg, 'LIMIT_MAKER_WAIT_SEC', 6.0)) + 's best-bid chase -> Market)' if lm_on else 'OFF (Market only)'}")
+    print(f"  MIN_SCAN_VOLUME_USDT : ${float(getattr(cfg, 'MIN_SCAN_VOLUME_USDT', 20000000)):,.0f} USDT")
+    print(f"  MIN_LISTING_AGE_DAYS : {getattr(cfg, 'MIN_LISTING_AGE_DAYS', 60)} days ({'ON' if getattr(cfg, 'ENABLE_LISTING_AGE_FILTER', True) else 'OFF'})")
+    print(f"  FUTURES_CONFIRMATION : {'ON (Public OI + Funding)' if getattr(cfg, 'ENABLE_FUTURES_CONFIRMATION', True) else 'OFF'}")
+    print(f"  WARN_ZERO_BNB        : {'ON' if getattr(cfg, 'WARN_ZERO_BNB', True) else 'OFF'} (Min ${float(getattr(cfg, 'MIN_BNB_FEE_RESERVE_USDT', 1.0)):.2f} USDT)")
+    print()
 
     api_key = getattr(cfg, 'API_KEY', '')
     api_secret = getattr(cfg, 'API_SECRET', '')

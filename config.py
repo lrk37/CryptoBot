@@ -47,9 +47,15 @@ SCANNER_RESCAN_INTERVAL = 300
 ALIGN_SCANS_TO_CANDLE = True
 SCAN_ALIGN_OFFSET_SEC = 3
 MAX_SIGNAL_AGE_SEC = 480  # Skip 15m signals > 8m after closed bar (1h signals scale proportionally)
-MIN_SCAN_VOLUME_USDT = 10000000
-MAX_SCAN_CANDIDATES = 50
-MIN_SCORE_TO_TRADE = 75
+MIN_SCAN_VOLUME_USDT = float(os.getenv('MIN_SCAN_VOLUME_USDT', '20000000'))
+MAX_SCAN_CANDIDATES = int(os.getenv('MAX_SCAN_CANDIDATES', '50'))
+MIN_SCORE_TO_TRADE = float(os.getenv('MIN_SCORE_TO_TRADE', '75'))
+ENABLE_LISTING_AGE_FILTER = os.getenv('ENABLE_LISTING_AGE_FILTER', 'True').lower() in ('true', '1', 't')
+MIN_LISTING_AGE_DAYS = int(os.getenv('MIN_LISTING_AGE_DAYS', '60'))
+ENABLE_FUTURES_CONFIRMATION = os.getenv('ENABLE_FUTURES_CONFIRMATION', 'True').lower() in ('true', '1', 't')
+FUTURES_MAX_OI_SPIKE_PCT = float(os.getenv('FUTURES_MAX_OI_SPIKE_PCT', '5.0'))
+FUTURES_MAX_FUNDING_PCT = float(os.getenv('FUTURES_MAX_FUNDING_PCT', '0.05'))
+FUTURES_OI_FLUSH_PCT = float(os.getenv('FUTURES_OI_FLUSH_PCT', '-1.5'))
 
 # --- 3. BTC Market Regime & Confirmation Gate ---
 ENABLE_BTC_REGIME_FILTER = True
@@ -67,6 +73,8 @@ MIN_NOTIONAL_USDT = float(os.getenv('MIN_NOTIONAL_USDT', '11'))
 USE_RISK_BASED_SIZING = os.getenv('USE_RISK_BASED_SIZING', 'False').lower() in ('true', '1', 't')
 MAX_RISK_PER_TRADE_PCT = float(os.getenv('MAX_RISK_PER_TRADE_PCT', '2.5'))
 USE_QUOTE_ORDER_QTY = True
+USE_LIMIT_MAKER_ENTRY = os.getenv('USE_LIMIT_MAKER_ENTRY', 'True').lower() in ('true', '1', 't')
+LIMIT_MAKER_WAIT_SEC = float(os.getenv('LIMIT_MAKER_WAIT_SEC', '6.0'))
 USE_EXCHANGE_OCO = True
 OCO_STOP_LIMIT_OFFSET_PCT = 0.8  # Place OCO stopLimitPrice 0.8% below stopPrice trigger
 ROUND_TRIP_FEE_PCT = 0.2
@@ -127,9 +135,9 @@ SNIPE_BLACKLIST = [
 ]
 
 # --- 7. Portfolio Risk & Circuit Breaker Limits ---
-MAX_DAILY_LOSS = 6
-MAX_TOTAL_DRAWDOWN_PCT = 12.0    # Multi-day kill-switch: halt if equity drops 12% below peak balance
-MAX_OPEN_TRADES = 1
+MAX_DAILY_LOSS = float(os.getenv('MAX_DAILY_LOSS', '6'))
+MAX_TOTAL_DRAWDOWN_PCT = float(os.getenv('MAX_TOTAL_DRAWDOWN_PCT', '12.0'))  # Multi-day kill-switch: halt if equity drops 12% below peak balance
+MAX_OPEN_TRADES = int(os.getenv('MAX_OPEN_TRADES', '1'))
 MAX_CONSECUTIVE_LOSSES = 2
 CONSECUTIVE_LOSS_COOLDOWN_SEC = 1800
 COOLDOWN_AFTER_SL_SEC = 43200
