@@ -131,7 +131,7 @@ class RiskManager:
 
     def __init__(self, cfg):
         self.cfg = cfg
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._positions: Dict[str, Position] = {}
         self._daily_start_bal = None
         self._peak_balance = None
@@ -284,10 +284,18 @@ class RiskManager:
 
             if exit_price > 0 and not already_logged and not already_in_applied:
                 if not already_in_loss_state:
-                    pnl = closed_slice.pnl_pct(exit_price)
-                    # F-20: Account for round-trip fees when determining if trade is a net loss
+                    dt_prev = pos.details or {}
+                    prev_part_pnl = float(dt_prev.get('partial_realized_pnl_usdt', 0.0) or 0.0)
+                    prev_part_qty = float(dt_prev.get('partial_sold_qty', 0.0) or 0.0)
+                    tot_qty = prev_part_qty + eff_qty
+                    tot_pnl_usdt = prev_part_pnl + closed_slice.pnl_usdt(exit_price)
+                    if pos.entry_price > 0 and tot_qty > 0:
+                        pnl = (tot_pnl_usdt / (pos.entry_price * tot_qty)) * 100.0
+                    else:
+                        pnl = closed_slice.pnl_pct(exit_price)
+                    # F-20: Account for round-trip fees when determining if full trade is a net loss
                     fees_pct = getattr(self.cfg, 'ROUND_TRIP_FEE_PCT', 0.2)
-                    is_loss = pnl < fees_pct or 'SL' in exit_reason or 'Stop-Loss' in exit_reason
+                    is_loss = pnl < fees_pct
                     if is_loss:
                         self._consecutive_losses += 1
                         max_consec = getattr(self.cfg, 'MAX_CONSECUTIVE_LOSSES', 2)
@@ -398,6 +406,12 @@ class RiskManager:
             pos.quantity = max(round(pos.quantity - sold_qty, 8), 0.0)
             if pos.details is None:
                 pos.details = {}
+            pos.details['partial_realized_pnl_usdt'] = float(
+                pos.details.get('partial_realized_pnl_usdt', 0.0) or 0.0
+            ) + (exit_price - pos.entry_price) * sold_qty
+            pos.details['partial_sold_qty'] = float(
+                pos.details.get('partial_sold_qty', 0.0) or 0.0
+            ) + sold_qty
             if fill_id:
                 applied = list(pos.details.get('applied_sell_ids') or [])
                 if fill_id not in applied:
@@ -443,11 +457,12 @@ class RiskManager:
             return list(self._positions.keys())
 
     def is_loss_halted(self) -> bool:
-        if time.time() < self._loss_halt_until:
-            remaining = int(self._loss_halt_until - time.time())
-            log.info(f"[LOSS HALT] Paused due to {self._consecutive_losses} consecutive losses - {remaining}s remaining")
-            return True
-        return False
+        with self._lock:
+            if time.time() < self._loss_halt_until:
+                remaining = int(self._loss_halt_until - time.time())
+                log.info(f"[LOSS HALT] Paused due to {self._consecutive_losses} consecutive losses - {remaining}s remaining")
+                return True
+            return False
 
     @property
     def consecutive_losses(self) -> int:
@@ -578,57 +593,85 @@ class RiskManager:
         with self._lock:
             return self._save_positions()
 
-    def check_circuit_breaker(self, current_balance: float) -> bool:
-        """Check daily loss and multi-day peak-equity drawdown circuit breakers.
-        Pass total portfolio value, not just USDT cash.
-        """
-        if current_balance <= 0:
-            log.warning(f"[CIRCUIT BREAKER] Ignoring non-positive portfolio balance ({current_balance})")
-            return self._halted
-
-        state_dirty = False
-        if self._peak_balance is None or self._peak_balance <= 0 or current_balance > self._peak_balance:
-            self._peak_balance = current_balance
-            state_dirty = True
-
-        today = datetime.now(timezone.utc).date()
-        if today != self._today:
-            self._today = today
-            self._daily_start_bal = current_balance
+    def reset_circuit_breaker(self, new_baseline: Optional[float] = None) -> bool:
+        """Reset peak & daily equity baselines (e.g. after a manual withdrawal) and clear active halt."""
+        with self._lock:
             self._halted = False
             self._last_halt_reason = ""
-            state_dirty = True
+            self._daily_start_bal = float(new_baseline) if (new_baseline and new_baseline > 0) else None
+            self._peak_balance = float(new_baseline) if (new_baseline and new_baseline > 0) else None
+            self._today = datetime.now(timezone.utc).date()
+            return self._save_loss_state()
 
-        if self._daily_start_bal is None or self._daily_start_bal <= 0:
-            self._daily_start_bal = current_balance
-            state_dirty = True
+    def check_circuit_breaker(self, current_balance: float) -> bool:
+        """Check daily loss and multi-day peak-equity drawdown circuit breakers.
+        Pass total portfolio value, not just USDT cash. Latches halt for the rest of the UTC day.
+        """
+        with self._lock:
+            if current_balance <= 0:
+                log.warning(f"[CIRCUIT BREAKER] Ignoring non-positive portfolio balance ({current_balance})")
+                return self._halted
 
-        if state_dirty:
-            self._save_loss_state()  # F-19: Persist daily & peak balance across restarts
+            state_dirty = False
+            today = datetime.now(timezone.utc).date()
+            if today != self._today:
+                self._today = today
+                self._daily_start_bal = current_balance
+                self._halted = False
+                self._last_halt_reason = ""
+                state_dirty = True
 
-        loss_pct = ((self._daily_start_bal - current_balance) / self._daily_start_bal) * 100.0
-        max_loss = getattr(self.cfg, 'MAX_DAILY_LOSS', 6.0)
-        if loss_pct >= max_loss:
-            if not self._halted:
+            if self._daily_start_bal is None or self._daily_start_bal <= 0:
+                self._daily_start_bal = current_balance
+                state_dirty = True
+            elif len(self._positions) == 0 and current_balance > self._daily_start_bal * 1.25:
+                # Adapt intraday baseline upward on external capital deposits (>25% jump while flat)
+                deposit_delta = current_balance - self._daily_start_bal
+                self._daily_start_bal = current_balance
+                if self._peak_balance and self._peak_balance > 0:
+                    self._peak_balance = max(current_balance, self._peak_balance + deposit_delta)
+                state_dirty = True
+                log.info(
+                    f"[CIRCUIT BREAKER] Detected capital deposit (+${deposit_delta:.2f}); "
+                    f"updated daily baseline to ${self._daily_start_bal:.2f}"
+                )
+
+            if self._peak_balance is None or self._peak_balance <= 0 or current_balance > self._peak_balance:
+                self._peak_balance = current_balance
+                state_dirty = True
+
+            # Once tripped on a given UTC day, stay latched for the rest of the day even on minor price rebounds
+            if self._halted:
+                if state_dirty:
+                    self._save_loss_state()
+                return True
+
+            loss_pct = ((self._daily_start_bal - current_balance) / self._daily_start_bal) * 100.0
+            max_loss = getattr(self.cfg, 'MAX_DAILY_LOSS', 6.0)
+            if loss_pct >= max_loss:
                 self._last_halt_reason = f"Daily loss {loss_pct:.2f}% >= {max_loss}%"
                 log.error(f"[CIRCUIT BREAKER] {self._last_halt_reason}. HALTING.")
                 self._halted = True
-            return True
+                self._save_loss_state()
+                return True
 
-        max_total_dd = float(getattr(self.cfg, 'MAX_TOTAL_DRAWDOWN_PCT', 0.0) or 0.0)
-        if max_total_dd > 0 and self._peak_balance and self._peak_balance > 0:
-            total_dd_pct = ((self._peak_balance - current_balance) / self._peak_balance) * 100.0
-            if total_dd_pct >= max_total_dd:
-                if not self._halted:
+            max_total_dd = float(getattr(self.cfg, 'MAX_TOTAL_DRAWDOWN_PCT', 0.0) or 0.0)
+            if max_total_dd > 0 and self._peak_balance and self._peak_balance > 0:
+                total_dd_pct = ((self._peak_balance - current_balance) / self._peak_balance) * 100.0
+                if total_dd_pct >= max_total_dd:
                     self._last_halt_reason = (
                         f"Peak equity drawdown {total_dd_pct:.2f}% >= {max_total_dd}% "
                         f"(Peak=${self._peak_balance:.2f}, Current=${current_balance:.2f})"
                     )
                     log.error(f"[CIRCUIT BREAKER] {self._last_halt_reason}. HALTING.")
                     self._halted = True
-                return True
+                    self._save_loss_state()
+                    return True
 
-        return False
+            if state_dirty:
+                self._save_loss_state()  # F-19: Persist daily & peak balance across restarts
+
+            return False
 
     @property
     def peak_balance(self) -> Optional[float]:
@@ -639,17 +682,32 @@ class RiskManager:
         return self._last_halt_reason
 
     def get_expectancy_stats(self) -> dict:
-        """Compute win rate, average win/loss, profit factor, and net expectancy per trade from trade_log."""
+        """Compute win rate, average win/loss, profit factor, and net expectancy per logical trade."""
         with self._lock:
             trades = list(self._trade_log)
-        total = len(trades)
-        if total == 0:
+        if not trades:
             return {
                 'total_trades': 0, 'wins': 0, 'losses': 0, 'win_rate_pct': 0.0,
                 'net_pnl_usdt': 0.0, 'avg_win_usdt': 0.0, 'avg_loss_usdt': 0.0,
                 'expectancy_usdt': 0.0, 'profit_factor': 0.0,
             }
-        pnls = [float(t.get('net_pnl_usdt', t.get('pnl_usdt', 0.0)) or 0.0) for t in trades]
+        # Group partial fills sharing the same trade_id so multi-slice exits count as 1 logical trade
+        grouped_pnls: List[float] = []
+        by_tid: Dict[str, int] = {}
+        for t in trades:
+            p = float(t.get('net_pnl_usdt', t.get('pnl_usdt', 0.0)) or 0.0)
+            tid = t.get('trade_id')
+            if tid:
+                if tid in by_tid:
+                    grouped_pnls[by_tid[tid]] += p
+                else:
+                    by_tid[tid] = len(grouped_pnls)
+                    grouped_pnls.append(p)
+            else:
+                grouped_pnls.append(p)
+
+        pnls = grouped_pnls
+        total = len(pnls)
         wins = [p for p in pnls if p > 0]
         losses = [p for p in pnls if p <= 0]
         net_total = sum(pnls)
@@ -667,16 +725,27 @@ class RiskManager:
             'profit_factor': round(gross_win / gross_loss, 2) if gross_loss > 0 else (99.9 if gross_win > 0 else 0.0),
         }
 
+    @staticmethod
+    def _atomic_write_json(target_fn: str, payload, indent: Optional[int] = None) -> bool:
+        tmp_fn = f"{target_fn}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            with open(tmp_fn, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, indent=indent)
+            os.replace(tmp_fn, target_fn)
+            return True
+        finally:
+            if os.path.exists(tmp_fn):
+                try:
+                    os.remove(tmp_fn)
+                except OSError:
+                    pass
+
     def _save_positions(self) -> bool:
-        # F-30: Atomic write — write to tmp then rename
+        # F-30: Thread-safe atomic write — write to per-thread tmp then rename
         try:
             fn = getattr(self.cfg, 'POSITIONS_FILE', 'positions.json')
             data = {k: asdict(v) for k, v in self._positions.items()}
-            tmp_fn = fn + '.tmp'
-            with open(tmp_fn, 'w') as f:
-                json.dump(data, f, indent=2)
-            os.replace(tmp_fn, fn)
-            return True
+            return self._atomic_write_json(fn, data, indent=2)
         except Exception as e:
             log.error(f"Failed to save positions: {e}")
             return False
@@ -685,7 +754,7 @@ class RiskManager:
         try:
             fn = getattr(self.cfg, 'POSITIONS_FILE', 'positions.json')
             if Path(fn).exists():
-                with open(fn, 'r') as f:
+                with open(fn, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     for k, v in data.items():
                         self._positions[k] = Position(**v)
@@ -693,7 +762,7 @@ class RiskManager:
             log.error(f"Failed to load positions: {e}")
 
     def _save_loss_state(self) -> bool:
-        # F-19: Also persist daily start balance, peak equity, and date. F-30: Atomic write.
+        # F-19: Persist daily start balance, peak equity, halt latch, and date. F-30: Thread-safe atomic write.
         try:
             data = {
                 'losses': self._consecutive_losses,
@@ -701,13 +770,11 @@ class RiskManager:
                 'daily_start_bal': self._daily_start_bal,
                 'peak_bal': self._peak_balance,
                 'today': str(self._today),
+                'halted': bool(self._halted),
+                'halt_reason': str(self._last_halt_reason or ''),
                 'applied_fill_ids': list(self._applied_loss_fill_ids[-200:]),
             }
-            tmp_fn = 'loss_state.json.tmp'
-            with open(tmp_fn, 'w') as f:
-                json.dump(data, f)
-            os.replace(tmp_fn, 'loss_state.json')
-            return True
+            return self._atomic_write_json('loss_state.json', data)
         except Exception as e:
             log.error(f"Failed to save loss state: {e}")
             return False
@@ -715,7 +782,7 @@ class RiskManager:
     def _load_loss_state(self):
         try:
             if Path('loss_state.json').exists():
-                with open('loss_state.json', 'r') as f:
+                with open('loss_state.json', 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     self._consecutive_losses = data.get('losses', 0)
                     self._loss_halt_until = data.get('halt_until', 0)
@@ -724,24 +791,22 @@ class RiskManager:
                     peak_bal = data.get('peak_bal')
                     if peak_bal is not None and float(peak_bal) > 0:
                         self._peak_balance = float(peak_bal)
-                    # F-19: Restore daily start balance if still same day
+                    # F-19: Restore daily start balance and same-day halt latch if still same UTC day
                     saved_today = data.get('today', '')
                     utc_today = datetime.now(timezone.utc).date()
                     if saved_today == str(utc_today):
                         self._daily_start_bal = data.get('daily_start_bal')
                         self._today = utc_today
+                        self._halted = bool(data.get('halted', False))
+                        self._last_halt_reason = str(data.get('halt_reason', '') or '')
         except Exception as e:
             log.error(f"Failed to load loss state: {e}")
 
     def _save_trade_log(self) -> bool:
-        # F-30: Atomic write
+        # F-30: Thread-safe atomic write
         try:
             fn = getattr(self.cfg, 'TRADE_LOG_FILE', 'trade_log.json')
-            tmp_fn = fn + '.tmp'
-            with open(tmp_fn, 'w') as f:
-                json.dump(self._trade_log, f, indent=2)
-            os.replace(tmp_fn, fn)
-            return True
+            return self._atomic_write_json(fn, self._trade_log, indent=2)
         except Exception as e:
             log.error(f"Failed to save trade log: {e}")
             return False
@@ -779,6 +844,7 @@ class RiskManager:
         entry = {
             # F-32: Use timezone-aware UTC datetime
             'timestamp': datetime.now(timezone.utc).isoformat(),
+            'trade_id': f"{pos.symbol}:{int(round(pos.open_time * 1000))}",
             'symbol': pos.symbol,
             'kind': pos.kind,
             'entry_price': pos.entry_price,

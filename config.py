@@ -61,30 +61,34 @@ HIGH_SCORE_THRESHOLD = 85
 REQUIRE_CONFIRMATION = False
 
 # --- 4. Position Sizing & Order Execution ---
-SCANNER_TRADE_PCT = 99
-MAX_TRADE_USDT = 20
-MIN_NOTIONAL_USDT = 11
-USE_RISK_BASED_SIZING = False    # Scale trade size inversely with SL distance when True
-MAX_RISK_PER_TRADE_PCT = 2.5     # Max % of MAX_TRADE_USDT risked at stop-loss when USE_RISK_BASED_SIZING=True
+SCANNER_TRADE_PCT = float(os.getenv('SCANNER_TRADE_PCT', '99'))
+MAX_TRADE_USDT = float(os.getenv('MAX_TRADE_USDT', '20'))  # Set 0 in .env to scale dynamically with USDT balance
+MIN_NOTIONAL_USDT = float(os.getenv('MIN_NOTIONAL_USDT', '11'))
+USE_RISK_BASED_SIZING = os.getenv('USE_RISK_BASED_SIZING', 'False').lower() in ('true', '1', 't')
+MAX_RISK_PER_TRADE_PCT = float(os.getenv('MAX_RISK_PER_TRADE_PCT', '2.5'))
 USE_QUOTE_ORDER_QTY = True
 USE_EXCHANGE_OCO = True
 OCO_STOP_LIMIT_OFFSET_PCT = 0.8  # Place OCO stopLimitPrice 0.8% below stopPrice trigger
 ROUND_TRIP_FEE_PCT = 0.2
+WARN_ZERO_BNB = os.getenv('WARN_ZERO_BNB', 'True').lower() in ('true', '1', 't')
+MIN_BNB_FEE_RESERVE_USDT = float(os.getenv('MIN_BNB_FEE_RESERVE_USDT', '1.0'))
 
 # --- 5. Dynamic Stop-Loss, Take-Profit & Trailing Parameters ---
+# Validated across 90d Dual-TF (93 trades, 87.1% WR, PF 3.23) & 365d Full-Year 1h (99 trades, 71.7% WR, PF 1.94):
+# Break-Even & Trailing arm together at +1.8% while OCO TP sits strictly higher (>= +2.0% / 2.2x ATR).
 MIN_SL_PCT = 1.5
-MIN_TP_PCT = 1.8
+MIN_TP_PCT = 2.0
 SCANNER_USE_ATR_STOPS = True
 SCANNER_ATR_SL_MULTIPLIER = 4.8
-SCANNER_ATR_TP_MULTIPLIER = 2.0
+SCANNER_ATR_TP_MULTIPLIER = 2.2
 SCANNER_STOP_LOSS_PCT = 4.5
-SCANNER_MAX_STOP_LOSS_PCT = 5.0
+SCANNER_MAX_STOP_LOSS_PCT = 4.8
 SCANNER_TAKE_PROFIT_PCT = 2.2
 SCANNER_TRAILING_STOP = True
 SCANNER_TRAILING_OFFSET = 0.7
-MIN_TRAILING_PROFIT_PCT = 1.6
+MIN_TRAILING_PROFIT_PCT = 1.6    # +0.2% RT fees => Trailing & Break-Even arm together at +1.8%
 ENABLE_BREAK_EVEN_STOP = True
-BREAK_EVEN_TRIGGER_PCT = 2.2
+BREAK_EVEN_TRIGGER_PCT = 1.8
 BREAK_EVEN_SLIPPAGE_BUFFER_PCT = 0.10
 MAX_SCANNER_HOLD_HOURS = 8
 
@@ -96,6 +100,11 @@ MAX_SPREAD_PCT = 0.25
 MIN_ORDERBOOK_RATIO = 0.70
 PARABOLIC_PUMP_MAX_PCT = 25.0
 MAX_24H_DUMP_PCT = -18.0
+MAX_24H_HIGH_DUMP_PCT = -18.0    # Also block intraday crashes >18% off the rolling 24h high
+MAX_FORMING_BOUNCE_PCT = 0.45    # Skip if forming bar already bounced >0.45% above signal close
+MAX_FORMING_HIGH_PCT = 0.85      # Skip if forming bar wick already ran >=0.85% above signal close
+MAX_FORMING_DUMP_PCT = -1.20     # Skip if forming bar is actively collapsing >1.2% below signal close
+SCANNER_MAX_WORKERS = 6          # Parallel kline fetch threads (cuts 50-symbol scan from ~25s to ~3s)
 
 # Stablecoins, wrapped tokens & fee token (BNB) excluded from scanning
 SNIPE_BLACKLIST = [

@@ -71,6 +71,40 @@ class ScannerEngine:
         self._in_flight_buys: set[str] = set()
 
         self._load_scanner_state()
+        self.sync_active_symbols()
+
+    def sync_active_symbols(self):
+        """Synchronize _active_symbols with RiskManager's currently open positions."""
+        with self._state_lock:
+            self._active_symbols = set(self.risk_mgr.all_position_symbols())
+
+    def _check_bnb_reserve(self):
+        """Warn in logs and Telegram (throttled to once/12h) if Live Spot BNB fee reserve is depleted or low."""
+        if getattr(cfg, 'USE_TESTNET', False) or not getattr(cfg, 'WARN_ZERO_BNB', True):
+            return
+        if not hasattr(self.exchange, 'check_bnb_fee_reserve'):
+            return
+        try:
+            min_bnb = float(getattr(cfg, 'MIN_BNB_FEE_RESERVE_USDT', 1.0) or 1.0)
+            status = self.exchange.check_bnb_fee_reserve(min_bnb_usdt=min_bnb)
+            if not status.get('ok', True):
+                rsn = status.get('reason', 'LOW_BNB')
+                bnb_free = float(status.get('bnb_free', 0.0) or 0.0)
+                bnb_usdt = float(status.get('bnb_usdt', 0.0) or 0.0)
+                if rsn == 'ZERO_BNB':
+                    msg = (
+                        "BNB fee reserve is 0.00 BNB! Binance will deduct 0.10% fees from bought "
+                        "altcoins (creating unsellable LOT_SIZE dust). Top up ~$2-$5 BNB in Spot."
+                    )
+                else:
+                    msg = (
+                        f"BNB fee reserve is low ({bnb_free:.5f} BNB ~ ${bnb_usdt:.2f} USDT < ${min_bnb:.2f}). "
+                        f"Top up BNB soon to keep the 25% fee discount and avoid altcoin dust."
+                    )
+                log.warning(f"[BNB FEE WARNING] {msg}")
+                self._alert_throttled("bnb_fee_reserve", msg, min_interval=43200.0)
+        except Exception as e:
+            log.debug(f"[BNB CHECK] Skipped: {e}")
 
     def _alert_throttled(self, key: str, message: str, min_interval: float = 900.0):
         """Send a Telegram operational alert at most once per `min_interval` seconds per key."""
@@ -87,11 +121,19 @@ class ScannerEngine:
         except Exception as e:
             log.warning(f"[ALERT ERROR] {key}: {e}")
 
-    def _record_cooldown(self, symbol: str, reason: str) -> int:
-        """Apply and persist per-symbol post-exit cooldown (extended after STOP_LOSS)."""
+    def _record_cooldown(self, symbol: str, reason: str, net_pnl_pct: float = None) -> int:
+        """Apply and persist per-symbol post-exit cooldown (12h after losing SL/invalidation, 1h after wins/BE)."""
         cooldown_sec = getattr(cfg, 'SYMBOL_COOLDOWN_SEC', 3600)
-        if "STOP_LOSS" in str(reason) and getattr(cfg, 'STRATEGY_MODE', 'capitulation') == 'capitulation':
-            cooldown_sec = max(cooldown_sec, getattr(cfg, 'COOLDOWN_AFTER_SL_SEC', 43200))
+        if getattr(cfg, 'STRATEGY_MODE', 'capitulation') == 'capitulation':
+            rsn_str = str(reason or '')
+            if net_pnl_pct is None:
+                is_lockout = "STOP_LOSS" in rsn_str
+            else:
+                is_lockout = (net_pnl_pct < 0) and (
+                    "STOP_LOSS" in rsn_str or rsn_str in ("TREND_INVALIDATED", "MAX_HOLD_TIMEOUT")
+                )
+            if is_lockout:
+                cooldown_sec = max(cooldown_sec, getattr(cfg, 'COOLDOWN_AFTER_SL_SEC', 43200))
         with self._state_lock:
             self._symbol_cooldowns[symbol] = time.time() + cooldown_sec
         self._save_scanner_state()
@@ -175,6 +217,7 @@ class ScannerEngine:
             portfolio_val = self.exchange.get_portfolio_value(symbols=pos_symbols, quantities=pos_qty)
         if portfolio_val > 0:
             self._maybe_send_daily_heartbeat(portfolio_val)
+        self._check_bnb_reserve()
 
         if self.risk_mgr.check_circuit_breaker(portfolio_val):
             today_str = str(datetime.now(timezone.utc).date())
@@ -201,6 +244,8 @@ class ScannerEngine:
         if not results:
             log.info("[SCANNER ENGINE] No candidates passed scoring threshold")
             try:
+                update_forward_returns(self.exchange, price_map=getattr(self.scanner, '_last_tickers_24h', None))
+            except TypeError:
                 update_forward_returns(self.exchange)
             except Exception as e:
                 log.warning(f"[SCAN LOGGER] Forward tracking exception: {e}")
@@ -239,15 +284,20 @@ class ScannerEngine:
                 if self._is_signal_stale(res):
                     continue
 
-                # 2. High Score Override (>=80) fast-tracks entry (only in Bullish BTC regime)
+                # 2. High Score Override (>=80) fast-tracks entry
                 if score >= high_thresh and getattr(cfg, 'ENABLE_HIGH_SCORE_OVERRIDE', True):
                     log.info(f"[CONFIRMATION BYPASS] {symbol} score {score:.0f} >= {high_thresh:.0f} - fast-tracking entry!")
-                    self._execute_entry(res)
-                    break
+                    if self._execute_entry(res):
+                        break
+                    continue
 
                 # 2-Scan Candle-Based Confirmation System
                 if require_confirm:
-                    self._curr_high_scores[symbol] = {'score': score, 'last_closed_time': closed_time}
+                    self._curr_high_scores[symbol] = {
+                        'score': score,
+                        'last_closed_time': closed_time,
+                        'recorded_at': now,
+                    }
 
                     if symbol in self._prev_high_scores:
                         prev_info = self._prev_high_scores[symbol]
@@ -255,23 +305,28 @@ class ScannerEngine:
                         prev_time = prev_info.get('last_closed_time', 0)
 
                         if closed_time > prev_time:
-                            log.info(f"[CONFIRMATION CONFIRMED] {symbol} scored high on distinct 15m candles ({prev_score:.0f} -> {score:.0f}) - executing!")
-                            self._execute_entry(res)
-                            break
+                            log.info(f"[CONFIRMATION CONFIRMED] {symbol} scored high on distinct candles ({prev_score:.0f} -> {score:.0f}) - executing!")
+                            if self._execute_entry(res):
+                                self._curr_high_scores.pop(symbol, None)
+                                self._prev_high_scores.pop(symbol, None)
+                                break
                         else:
-                            log.info(f"[CONFIRMATION WAIT] {symbol} same 15m candle as previous scan ({closed_time}) - waiting for next closed candle")
+                            log.info(f"[CONFIRMATION WAIT] {symbol} same candle as previous scan ({closed_time}) - waiting for next closed candle")
                     else:
                         log.info(f"[CONFIRMATION WAIT] {symbol} score {score:.0f} >= 60 - waiting for 2nd scan confirmation")
                 else:
-                    self._execute_entry(res)
-                    break
+                    if self._execute_entry(res):
+                        break
         finally:
             if expired_removed:
                 self._save_scanner_state()
             # Log candidates & update historical forward returns AFTER entry execution (avoids retry lag on buys)
             try:
                 log_scan_candidates(results, self.exchange)
-                update_forward_returns(self.exchange)
+                try:
+                    update_forward_returns(self.exchange, price_map=getattr(self.scanner, '_last_tickers_24h', None))
+                except TypeError:
+                    update_forward_returns(self.exchange)
             except Exception as e:
                 log.warning(f"[SCAN LOGGER] Forward tracking exception: {e}")
 
@@ -457,7 +512,18 @@ class ScannerEngine:
             if getattr(cfg, 'USE_EXCHANGE_OCO', True):
                 try:
                     oco = self.exchange.create_oco_sell(symbol, exec_qty, target_pos.take_profit, target_pos.stop_loss)
-                    self._record_or_rollback_oco(symbol, target_pos, oco, target_pos.stop_loss, tag="OCO ENTRY")
+                    if oco is None and getattr(self.exchange, 'last_oco_filter_rejected', False):
+                        target_pos.details.pop('oco_order_list_id', None)
+                        target_pos.details.pop('oco_stop_loss', None)
+                        target_pos.details['oco_needs_sync'] = False
+                        target_pos.details['oco_filter_blocked_qty'] = round(exec_qty, 8)
+                        self.risk_mgr.persist_positions()
+                        log.warning(
+                            f"[OCO ENTRY SKIPPED] {symbol} qty={exec_qty} rejected by exchange filters (-1013/minQty); "
+                            f"relying on client-side monitor exits."
+                        )
+                    else:
+                        self._record_or_rollback_oco(symbol, target_pos, oco, target_pos.stop_loss, tag="OCO ENTRY")
                 except Exception as e:
                     target_pos.details['oco_needs_sync'] = True
                     self.risk_mgr.persist_positions()
@@ -482,7 +548,6 @@ class ScannerEngine:
         today_str = str(datetime.now(timezone.utc).date())
         if self._heartbeat_sent_date == today_str:
             return
-        self._heartbeat_sent_date = today_str
         try:
             stats = self.risk_mgr.get_expectancy_stats() if hasattr(self.risk_mgr, 'get_expectancy_stats') else {}
             peak_val = getattr(self.risk_mgr, 'peak_balance', None) or portfolio_val
@@ -492,21 +557,30 @@ class ScannerEngine:
                 f"Trades={stats.get('total_trades', 0)} ({stats.get('win_rate_pct', 0.0):.1f}% WR, "
                 f"Exp=${stats.get('expectancy_usdt', 0.0):+.2f})"
             )
+            sent_ok = True
             if hasattr(self.notifier, 'daily_heartbeat'):
-                self.notifier.daily_heartbeat(portfolio_val, peak_val, open_cnt, stats)
+                res = self.notifier.daily_heartbeat(portfolio_val, peak_val, open_cnt, stats)
+                if getattr(self.notifier, 'enabled', False) and res is False:
+                    sent_ok = False
+            if sent_ok:
+                self._heartbeat_sent_date = today_str
+                self._save_scanner_state()
         except Exception as e:
             log.warning(f"[HEARTBEAT ERROR] {e}")
 
-    def _execute_entry(self, res: ScanResult):
+    def _execute_entry(self, res: ScanResult) -> bool:
         symbol = res.symbol
         price = res.close_price
 
         bal = self.exchange.get_usdt_balance()
-        max_usdt = getattr(cfg, 'MAX_TRADE_USDT', 20.0)
-        # F-18: Use SCANNER_TRADE_PCT config instead of hardcoded 0.99
-        trade_pct = getattr(cfg, 'SCANNER_TRADE_PCT', 99) / 100.0
-        usable_bal = bal * trade_pct if bal < max_usdt else max_usdt
-        usdt_amount = min(usable_bal, max_usdt)
+        max_usdt = float(getattr(cfg, 'MAX_TRADE_USDT', 20.0) or 0.0)
+        # F-18: Use SCANNER_TRADE_PCT config instead of hardcoded 0.99; MAX_TRADE_USDT<=0 auto-scales with balance
+        trade_pct = float(getattr(cfg, 'SCANNER_TRADE_PCT', 99)) / 100.0
+        if max_usdt <= 0:
+            usdt_amount = bal * trade_pct
+        else:
+            usable_bal = bal * trade_pct if bal < max_usdt else max_usdt
+            usdt_amount = min(usable_bal, max_usdt)
         min_notional = getattr(cfg, 'MIN_NOTIONAL_USDT', 11.0)
 
         if getattr(cfg, 'USE_RISK_BASED_SIZING', False) and price > 0 and usdt_amount >= min_notional:
@@ -521,7 +595,7 @@ class ScannerEngine:
 
         if usdt_amount < min_notional:
             log.warning(f"[ENTRY FAILED] Insufficient balance for {symbol}: ${usdt_amount:.2f}")
-            return
+            return False
 
         tf = getattr(res, 'timeframe', getattr(cfg, 'SCANNER_INTERVAL', '15m'))
         scan_details = {
@@ -554,10 +628,10 @@ class ScannerEngine:
             with self._state_lock:
                 if symbol in self._pending_buys or symbol in self._in_flight_buys:
                     log.warning(f"[ENTRY DEFERRED] Unresolved buy order already tracked for {symbol}")
-                    return
+                    return False
                 if self.risk_mgr.has_position(symbol):
                     log.warning(f"[ENTRY DEFERRED] Position already tracked for {symbol}")
-                    return
+                    return False
                 if hasattr(self.exchange, 'new_client_order_id'):
                     buy_oid = self.exchange.new_client_order_id(symbol, 'BUY')
                     meta['client_oid'] = buy_oid
@@ -571,7 +645,7 @@ class ScannerEngine:
                             f"[ENTRY ABORTED] Failed to persist scanner state for {symbol}; "
                             f"refusing unrecorded market buy."
                         )
-                        return
+                        return False
 
         try:
             order = self._call_market_buy(symbol, usdt_amount=usdt_amount, client_oid=buy_oid)
@@ -587,7 +661,7 @@ class ScannerEngine:
                         if state == 'NOT_FOUND':
                             self._clear_pending_buy(symbol)
                             log.error(f"[ENTRY FAILED] Market buy failed for {symbol}")
-                            return
+                            return False
                         if state == 'FOUND' and rec is not None:
                             order = rec
                         else:
@@ -599,12 +673,12 @@ class ScannerEngine:
                                 f"[ENTRY UNCERTAIN] Market buy {buy_oid} for {symbol} could not be confirmed; "
                                 f"keeping persisted pending_buy for next reconciliation tick."
                             )
-                            return
+                            return True
                     else:
                         if buy_oid:
                             self._clear_pending_buy(symbol)
                         log.error(f"[ENTRY FAILED] Market buy failed for {symbol}")
-                        return
+                        return False
 
                 if not self._order_is_terminal(order):
                     if buy_oid:
@@ -622,9 +696,9 @@ class ScannerEngine:
                             f"[ENTRY ABORTED] Market buy for {symbol} returned non-terminal status="
                             f"{order.get('status', 'UNKNOWN')} without reconciliation support."
                         )
-                    return
+                    return True
 
-                self._finalize_buy_order(symbol, order, meta, clear_pending=bool(buy_oid))
+                return self._finalize_buy_order(symbol, order, meta, clear_pending=bool(buy_oid))
         finally:
             if buy_oid:
                 with self._order_reconcile_lock:
@@ -635,7 +709,14 @@ class ScannerEngine:
                             self._save_scanner_state()
 
     def _rotate_scores(self):
-        self._prev_high_scores = self._curr_high_scores.copy()
+        now = time.time()
+        max_keep_sec = 7200.0
+        merged = {
+            sym: info for sym, info in self._prev_high_scores.items()
+            if isinstance(info, dict) and (now - float(info.get('recorded_at', now) or now)) <= max_keep_sec
+        }
+        merged.update(self._curr_high_scores)
+        self._prev_high_scores = merged
         self._curr_high_scores.clear()
         self._save_scanner_state()
 
@@ -671,8 +752,9 @@ class ScannerEngine:
         oco_fill_id = f"OCO:{oco_id}:{fill.get('order_id') or fill.get('time') or ''}"
         remaining = pos.quantity - fill_qty
         if fill_qty < pos.quantity * 0.99 and remaining > 1e-8:
+            ref_px = min(exit_px, pos.stop_loss) if pos.stop_loss > 0 else exit_px
             sellable_rem = (
-                self.exchange.is_sellable_qty(symbol, remaining, exit_px)
+                self.exchange.is_sellable_qty(symbol, remaining, ref_px)
                 if hasattr(self.exchange, 'is_sellable_qty')
                 else True
             )
@@ -698,8 +780,12 @@ class ScannerEngine:
             )
 
         log.info(f"[EXCHANGE FILL] {symbol} OCO leg filled ({reason}) qty={fill_qty} at {exit_px:.6f}")
-        pnl_pct = pos.pnl_pct(exit_px)
-        pnl_usdt = (exit_px - pos.entry_price) * fill_qty
+        fees_pct = float(getattr(cfg, 'ROUND_TRIP_FEE_PCT', 0.2) or 0.0)
+        gross_pnl_pct = pos.pnl_pct(exit_px)
+        gross_pnl_usdt = (exit_px - pos.entry_price) * fill_qty
+        est_fee_usdt = (pos.entry_price * fill_qty + exit_px * fill_qty) * (fees_pct / 200.0)
+        pnl_pct = gross_pnl_pct - fees_pct
+        pnl_usdt = gross_pnl_usdt - est_fee_usdt
         dur_sec = max(0.0, fill_ts - pos.open_time)
         if not self.risk_mgr.close_position(
             symbol, exit_px, f"OCO_{reason}",
@@ -717,7 +803,7 @@ class ScannerEngine:
 
         with self._state_lock:
             self._active_symbols.discard(symbol)
-        self._record_cooldown(symbol, reason)
+        self._record_cooldown(symbol, reason, net_pnl_pct=pnl_pct)
         self.notifier.trade_closed(
             symbol, f"OCO_{reason}", pos.entry_price, exit_px, pnl_pct,
             duration_sec=dur_sec, pnl_usdt=pnl_usdt, open_time=pos.open_time, close_time=fill_ts
@@ -1037,7 +1123,17 @@ class ScannerEngine:
                 return
             oco_qty = min(actual_qty, pos.quantity)
             oco = self.exchange.create_oco_sell(symbol, oco_qty, pos.take_profit, pos.stop_loss)
-            if self._record_or_rollback_oco(symbol, pos, oco, pos.stop_loss, tag="OCO SYNC"):
+            if oco is None and getattr(self.exchange, 'last_oco_filter_rejected', False):
+                pos.details.pop('oco_order_list_id', None)
+                pos.details.pop('oco_stop_loss', None)
+                pos.details['oco_needs_sync'] = False
+                pos.details['oco_filter_blocked_qty'] = round(oco_qty, 8)
+                self.risk_mgr.persist_positions()
+                log.warning(
+                    f"[OCO SYNC SKIPPED] {symbol} qty={oco_qty} rejected by exchange filters (-1013/minQty); "
+                    f"disabling OCO re-sync loop and relying on client-side monitor."
+                )
+            elif self._record_or_rollback_oco(symbol, pos, oco, pos.stop_loss, tag="OCO SYNC"):
                 log.info(f"[OCO SYNC] {symbol} exchange OCO stop updated to {pos.stop_loss:.6f}")
             elif not oco or oco.get('orderListId') is None:
                 log.warning(f"[OCO SYNC] {symbol} OCO replacement returned None; will retry on next monitor tick")
@@ -1109,8 +1205,9 @@ class ScannerEngine:
         # Reconcile partial fills: keep remaining position open when it is still sellable on Binance
         remaining = pos.quantity - exec_qty
         if exec_qty < pos.quantity * 0.99 and remaining > 1e-8:
+            ref_px = min(exit_price, pos.stop_loss) if pos.stop_loss > 0 else exit_price
             sellable_rem = (
-                self.exchange.is_sellable_qty(symbol, remaining, exit_price)
+                self.exchange.is_sellable_qty(symbol, remaining, ref_px)
                 if hasattr(self.exchange, 'is_sellable_qty')
                 else True
             )
@@ -1132,9 +1229,13 @@ class ScannerEngine:
                 f"remainder {remaining:.8f} below exchange minQty/minNotional — finalizing close."
             )
 
-        # Full fill (or dust remainder): compute realized P&L on actual executed quantity
-        pnl_pct = pos.pnl_pct(exit_price)
-        pnl_usdt = (exit_price - pos.entry_price) * exec_qty
+        # Full fill (or dust remainder): compute net realized P&L (after estimated round-trip fees)
+        fees_pct = float(getattr(cfg, 'ROUND_TRIP_FEE_PCT', 0.2) or 0.0)
+        gross_pnl_pct = pos.pnl_pct(exit_price)
+        gross_pnl_usdt = (exit_price - pos.entry_price) * exec_qty
+        est_fee_usdt = (pos.entry_price * exec_qty + exit_price * exec_qty) * (fees_pct / 200.0)
+        pnl_pct = gross_pnl_pct - fees_pct
+        pnl_usdt = gross_pnl_usdt - est_fee_usdt
 
         tx_ms = order.get('transactTime') or order.get('updateTime') or order.get('time')
         close_ts = (float(tx_ms) / 1000.0) if tx_ms else time.time()
@@ -1155,7 +1256,7 @@ class ScannerEngine:
         with self._state_lock:
             self._active_symbols.discard(symbol)
 
-        cooldown_sec = self._record_cooldown(symbol, reason)
+        cooldown_sec = self._record_cooldown(symbol, reason, net_pnl_pct=pnl_pct)
         log.info(f"[COOLDOWN SET] {symbol} placed on {cooldown_sec // 60}m cooldown after trade close ({reason})")
 
         self.notifier.trade_closed(
@@ -1343,12 +1444,20 @@ class ScannerEngine:
                     'curr_high_scores': dict(self._curr_high_scores),
                     'pending_buys': dict(self._pending_buys),
                     'symbol_cooldowns': active_cooldowns,
+                    'heartbeat_sent_date': self._heartbeat_sent_date,
                     'timestamp': now,
                 }
-            tmp_path = 'scanner_state.json.tmp'
-            with open(tmp_path, 'w') as f:
-                json.dump(data, f)
-            os.replace(tmp_path, 'scanner_state.json')
+            tmp_path = f"scanner_state.json.{os.getpid()}.{threading.get_ident()}.tmp"
+            try:
+                with open(tmp_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f)
+                os.replace(tmp_path, 'scanner_state.json')
+            finally:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
             return True
         except Exception as e:
             log.error(f"Failed to save scanner state: {e}")
@@ -1358,12 +1467,15 @@ class ScannerEngine:
         try:
             if Path('scanner_state.json').exists():
                 now = time.time()
-                with open('scanner_state.json', 'r') as f:
+                with open('scanner_state.json', 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     with self._state_lock:
                         self._prev_high_scores = data.get('prev_high_scores', {})
                         self._curr_high_scores = data.get('curr_high_scores', {})
                         self._pending_buys = data.get('pending_buys', {})
+                        saved_hb = data.get('heartbeat_sent_date')
+                        if saved_hb:
+                            self._heartbeat_sent_date = str(saved_hb)
                         raw_cd = data.get('symbol_cooldowns', {}) or {}
                         self._symbol_cooldowns = {
                             k: float(v) for k, v in raw_cd.items()
@@ -1398,6 +1510,15 @@ def main():
     connector = BinanceConnector(cfg)
     risk_mgr = RiskManager(cfg)
     risk_mgr.set_exchange(connector)
+
+    if '--reset-breaker' in sys.argv:
+        pos_syms = risk_mgr.all_position_symbols()
+        pos_qty = {s: risk_mgr.get_position(s).quantity for s in pos_syms if risk_mgr.get_position(s)}
+        cur_eq = connector.get_portfolio_value(symbols=pos_syms, quantities=pos_qty)
+        risk_mgr.reset_circuit_breaker(cur_eq if cur_eq > 0 else None)
+        log.info(f"[CIRCUIT BREAKER RESET] Baselines reset to current equity (${cur_eq:.2f} USDT). Exiting.")
+        return
+
     notifier = TelegramNotifier(cfg)
 
     engine = ScannerEngine(connector, risk_mgr, notifier)
@@ -1409,6 +1530,8 @@ def main():
         log.warning(f"[STARTUP RECONCILE] Failed startup reconciliation pass: {e}")
 
     risk_mgr.validate_positions(connector)
+    engine.sync_active_symbols()
+    engine._check_bnb_reserve()
 
     engine.start()
 

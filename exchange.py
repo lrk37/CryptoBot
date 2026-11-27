@@ -30,7 +30,20 @@ class BinanceConnector:
     def __init__(self, cfg):
         self.cfg = cfg
         self.client = Client(cfg.API_KEY, cfg.API_SECRET, testnet=cfg.USE_TESTNET)
-        self.client.recvWindow = 10000
+        recv_win = int(getattr(cfg, 'RECV_WINDOW_MS', 10000) or 10000)
+        self.client.recvWindow = recv_win
+        if hasattr(self.client, '_get_request_kwargs'):
+            _orig_req_kw = self.client._get_request_kwargs
+            def _with_recv_window(method, signed: bool, force_params: bool = False, **kw):
+                if signed:
+                    d = kw.get('data')
+                    if d is None:
+                        d = {}
+                        kw['data'] = d
+                    if isinstance(d, dict):
+                        d.setdefault('recvWindow', recv_win)
+                return _orig_req_kw(method, signed, force_params, **kw)
+            self.client._get_request_kwargs = _with_recv_window
 
         self._sync_time()
 
@@ -58,6 +71,7 @@ class BinanceConnector:
         self._portfolio_lock = threading.Lock()
         self._last_prices: Dict[str, float] = {}
         self._last_order_unsent = False
+        self._last_oco_filter_rejected = False
 
     def _sync_time(self) -> bool:
         """Synchronize local client clock offset with Binance server time."""
@@ -115,6 +129,11 @@ class BinanceConnector:
     def last_order_confirmed_unsent(self) -> bool:
         """True if the most recent market_buy/market_sell failed locally or Binance confirmed -2013/rejection."""
         return bool(self._last_order_unsent)
+
+    @property
+    def last_oco_filter_rejected(self) -> bool:
+        """True if the most recent create_oco_sell failed permanently on exchange filters (-1013/minQty)."""
+        return bool(getattr(self, '_last_oco_filter_rejected', False))
 
     @staticmethod
     def is_order_terminal(order) -> bool:
@@ -398,6 +417,25 @@ class BinanceConnector:
         base_asset = symbol.removesuffix('USDT')
         return self.get_balance(base_asset, include_locked=True)
 
+    def check_bnb_fee_reserve(self, min_bnb_usdt: float = 1.0) -> dict:
+        """Check free BNB balance and its approximate USDT value for Spot fee coverage."""
+        bnb_free = self._get_cached_balance('BNB')
+        if bnb_free <= 0:
+            return {'ok': False, 'bnb_free': 0.0, 'bnb_usdt': 0.0, 'reason': 'ZERO_BNB'}
+        bnb_px = self._last_prices.get('BNBUSDT', 0.0)
+        if bnb_px <= 0:
+            try:
+                t = self._retry(self.market_client.get_symbol_ticker, symbol='BNBUSDT')
+                bnb_px = float((t or {}).get('price', 0.0) or 0.0)
+                if bnb_px > 0:
+                    self._last_prices['BNBUSDT'] = bnb_px
+            except Exception:
+                bnb_px = 0.0
+        bnb_usdt = bnb_free * bnb_px if bnb_px > 0 else 0.0
+        if bnb_px > 0 and bnb_usdt < min_bnb_usdt:
+            return {'ok': False, 'bnb_free': bnb_free, 'bnb_usdt': bnb_usdt, 'reason': 'LOW_BNB'}
+        return {'ok': True, 'bnb_free': bnb_free, 'bnb_usdt': bnb_usdt, 'reason': 'OK'}
+
     def net_executed_qty(self, order, symbol):
         """Executed base quantity minus any commission taken in the base asset = what you actually hold."""
         if not order:
@@ -544,10 +582,24 @@ class BinanceConnector:
                 return self._info_cache.get(symbol)
         return self._info_cache.get(symbol)
 
-    def _round_lot(self, symbol, quantity):
+    @staticmethod
+    def _decimal_to_str(d_val: Decimal) -> str:
+        """Format a Decimal in plain fixed-point notation (never scientific notation like '5e-05')."""
+        s = format(d_val.normalize(), 'f')
+        if '.' in s:
+            s = s.rstrip('0').rstrip('.')
+        return s or '0'
+
+    def _round_lot_decimal(self, symbol, quantity) -> Decimal:
+        try:
+            d_qty = Decimal(str(quantity))
+        except (InvalidOperation, ValueError):
+            return Decimal('0')
+        if d_qty <= 0:
+            return Decimal('0')
         info = self._get_symbol_info(symbol)
         if not info:
-            return quantity
+            return d_qty
         step_str = None
         for f in info.get('filters', []):
             if f.get('filterType') == 'LOT_SIZE':
@@ -557,18 +609,32 @@ class BinanceConnector:
             try:
                 d_step = Decimal(step_str).normalize()
                 if d_step > 0:
-                    d_qty = Decimal(str(quantity))
-                    floored = (d_qty / d_step).to_integral_value(rounding=ROUND_DOWN) * d_step
-                    return float(floored)
+                    return (d_qty / d_step).to_integral_value(rounding=ROUND_DOWN) * d_step
             except (InvalidOperation, ValueError, ZeroDivisionError):
                 pass
-        return quantity
+        return d_qty
 
-    def _round_price(self, symbol, price):
-        """Round price to the nearest exact multiple of PRICE_FILTER tickSize."""
+    def _round_lot(self, symbol, quantity):
+        if quantity <= 0:
+            return quantity
         info = self._get_symbol_info(symbol)
-        if not info or price <= 0:
-            return price
+        if not info:
+            return quantity
+        return float(self._round_lot_decimal(symbol, quantity))
+
+    def _format_qty(self, symbol, quantity) -> str:
+        return self._decimal_to_str(self._round_lot_decimal(symbol, quantity))
+
+    def _round_price_decimal(self, symbol, price) -> Decimal:
+        try:
+            d_px = Decimal(str(price))
+        except (InvalidOperation, ValueError):
+            return Decimal('0')
+        if d_px <= 0:
+            return d_px
+        info = self._get_symbol_info(symbol)
+        if not info:
+            return d_px
         tick_str = None
         for f in info.get('filters', []):
             if f.get('filterType') == 'PRICE_FILTER':
@@ -578,12 +644,20 @@ class BinanceConnector:
             try:
                 d_tick = Decimal(tick_str).normalize()
                 if d_tick > 0:
-                    d_px = Decimal(str(price))
-                    rounded = (d_px / d_tick).to_integral_value(rounding=ROUND_HALF_UP) * d_tick
-                    return float(rounded)
+                    return (d_px / d_tick).to_integral_value(rounding=ROUND_HALF_UP) * d_tick
             except (InvalidOperation, ValueError, ZeroDivisionError):
                 pass
-        return price
+        return d_px
+
+    def _round_price(self, symbol, price):
+        """Round price to the nearest exact multiple of PRICE_FILTER tickSize."""
+        info = self._get_symbol_info(symbol)
+        if not info or price <= 0:
+            return price
+        return float(self._round_price_decimal(symbol, price))
+
+    def _format_price(self, symbol, price) -> str:
+        return self._decimal_to_str(self._round_price_decimal(symbol, price))
 
     def _get_min_qty(self, symbol):
         info = self._get_symbol_info(symbol)
@@ -659,11 +733,12 @@ class BinanceConnector:
             log.warning(f"{symbol}: qty {qty} below minQty {min_qty}")
             self._last_order_unsent = True
             return None
-        log.info(f"[BUY]  {qty} {symbol}")
+        qty_str = self._format_qty(symbol, quantity)
+        log.info(f"[BUY]  {qty_str} {symbol}")
         try:
             order = self._submit_order_idempotent(
                 self.client.order_market_buy, symbol=symbol, side='BUY',
-                client_oid=client_oid, quantity=qty
+                client_oid=client_oid, quantity=qty_str
             )
             self.invalidate_balance_cache()
             return order
@@ -676,24 +751,26 @@ class BinanceConnector:
 
     def market_sell(self, symbol, quantity, client_oid: str = None):
         self._last_order_unsent = False
-        qty = self._round_lot(symbol, quantity)
+        sell_target = quantity
+        qty = self._round_lot(symbol, sell_target)
         if qty <= 0:
             self._last_order_unsent = True
             return None
         min_qty = self._get_min_qty(symbol)
         if qty < min_qty:
             log.warning(f"{symbol}: sell qty {qty} below minQty {min_qty}, checking actual balance capped to {quantity}")
-            actual = min(self.get_asset_balance_fresh(symbol), quantity)
-            qty = self._round_lot(symbol, actual)
+            sell_target = min(self.get_asset_balance_fresh(symbol), quantity)
+            qty = self._round_lot(symbol, sell_target)
             if qty < min_qty:
-                log.error(f"{symbol}: capped sell balance {actual} (qty={qty}) is below minQty {min_qty}")
+                log.error(f"{symbol}: capped sell balance {sell_target} (qty={qty}) is below minQty {min_qty}")
                 self._last_order_unsent = True
                 return None
-        log.info(f"[SELL] {qty} {symbol}")
+        qty_str = self._format_qty(symbol, sell_target)
+        log.info(f"[SELL] {qty_str} {symbol}")
         try:
             order = self._submit_order_idempotent(
                 self.client.order_market_sell, symbol=symbol, side='SELL',
-                client_oid=client_oid, quantity=qty
+                client_oid=client_oid, quantity=qty_str
             )
             self.invalidate_balance_cache()
             return order
@@ -830,6 +907,8 @@ class BinanceConnector:
                 had_api_success = True
                 if isinstance(ol, dict):
                     list_status = str(ol.get('listOrderStatus', '')).upper()
+                    if list_status == 'EXECUTING':
+                        return {'status': 'OPEN', 'order_list_id': order_list_id, 'qty': 0.0}
                     for ref in ol.get('orders') or []:
                         if ref.get('orderId') is not None:
                             child_ids.add(int(ref['orderId']))
@@ -946,6 +1025,7 @@ class BinanceConnector:
 
     def create_oco_sell(self, symbol, quantity, take_profit, stop_loss):
         """Place an OCO (One-Cancels-the-Other) sell order on Binance to protect the position."""
+        self._last_oco_filter_rejected = False
         # Never ask for more than we hold free (commission may have been taken in the base asset)
         try:
             free = self.get_balance(symbol.removesuffix('USDT'))
@@ -954,39 +1034,86 @@ class BinanceConnector:
         except Exception as e:
             log.warning(f"[OCO] could not check free balance for {symbol}: {e}")
         qty = self._round_lot(symbol, quantity)
+        qty_str = self._format_qty(symbol, quantity)
         tp_price = self._round_price(symbol, take_profit)
+        tp_str = self._format_price(symbol, take_profit)
         sl_price = self._round_price(symbol, stop_loss)
         # Trigger at sl_price and place stopLimitPrice below trigger so fast wicks still fill
         offset_pct = float(getattr(self.cfg, 'OCO_STOP_LIMIT_OFFSET_PCT', 0.8) or 0.8)
         stop_trigger = sl_price
-        sl_limit = self._round_price(symbol, stop_trigger * (1.0 - offset_pct / 100.0))
+        stop_trigger_str = self._format_price(symbol, stop_trigger)
+        raw_sl_limit = stop_trigger * (1.0 - offset_pct / 100.0)
+        sl_limit = self._round_price(symbol, raw_sl_limit)
+        sl_limit_str = self._format_price(symbol, raw_sl_limit)
         if sl_limit <= 0 or sl_limit > stop_trigger:
             sl_limit = stop_trigger
+            sl_limit_str = stop_trigger_str
 
         if qty <= 0 or tp_price <= 0 or sl_price <= 0 or sl_price >= tp_price:
+            self._last_oco_filter_rejected = True
             log.warning(f"[OCO ERROR] Invalid parameters for {symbol}: qty={qty}, tp={tp_price}, sl={sl_price}")
             return None
 
         min_qty = self._get_min_qty(symbol)
         if qty < min_qty:
+            self._last_oco_filter_rejected = True
             log.warning(f"[OCO ERROR] {symbol} qty {qty} < minQty {min_qty}")
             return None
 
-        log.info(f"[OCO ORDER] Submitting OCO Sell for {symbol} | Qty: {qty} | TP: {tp_price} | Trigger: {stop_trigger} | SL Limit: {sl_limit}")
+        log.info(f"[OCO ORDER] Submitting OCO Sell for {symbol} | Qty: {qty_str} | TP: {tp_str} | Trigger: {stop_trigger_str} | SL Limit: {sl_limit_str}")
+        use_v3_orderlist = hasattr(self.client, '_post') and (
+            type(self.client).__module__.startswith('binance.')
+            or not hasattr(self.client, 'create_oco_order')
+        )
         try:
-            oco = self._retry(
-                self.client.create_oco_order,
-                symbol=symbol,
-                side='SELL',
-                quantity=qty,
-                price=f"{tp_price:.8f}".rstrip('0').rstrip('.'),
-                stopPrice=f"{stop_trigger:.8f}".rstrip('0').rstrip('.'),
-                stopLimitPrice=f"{sl_limit:.8f}".rstrip('0').rstrip('.'),
-                stopLimitTimeInForce='GTC'
-            )
+            if use_v3_orderlist:
+                try:
+                    oco = self._retry(
+                        self.client._post,
+                        'orderList/oco',
+                        True,
+                        data={
+                            'symbol': symbol,
+                            'side': 'SELL',
+                            'quantity': qty_str,
+                            'aboveType': 'LIMIT_MAKER',
+                            'abovePrice': tp_str,
+                            'belowType': 'STOP_LOSS_LIMIT',
+                            'belowStopPrice': stop_trigger_str,
+                            'belowPrice': sl_limit_str,
+                            'belowTimeInForce': 'GTC',
+                        },
+                    )
+                except BinanceAPIException as v3_err:
+                    if getattr(v3_err, 'status_code', None) == 404 and hasattr(self.client, 'create_oco_order'):
+                        oco = self._retry(
+                            self.client.create_oco_order,
+                            symbol=symbol,
+                            side='SELL',
+                            quantity=qty_str,
+                            price=tp_str,
+                            stopPrice=stop_trigger_str,
+                            stopLimitPrice=sl_limit_str,
+                            stopLimitTimeInForce='GTC',
+                        )
+                    else:
+                        raise
+            else:
+                oco = self._retry(
+                    self.client.create_oco_order,
+                    symbol=symbol,
+                    side='SELL',
+                    quantity=qty_str,
+                    price=tp_str,
+                    stopPrice=stop_trigger_str,
+                    stopLimitPrice=sl_limit_str,
+                    stopLimitTimeInForce='GTC',
+                )
             log.info(f"[OCO SUCCESS] Placed OCO order for {symbol} (OrderListId: {oco.get('orderListId')})")
             return oco
         except (BinanceAPIException, BinanceOrderException) as e:
+            if getattr(e, 'code', None) == -1013:
+                self._last_oco_filter_rejected = True
             log.warning(f"[OCO FAILED] Could not place OCO for {symbol}: {e}. (Will rely on bot monitor loop)")
             return None
 

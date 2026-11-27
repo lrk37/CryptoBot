@@ -55,7 +55,8 @@ def main():
 
         # List non-zero balances
         print("\n--- Current Account Balances ---")
-        balances = [b for b in acct.get('balances', []) if float(b['free']) > 0 or float(b['locked']) > 0]
+        all_balances = acct.get('balances', [])
+        balances = [b for b in all_balances if float(b['free']) > 0 or float(b['locked']) > 0]
         if not balances:
             print("  [i] All balances are 0.00")
         else:
@@ -63,6 +64,33 @@ def main():
                 free = float(b['free'])
                 locked = float(b['locked'])
                 print(f"  {b['asset']:<8}: Free = {free:<12.6f} | Locked = {locked:<12.6f}")
+
+        # Check BNB fee reserve on Live Spot
+        bnb_free = 0.0
+        for b in all_balances:
+            if b.get('asset') == 'BNB':
+                bnb_free = float(b.get('free', 0) or 0)
+                break
+        bnb_usdt = 0.0
+        if bnb_free > 0:
+            try:
+                bnb_px = float(client.get_symbol_ticker(symbol='BNBUSDT')['price'])
+                bnb_usdt = bnb_free * bnb_px
+            except Exception:
+                bnb_usdt = 0.0
+        min_bnb_usdt = float(getattr(cfg, 'MIN_BNB_FEE_RESERVE_USDT', 1.0) or 1.0)
+        print("\n--- BNB Fee Reserve Check ---")
+        if bnb_free <= 0:
+            print("  [WARNING] ZERO BNB BALANCE (0.00 BNB)!")
+            print("            Without BNB, Binance deducts 0.10% fees from bought altcoins, creating")
+            print("            unsellable LOT_SIZE dust and forfeiting the 25% BNB fee discount.")
+            print("            Recommended: Keep ~$2-$5 of BNB in Spot and enable 'Use BNB to pay fees'.")
+        elif 0 < bnb_usdt < min_bnb_usdt:
+            print(f"  [WARNING] LOW BNB FEE RESERVE: {bnb_free:.6f} BNB (~${bnb_usdt:.2f} USDT < ${min_bnb_usdt:.2f})")
+            print("            Top up BNB soon so Spot fees do not fall back to base-asset deduction.")
+        else:
+            val_str = f" (~${bnb_usdt:.2f} USDT)" if bnb_usdt > 0 else ""
+            print(f"  [OK] BNB Fee Reserve: {bnb_free:.6f} BNB{val_str}")
 
         print("\n" + "=" * 60)
         if can_trade:

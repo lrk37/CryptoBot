@@ -4,12 +4,12 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/root/CryptoBot
-ExecStart=/root/CryptoBot/venv/bin/python /root/CryptoBot/dashboard.py --host 0.0.0.0 --port 8050
+User=ubuntu
+WorkingDirectory=/home/ubuntu/CryptoBot
+ExecStart=/home/ubuntu/CryptoBot/venv/bin/python /home/ubuntu/CryptoBot/dashboard.py --host 127.0.0.1 --port 8050
 Restart=on-failure
 RestartSec=5
-EnvironmentFile=-/root/CryptoBot/.env
+EnvironmentFile=-/home/ubuntu/CryptoBot/.env
 
 StandardOutput=journal
 StandardError=journal

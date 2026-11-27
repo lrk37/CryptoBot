@@ -58,10 +58,14 @@ def log_scan_candidates(candidates: list, exchange=None):
     except Exception as e:
         log.warning(f"[SCAN LOGGER] Failed to append scan history: {e}")
 
-def update_forward_returns(exchange):
+MAX_LIVE_LOOKUPS_PER_TICK = 10
+
+
+def update_forward_returns(exchange, price_map: dict = None):
     """
     Inspect previous scan logs and fill in price_1h and price_4h once enough
     time has elapsed, computing the empirical forward return.
+    Reuses batch ticker maps and deduplicates/caps live REST lookups per tick.
     """
     if not SCAN_LOG_FILE.exists() or not exchange:
         return
@@ -69,6 +73,33 @@ def update_forward_returns(exchange):
     now = time.time()
     updated = False
     new_lines = []
+    symbol_prices = {}
+    if price_map:
+        for sym_k, t_obj in price_map.items():
+            try:
+                if isinstance(t_obj, dict):
+                    px_v = float(t_obj.get('lastPrice') or t_obj.get('price') or 0.0)
+                else:
+                    px_v = float(t_obj or 0.0)
+                if px_v > 0:
+                    symbol_prices[sym_k] = px_v
+            except (TypeError, ValueError):
+                pass
+    live_lookups = 0
+
+    def _resolve_price(sym: str) -> float:
+        nonlocal live_lookups
+        if sym in symbol_prices:
+            return symbol_prices[sym]
+        if live_lookups >= MAX_LIVE_LOOKUPS_PER_TICK:
+            return 0.0
+        live_lookups += 1
+        try:
+            px_v = float(exchange.get_price(sym) or 0.0)
+        except Exception:
+            px_v = 0.0
+        symbol_prices[sym] = px_v
+        return px_v
 
     try:
         with open(SCAN_LOG_FILE, 'r', encoding='utf-8') as f:
@@ -84,7 +115,7 @@ def update_forward_returns(exchange):
 
                     # Update 1h return if age >= 3600s
                     if r.get('price_1h') is None and age >= 3600 and base_price > 0:
-                        curr_p = exchange.get_price(sym)
+                        curr_p = _resolve_price(sym)
                         if curr_p and curr_p > 0:
                             r['price_1h'] = curr_p
                             r['pnl_1h_pct'] = round(((curr_p - base_price) / base_price) * 100.0, 3)
@@ -92,7 +123,7 @@ def update_forward_returns(exchange):
 
                     # Update 4h return if age >= 14400s
                     if r.get('price_4h') is None and age >= 14400 and base_price > 0:
-                        curr_p = exchange.get_price(sym)
+                        curr_p = _resolve_price(sym)
                         if curr_p and curr_p > 0:
                             r['price_4h'] = curr_p
                             r['pnl_4h_pct'] = round(((curr_p - base_price) / base_price) * 100.0, 3)

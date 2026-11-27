@@ -115,10 +115,19 @@ def run_walk_forward(args):
     t0 = _time.time()
     print(f'\n[*] Fetching {days} days of {interval} data for {sym}...')
     df = fetch_historical_candles(sym, interval=interval, days=days, refresh=refresh)
+    btc_df = None
+    if getattr(cfg, 'ENABLE_BTC_REGIME_FILTER', True):
+        if sym == 'BTCUSDT':
+            btc_df = df
+        else:
+            try:
+                btc_df = fetch_historical_candles('BTCUSDT', interval=interval, days=days, refresh=False)
+            except Exception:
+                btc_df = None
 
     bpd       = _bpd(interval)
-    warmup    = 200                              # bars for indicator convergence (EMA200/BB/RSI)
     test_bars = test_d * bpd
+    warmup    = 800 if (interval == '15m' and len(df) >= 800 + test_bars) else 200  # 200h warmup for 1h EMA200
 
     print(f'[+] {len(df)} bars loaded | {bpd} bars/day | Window: {test_d}d ({test_bars} bars)')
 
@@ -131,7 +140,7 @@ def run_walk_forward(args):
         bt = StrategyBacktester(
             initial_capital=cap, trade_size_usdt=tsize, min_score=mscore
         )
-        m = bt.run(sym, window, interval=interval, start_bar=warmup)
+        m = bt.run(sym, window, interval=interval, start_bar=warmup, btc_df=btc_df)
 
         s = df.index[idx].strftime('%Y-%m-%d')
         e = df.index[min(idx + test_bars - 1, len(df) - 1)].strftime('%Y-%m-%d')
@@ -154,7 +163,7 @@ def run_walk_forward(args):
         bt = StrategyBacktester(
             initial_capital=cap, trade_size_usdt=tsize, min_score=mscore
         )
-        m = bt.run(sym, window, interval=interval, start_bar=warmup)
+        m = bt.run(sym, window, interval=interval, start_bar=warmup, btc_df=btc_df)
 
         s = df.index[idx].strftime('%Y-%m-%d')
         e = df.index[-1].strftime('%Y-%m-%d')
@@ -324,8 +333,8 @@ def simulate_portfolio(all_trades: list, initial_capital: float = 1000.0,
             'trades_taken': 0, 'trades_skipped': 0, 'max_concurrent_positions': max_positions,
         }
 
-    # Sort all trades chronologically by entry_time
-    sorted_trades = sorted(all_trades, key=lambda t: t['entry_time'])
+    # Sort all trades chronologically by entry_time, breaking ties by highest signal score (matching scanner.py)
+    sorted_trades = sorted(all_trades, key=lambda t: (t['entry_time'], -float(t.get('score', 0.0) or 0.0)))
 
     cash = initial_capital
     open_positions = []
@@ -514,7 +523,8 @@ def run_basket(args):
     mscore   = args.min_score
     n_base   = getattr(args, 'baseline', 50)
     refresh  = getattr(args, 'refresh', False)
-    symbols  = DEFAULT_BASKET
+    blacklist = set(getattr(cfg, 'SNIPE_BLACKLIST', []))
+    symbols  = [s for s in DEFAULT_BASKET if s not in blacklist]
 
     t0 = _time.time()
     W  = 100
@@ -712,8 +722,17 @@ def run_monte_carlo(args):
 
     print(f'\n[*] Running base backtest for {sym} ({interval}, {days}d)...')
     df = fetch_historical_candles(sym, interval=interval, days=days, refresh=refresh)
+    btc_df = None
+    if getattr(cfg, 'ENABLE_BTC_REGIME_FILTER', True):
+        if sym == 'BTCUSDT':
+            btc_df = df
+        else:
+            try:
+                btc_df = fetch_historical_candles('BTCUSDT', interval=interval, days=days, refresh=False)
+            except Exception:
+                btc_df = None
     bt = StrategyBacktester(initial_capital=cap, trade_size_usdt=tsize, min_score=mscore)
-    metrics = bt.run(sym, df, interval=interval)
+    metrics = bt.run(sym, df, interval=interval, btc_df=btc_df)
 
     trades = bt.trades
     if not trades:
@@ -830,6 +849,15 @@ def run_slippage(args):
 
     print(f'\n[*] Fetching {days} days of {interval} data for {sym}...')
     df = fetch_historical_candles(sym, interval=interval, days=days, refresh=refresh)
+    btc_df = None
+    if getattr(cfg, 'ENABLE_BTC_REGIME_FILTER', True):
+        if sym == 'BTCUSDT':
+            btc_df = df
+        else:
+            try:
+                btc_df = fetch_historical_candles('BTCUSDT', interval=interval, days=days, refresh=False)
+            except Exception:
+                btc_df = None
 
     slippages = [0.00, 0.02, 0.05, 0.08, 0.10, 0.15, 0.20, 0.25, 0.30]
     rows = []
@@ -839,7 +867,7 @@ def run_slippage(args):
             initial_capital=cap, trade_size_usdt=tsize,
             slippage_pct=slip, min_score=mscore,
         )
-        m = bt.run(sym, df, interval=interval)
+        m = bt.run(sym, df, interval=interval, btc_df=btc_df)
         rows.append({'slippage': slip, 'metrics': m})
 
     # ── Report ────────────────────────────────────────────────

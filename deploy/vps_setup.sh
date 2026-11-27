@@ -35,10 +35,11 @@ fi
 
 echo "=== [5/5] Installing systemd Background Service ==="
 sudo cp deploy/cryptobot.service /etc/systemd/system/cryptobot.service
+sudo cp deploy/cryptobot-dashboard.service /etc/systemd/system/cryptobot-dashboard.service
 # Replace user/path dynamically if not 'ubuntu'
 CURRENT_USER=$(whoami)
-sudo sed -i "s|User=ubuntu|User=$CURRENT_USER|g" /etc/systemd/system/cryptobot.service
-sudo sed -i "s|/home/ubuntu|$HOME|g" /etc/systemd/system/cryptobot.service
+sudo sed -i "s|User=ubuntu|User=$CURRENT_USER|g" /etc/systemd/system/cryptobot.service /etc/systemd/system/cryptobot-dashboard.service
+sudo sed -i "s|/home/ubuntu|$HOME|g" /etc/systemd/system/cryptobot.service /etc/systemd/system/cryptobot-dashboard.service
 
 sudo systemctl daemon-reload
 sudo systemctl enable cryptobot.service

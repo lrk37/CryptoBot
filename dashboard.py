@@ -21,6 +21,7 @@ import base64
 import hmac
 import json
 import os
+import threading
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -32,14 +33,16 @@ import config as cfg
 
 _PRICE_CACHE = {}
 _PRICE_CACHE_TTL = 5.0
+_PRICE_LOCK = threading.Lock()
 
 
 def _fetch_public_price(symbol: str) -> float:
     """Fetch public live ticker price from Binance without API keys (cached for 5s)."""
     now = time.time()
-    cached = _PRICE_CACHE.get(symbol)
-    if cached and (now - cached[1]) < _PRICE_CACHE_TTL:
-        return cached[0]
+    with _PRICE_LOCK:
+        cached = _PRICE_CACHE.get(symbol)
+        if cached and (now - cached[1]) < _PRICE_CACHE_TTL:
+            return cached[0]
     try:
         url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
         req = urllib.request.Request(url, headers={"User-Agent": "CryptoBot-Dashboard/1.0"})
@@ -47,7 +50,8 @@ def _fetch_public_price(symbol: str) -> float:
             data = json.loads(resp.read().decode("utf-8"))
             px = float(data.get("price", 0.0) or 0.0)
             if px > 0:
-                _PRICE_CACHE[symbol] = (px, now)
+                with _PRICE_LOCK:
+                    _PRICE_CACHE[symbol] = (px, now)
                 return px
     except Exception:
         pass
@@ -96,9 +100,22 @@ def collect_dashboard_state(base_dir: str = ".") -> dict:
     loss_state = _read_json_safe(loss_file, {}) or {}
     scan_state = _read_json_safe(scan_file, {}) or {}
 
-    # Compute Expectancy & Performance Metrics
-    total_trades = len(trades)
-    pnls = [float(t.get("net_pnl_usdt", t.get("pnl_usdt", 0.0)) or 0.0) for t in trades]
+    # Compute Expectancy & Performance Metrics (grouping partial fills by trade_id)
+    grouped_pnls = []
+    by_tid = {}
+    for t in trades:
+        p = float(t.get("net_pnl_usdt", t.get("pnl_usdt", 0.0)) or 0.0)
+        tid = t.get("trade_id")
+        if tid:
+            if tid in by_tid:
+                grouped_pnls[by_tid[tid]] += p
+            else:
+                by_tid[tid] = len(grouped_pnls)
+                grouped_pnls.append(p)
+        else:
+            grouped_pnls.append(p)
+    pnls = grouped_pnls
+    total_trades = len(pnls)
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p <= 0]
     net_pnl = sum(pnls)
@@ -200,6 +217,8 @@ def collect_dashboard_state(base_dir: str = ".") -> dict:
             "consecutive_losses": int(loss_state.get("losses", 0) or 0),
             "max_consecutive_losses": int(getattr(cfg, "MAX_CONSECUTIVE_LOSSES", 2)),
             "loss_halt_remaining_sec": loss_halt_rem,
+            "halted": bool(loss_state.get("halted", False)) and loss_state.get("today") == str(datetime.now(timezone.utc).date()),
+            "halt_reason": str(loss_state.get("halt_reason", "") or ""),
         },
         "stats": {
             "total_trades": total_trades,
@@ -445,6 +464,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
 
 <script>
+function escHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function fmtPx(px) {
   const v = Number(px || 0);
   const a = Math.abs(v);
@@ -520,14 +548,19 @@ async function refreshState() {
     document.getElementById('kpi-avg').textContent = `Avg W: +$${d.stats.avg_win_usdt.toFixed(2)} | Avg L: $${d.stats.avg_loss_usdt.toFixed(2)}`;
 
     const shEl = document.getElementById('kpi-shield');
-    if (d.account.loss_halt_remaining_sec > 0) {
+    if (d.account.halted) {
+      shEl.textContent = 'CIRCUIT HALTED';
+      shEl.className = 'kpi-val neg';
+      document.getElementById('kpi-consec').textContent = d.account.halt_reason || 'Daily / Peak drawdown limit reached';
+    } else if (d.account.loss_halt_remaining_sec > 0) {
       shEl.textContent = `PAUSED (${fmtDur(d.account.loss_halt_remaining_sec)})`;
       shEl.className = 'kpi-val gold';
+      document.getElementById('kpi-consec').textContent = `Loss Streak: ${d.account.consecutive_losses}/${d.account.max_consecutive_losses} | Cooldowns: ${d.cooldowns.length}`;
     } else {
       shEl.textContent = 'PROTECTED';
       shEl.className = 'kpi-val pos';
+      document.getElementById('kpi-consec').textContent = `Loss Streak: ${d.account.consecutive_losses}/${d.account.max_consecutive_losses} | Cooldowns: ${d.cooldowns.length}`;
     }
-    document.getElementById('kpi-consec').textContent = `Loss Streak: ${d.account.consecutive_losses}/${d.account.max_consecutive_losses} | Cooldowns: ${d.cooldowns.length}`;
 
     // Active Position
     const posCont = document.getElementById('active-pos-container');
@@ -542,7 +575,7 @@ async function refreshState() {
         const sign = p.unrealized_pct >= 0 ? '+' : '';
         return `<div class="pos-box">
           <div class="pos-header">
-            <div><span class="pos-sym">${p.symbol}</span> <span class="badge badge-test">${p.timeframe}</span></div>
+            <div><span class="pos-sym">${escHtml(p.symbol)}</span> <span class="badge badge-test">${escHtml(p.timeframe)}</span></div>
             <div class="${pCls}" style="font-size:1.25rem;font-weight:800;">${sign}${p.unrealized_pct.toFixed(2)}% (${sign}$${p.unrealized_usdt.toFixed(2)})</div>
           </div>
           <div class="pos-stats">
@@ -578,16 +611,16 @@ async function refreshState() {
         const netP = Number(t.net_pnl_pct !== undefined ? t.net_pnl_pct : t.pnl_pct || 0);
         const cls = netU >= 0 ? 'pos' : 'neg';
         const pillCls = netU >= 0 ? 'pill-win' : 'pill-loss';
-        const ts = (t.timestamp || '').replace('T', ' ').slice(0, 19);
+        const ts = escHtml((t.timestamp || '').replace('T', ' ').slice(0, 19));
         return `<tr>
           <td style="color:var(--muted)">${ts}</td>
-          <td><b>${t.symbol}</b></td>
+          <td><b>${escHtml(t.symbol)}</b></td>
           <td>${fmtPx(t.entry_price)} &rarr; ${fmtPx(t.exit_price)}</td>
           <td class="${cls}"><b>${netP >= 0 ? '+' : ''}${netP.toFixed(2)}% (${netU >= 0 ? '+$' : '-$'}${Math.abs(netU).toFixed(2)})</b></td>
           <td>${Number(t.final_score || 0).toFixed(0)}</td>
           <td><span class="pos">+${Number(t.mfe_pct || 0).toFixed(2)}%</span> / <span class="neg">${Number(t.mae_pct || 0).toFixed(2)}%</span></td>
           <td>${fmtDur(t.hold_duration_sec)}</td>
-          <td><span class="pill ${pillCls}">${t.reason || 'EXIT'}</span></td>
+          <td><span class="pill ${pillCls}">${escHtml(t.reason || 'EXIT')}</span></td>
         </tr>`;
       }).join('');
     }
@@ -598,9 +631,9 @@ async function refreshState() {
       chCont.innerHTML = '<div style="color:var(--muted);font-size:0.85rem;">No chart snapshots found in charts/ directory yet.</div>';
     } else {
       chCont.innerHTML = d.charts.map(c => `
-        <div class="chart-thumb" onclick="document.getElementById('modal-img').src='${c.url}';document.getElementById('modal').classList.add('open');">
-          <img src="${c.url}" loading="lazy" alt="${c.name}">
-          <div class="chart-cap" title="${c.name}">${c.name}</div>
+        <div class="chart-thumb" data-url="${escHtml(c.url)}" onclick="document.getElementById('modal-img').src=this.dataset.url;document.getElementById('modal').classList.add('open');">
+          <img src="${escHtml(c.url)}" loading="lazy" alt="${escHtml(c.name)}">
+          <div class="chart-cap" title="${escHtml(c.name)}">${escHtml(c.name)}</div>
         </div>
       `).join('');
     }

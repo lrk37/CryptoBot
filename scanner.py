@@ -12,6 +12,7 @@ Features & Improvements:
 """
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import List, Optional, Dict
 import pandas as pd
@@ -49,6 +50,7 @@ class MarketScanner:
         self.cfg = cfg
         self._btc_regime_cache = None
         self._btc_cache_time = 0
+        self._btc_cache_hour = -1
 
     def check_btc_regime(self) -> str:
         """Returns 'BULLISH' if last closed 1h BTC candle >= EMA200, otherwise 'BEARISH' (fails closed)."""
@@ -56,8 +58,9 @@ class MarketScanner:
             return "BULLISH"
 
         now = time.time()
+        curr_hour = int(now // 3600)
         ttl = getattr(self.cfg, 'BTC_REGIME_CACHE_SEC', 300)
-        if self._btc_regime_cache and (now - self._btc_cache_time < ttl):
+        if self._btc_regime_cache and (now - self._btc_cache_time < ttl) and self._btc_cache_hour == curr_hour:
             return self._btc_regime_cache
 
         try:
@@ -82,6 +85,7 @@ class MarketScanner:
             status = "BULLISH" if btc_price >= ema_val else "BEARISH"
             self._btc_regime_cache = status
             self._btc_cache_time = now
+            self._btc_cache_hour = curr_hour
 
             log.info(f"[BTC REGIME] BTC={btc_price:.0f} EMA{ema_period}={ema_val:.0f} -> {status}")
             return status
@@ -140,10 +144,19 @@ class MarketScanner:
 
         self._last_tickers_24h = tickers_24h
         results = []
-        for sym in passed_prefilter:
-            res = self._analyze_symbol(sym)
-            if res and res.score >= getattr(self.cfg, 'MIN_SCORE_TO_TRADE', 60):
-                results.append(res)
+        min_score_cfg = getattr(self.cfg, 'MIN_SCORE_TO_TRADE', 60)
+        max_workers = int(getattr(self.cfg, 'SCANNER_MAX_WORKERS', 6) or 1)
+        if max_workers > 1 and len(passed_prefilter) > 1:
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(passed_prefilter))) as pool:
+                analyzed = list(pool.map(self._analyze_symbol, passed_prefilter))
+            for res in analyzed:
+                if res and res.score >= min_score_cfg:
+                    results.append(res)
+        else:
+            for sym in passed_prefilter:
+                res = self._analyze_symbol(sym)
+                if res and res.score >= min_score_cfg:
+                    results.append(res)
 
         results.sort(key=lambda x: x.score, reverse=True)
         top_n = getattr(self.cfg, 'SCANNER_TOP_N', 3)
@@ -221,23 +234,37 @@ class MarketScanner:
             last_low = low.iloc[-1]
             last_closed_time = int(df_closed.index[-1].timestamp())
 
-            # 24h Percentage Change calculation (24 bars on 1h, 96 bars on 15m)
+            # 24h Percentage Change & Intraday Drawdown from 24h High (24 bars on 1h, 96 bars on 15m)
+            strategy_mode = getattr(self.cfg, 'STRATEGY_MODE', 'capitulation')
             bars_24h = 24 if tf == '1h' else 96
-            if len(close) >= bars_24h:
-                pct_24h = ((last_close - close.iloc[-bars_24h]) / close.iloc[-bars_24h]) * 100.0
+            if len(close) > bars_24h:
+                ref_24h = close.iloc[-bars_24h - 1]
+                pct_24h = ((last_close - ref_24h) / ref_24h) * 100.0 if ref_24h > 0 else 0.0
+            elif len(close) == bars_24h:
+                ref_24h = close.iloc[-bars_24h]
+                pct_24h = ((last_close - ref_24h) / ref_24h) * 100.0 if ref_24h > 0 else 0.0
             else:
+                if strategy_mode == 'capitulation':
+                    log.info(f"[SCANNER] {symbol} ({tf}) skipped - insufficient 24h candle history ({len(close)} < {bars_24h})")
+                    return None
                 pct_24h = 0.0
 
+            rolling_24h_high = float(high.iloc[-bars_24h:].max()) if len(high) >= bars_24h else float(high.max())
+            dd_from_high_24h = ((last_close - rolling_24h_high) / rolling_24h_high) * 100.0 if rolling_24h_high > 0 else 0.0
+
             # --- TIERED 24h PUMP & CRASH GUARD ---
-            strategy_mode = getattr(self.cfg, 'STRATEGY_MODE', 'capitulation')
             parabolic_max = getattr(self.cfg, 'PARABOLIC_PUMP_MAX_PCT', 25.0)
             max_dump = getattr(self.cfg, 'MAX_24H_DUMP_PCT', -18.0)
+            max_high_dump = getattr(self.cfg, 'MAX_24H_HIGH_DUMP_PCT', max_dump)
             pump_penalty = 0.0
             if pct_24h > parabolic_max:
                 log.info(f"[SCANNER] {symbol} hard-blocked (parabolic 24h pump = {pct_24h:+.1f}% > {parabolic_max:.0f}%)")
                 return None
             if strategy_mode == 'capitulation' and pct_24h < max_dump:
                 log.info(f"[SCANNER] {symbol} hard-blocked (falling-knife 24h dump = {pct_24h:+.1f}% < {max_dump:.1f}%)")
+                return None
+            if strategy_mode == 'capitulation' and dd_from_high_24h < max_high_dump:
+                log.info(f"[SCANNER] {symbol} hard-blocked (intraday crash off 24h high = {dd_from_high_24h:+.1f}% < {max_high_dump:.1f}%)")
                 return None
             elif pct_24h > 15.0:
                 pump_penalty = -20.0
@@ -306,13 +333,22 @@ class MarketScanner:
             reasons = []
 
             if strategy_mode == 'capitulation':
-                # Guard against chasing late in the forming candle after the bounce already happened
+                # Guard against chasing late after bounce OR catching an actively accelerating breakdown
                 live_close = float(df['close'].iloc[-1])
                 live_high = float(df['high'].iloc[-1])
-                if last_close > 0 and (live_close > last_close * 1.0035 or live_high >= last_close * 1.008):
+                max_bounce_mult = 1.0 + float(getattr(self.cfg, 'MAX_FORMING_BOUNCE_PCT', 0.45)) / 100.0
+                max_high_mult = 1.0 + float(getattr(self.cfg, 'MAX_FORMING_HIGH_PCT', 0.85)) / 100.0
+                max_dump_mult = 1.0 + float(getattr(self.cfg, 'MAX_FORMING_DUMP_PCT', -1.20)) / 100.0
+                if last_close > 0 and (live_close > last_close * max_bounce_mult or live_high >= last_close * max_high_mult):
                     log.info(
                         f"[SCANNER] {symbol} ({tf}) skipped - forming candle already bounced "
                         f"(closed={last_close:.4f}, live={live_close:.4f}, high={live_high:.4f})"
+                    )
+                    return None
+                if last_close > 0 and live_close < last_close * max_dump_mult:
+                    log.info(
+                        f"[SCANNER] {symbol} ({tf}) skipped - forming candle actively breaking down "
+                        f"(closed={last_close:.4f}, live={live_close:.4f})"
                     )
                     return None
 

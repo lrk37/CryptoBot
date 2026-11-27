@@ -50,40 +50,41 @@ All indicators are computed strictly on the **last closed candle (`iloc[-2]`)** 
 
 ### C. Dynamic 3-Stage Exit Engine (`risk_manager.py`)
 Instead of using a tight `-1.5%` stop-loss that gets hunted by normal crypto wicks and a greedy `+6%` target that rarely hits, the bot manages risk dynamically across three stages:
-1. **Stage 1 — Wide Initial Catastrophe Bracket + Exchange OCO:**
-   - Places an ATR-scaled catastrophe Stop-Loss (`4.8x ATR`, clamped to `1.5%–5.0%`) and Take-Profit (`2.0x ATR`, floored at `1.8%`) directly on Binance's matching engine via a native **OCO (One-Cancels-the-Other)** order (`USE_EXCHANGE_OCO = True`). Even if your server loses internet, your position is protected on Binance.
-2. **Stage 2 — Fast Risk Elimination (Break-Even & Trailing Stop):**
-   - **Trailing Stop (`+1.8%` effective trigger, `0.7%` offset):** Once profit reaches `+1.8%` (`MIN_TRAILING_PROFIT_PCT + ROUND_TRIP_FEE_PCT`), a tight `0.7%` trailing stop arms to follow the rebound upward.
-   - **Break-Even Lock (`+2.2%` trigger + OCO Sync):** Once profit reaches `+2.2%`, the Stop-Loss floor is automatically raised above your entry price (`entry * 1.003`, covering `0.20%` round-trip fees plus a `0.10%` slippage allowance) and **synchronized with your exchange-side OCO order on Binance**.
+1. **Stage 1 — ATR Catastrophe Bracket + Native Exchange OCO (`POST /api/v3/orderList/oco`):**
+   - Places an ATR-scaled catastrophe Stop-Loss (`4.8x ATR`, clamped to `1.5%–4.8%`) and Take-Profit (`2.2x ATR`, floored at `2.0%`) directly on Binance's matching engine via a native **OCO (One-Cancels-the-Other)** order (`USE_EXCHANGE_OCO = True`). Even if your server loses internet, your position is protected on Binance.
+2. **Stage 2 — Synchronized Risk Elimination (Break-Even & Trailing Stop at `+1.8%`):**
+   - **Break-Even Lock (`+1.8%` trigger + OCO Sync):** Once profit reaches `+1.8%` (strictly before the `>= +2.0%` OCO Take-Profit ceiling), the Stop-Loss floor is automatically raised above your entry price (`entry * 1.003`, covering `0.20%` round-trip fees plus a `0.10%` slippage allowance) and **synchronized with your exchange-side OCO order on Binance**.
+   - **Trailing Stop (`+1.8%` effective trigger, `0.7%` offset):** Arms alongside Break-Even (`MIN_TRAILING_PROFIT_PCT = 1.6% + ROUND_TRIP_FEE_PCT = 0.2%`) to lock in rebounds before they fade.
    - **Time-Decaying `EMA21` Profit-Take (`minimal_roi` style):** If a candle closes back above `EMA21` with `>= +1.2%` profit in the first 45m (`2h` on `1h` trades) — or `>= +0.55%` profit after 45m (`2h` on `1h` trades) once `EMA21` has drifted lower — the bot banks the mean-reversion gain immediately.
 3. **Stage 3 — Time & Trend Invalidation (`8h` / `16h`):**
    - If a position has been open for `8 hours` (`MAX_SCANNER_HOLD_HOURS`) and the last closed candle is still below `EMA21`, it exits early (`TREND_INVALIDATED`) rather than waiting for the catastrophe stop. Hard maximum hold time is `16 hours` (`MAX_HOLD_TIMEOUT`).
 
 ### D. Portfolio Circuit Breakers & Protections
-- **24h Safe-Dump & Parabolic Guard:** Blocks coins that have crashed more than `-18%` in 24h (`MAX_24H_DUMP_PCT = -18.0`, protecting against hacks/delistings/falling knives) or pumped more than `+25%` (`PARABOLIC_PUMP_MAX_PCT = 25.0`).
-- **Per-Symbol Cooldown (`LowProfitPairs` Protection):** `1 hour` cooldown after a normal exit; extended to **`12 hours` (`43,200s`)** after a `STOP_LOSS` to prevent re-entering a bleeding coin on the same day.
-- **Consecutive Loss Pause:** Pauses scanning for `30 minutes` after `2` consecutive stop-losses.
-- **Daily Circuit Breaker:** Halts new entries for the rest of the UTC day if daily portfolio drawdown reaches `6%` (`MAX_DAILY_LOSS = 6`).
+- **24h Safe-Dump, Intraday Rolling-High Crash & Parabolic Guards:** Blocks coins that have crashed more than `-18%` over 24h (`MAX_24H_DUMP_PCT = -18.0`) **or** more than `-18%` off their rolling 24h high (`MAX_24H_HIGH_DUMP_PCT = -18.0`, catching rapid intraday pump-and-dump rugs), pumped more than `+25%` (`PARABOLIC_PUMP_MAX_PCT = 25.0`), or lack 24h of closed candle history.
+- **Live BNB Fee Reserve Monitor:** Automatically checks your Spot `BNB` balance on startup, in `check_perms.py`, and every 12h during live scanning — alerting via logs and Telegram if `BNB` hits `0` or falls below `$1.00 USDT` so fees never silently eat into base altcoin `LOT_SIZE` quantities.
+- **Per-Symbol Cooldown (`LowProfitPairs` Protection):** `1 hour` cooldown after profitable/break-even exits; extended to **`12 hours` (`43,200s`)** after losing `STOP_LOSS` / `TREND_INVALIDATED` exits to prevent re-entering a bleeding coin on the same day.
+- **Consecutive Loss Pause:** Pauses scanning for `30 minutes` after `2` consecutive net losses (aggregating partial fills per logical trade).
+- **Latching Daily & Peak-Equity Circuit Breakers:** Latches and persists a full-day halt in `loss_state.json` if daily portfolio drawdown reaches `6%` (`MAX_DAILY_LOSS = 6`) or peak drawdown reaches `12%` (`MAX_TOTAL_DRAWDOWN_PCT = 12.0`), automatically adapting daily baselines upward on capital deposits (use `python bot.py --reset-breaker` after manual withdrawals).
 
 ---
 
-## 3. Validated 90-Day Multi-Coin Performance
+## 3. Validated 90-Day & 365-Day Multi-Coin Performance
 
-Tested across the 15-coin liquid basket (`BTC`, `ETH`, `BNB`, `SOL`, `XRP`, `ADA`, `AVAX`, `DOT`, `LINK`, `POL`, `NEAR`, `ATOM`, `APT`, `SUI`, `ARB`) with realistic round-trip friction (`0.10%` fee/side + `0.05%` slippage/side = **`0.30%` round-trip cost**):
+Tested across the 14-coin tradeable liquid basket (`BTC`, `ETH`, `SOL`, `XRP`, `ADA`, `AVAX`, `DOT`, `LINK`, `POL`, `NEAR`, `ATOM`, `APT`, `SUI`, `ARB` — excluding blacklisted fee-reserve `BNB`) with realistic round-trip friction (`0.10%` fee/side + `0.05%` slippage/side = **`0.30%` round-trip cost**):
 
-### A. Cross-Asset Signal Breadth (Independent Symbol Backtests)
-| Metric | Old Breakout Bot (v5) | **New Dual-Timeframe Capitulation Bot** |
+### A. Cross-Asset Signal Breadth (90-Day Dual-Timeframe + 365-Day Full-Year)
+| Metric | Old Breakout Bot (v5) | **Hardened Dual-Timeframe Capitulation Bot** |
 |---|---|---|
-| **Profitable Coins in Basket** | `0 / 15` (`0%`) | **`14 / 15` (`93%` — `BROAD EDGE ✓`)** |
-| **Overall Win Rate** | `18% – 28%` | **`84.5%` (`82` Wins / `15` Losses across `97` trades)** |
-| **Pooled Profit Factor** | `0.34` | **`3.22` (`+$75.74` unconstrained net P&L)** |
-| **Median Expectancy / Trade** | `-1.12%` | **`+0.87%` net per trade** |
+| **Profitable Coins (90d Basket)** | `0 / 14` (`0%`) | **`14 / 14` (`100%` — `BROAD EDGE ✓`)** |
+| **90-Day Win Rate (`93` trades)** | `18% – 28%` | **`87.1%` (`81` Wins / `12` Losses)** |
+| **90-Day Pooled Profit Factor** | `0.34` | **`3.23` (`+$74.42` unconstrained net P&L)** |
+| **365-Day Full-Year `1h` (`99` trades)** | `0.41` | **`71.7%` WR, `PF 1.94` (`+$56.13` net P&L)** |
 
 ### B. Shared-Capital Portfolio Simulation (`MAX_OPEN_TRADES = 1`, `$1,000` Capital, `$100` / Trade)
-Simulating the live Dual-Timeframe mode (`--interval 15m`: `1h` signals on `BTC`/`ETH`/`SOL`/`XRP`, `15m + 1h` fallback on altcoins) with the 1-position-at-a-time constraint chronologically across all 15 coins and bar-by-bar Mark-to-Market drawdown accounting ([`validation_results/basket_15m_90d.json`](validation_results/basket_15m_90d.json)):
-- **Trades Executed:** `33` taken (`64` concurrent signals skipped due to `MAX_OPEN_TRADES = 1`)
-- **Portfolio Net Return:** **`+1.44%`** (`+$14.39` -> `$1,014.39` final equity; note `$100` / trade = `10%` position sizing)
-- **Mark-to-Market Max Drawdown:** **`1.04%`**
+Simulating the live Dual-Timeframe mode (`--interval 15m`: `1h` signals on `BTC`/`ETH`/`SOL`/`XRP`, `15m + 1h` fallback on altcoins) with the 1-position-at-a-time constraint chronologically across all 14 coins and bar-by-bar Mark-to-Market drawdown accounting ([`validation_results/basket_15m_90d.json`](validation_results/basket_15m_90d.json)):
+- **Trades Executed:** `28` taken (`65` concurrent signals skipped due to `MAX_OPEN_TRADES = 1`)
+- **Portfolio Net Return:** **`+0.88%`** (`+$8.84` on `10%` position sizing; **`+1.43%` / `+$14.30`** over 365-day `1h`)
+- **Mark-to-Market Max Drawdown:** **`1.01%`** (`2.08%` over 365 days)
 
 > *Note: Backtests model closed-bar Dual-Timeframe entries and cross-pair BTC `1h EMA200` regime filtering; live L2 spread (`<= 0.25%`) and top-20 order-book depth imbalance are applied during live scanning.*
 

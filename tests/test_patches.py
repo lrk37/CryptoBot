@@ -2526,6 +2526,208 @@ class TestHardeningRegressionSuite(InTempDir):
         sc._analyze_symbol("BTCUSDT")
         self.assertEqual(tf_calls, [])  # skipped stale 1h call
 
+    def test_bnb_fee_reserve_zero_and_low_warnings(self):
+        bot, fc, conn, rm, nt, eng, cfg = self._live_stack(USE_TESTNET=False, WARN_ZERO_BNB=True, MIN_BNB_FEE_RESERVE_USDT=1.0)
+        fc.get_symbol_ticker = lambda symbol: {"price": "600.0"} if symbol == "BNBUSDT" else {"price": "10.0"}
+
+        # 1. Zero BNB -> ZERO_BNB warning + throttled Telegram alert on Live Spot
+        fc.balances = [{"asset": "USDT", "free": "60.0", "locked": "0"}]
+        conn.invalidate_balance_cache()
+        st_zero = conn.check_bnb_fee_reserve(min_bnb_usdt=1.0)
+        self.assertFalse(st_zero["ok"])
+        self.assertEqual(st_zero["reason"], "ZERO_BNB")
+        eng._check_bnb_reserve()
+        self.assertEqual(len(nt.alerts), 1)
+        self.assertIn("0.00 BNB", nt.alerts[-1])
+
+        # 2. Low BNB (0.001 BNB * $600 = $0.60 < $1.00) -> LOW_BNB
+        fc.balances = [{"asset": "USDT", "free": "60.0", "locked": "0"}, {"asset": "BNB", "free": "0.001", "locked": "0"}]
+        conn.invalidate_balance_cache()
+        st_low = conn.check_bnb_fee_reserve(min_bnb_usdt=1.0)
+        self.assertFalse(st_low["ok"])
+        self.assertEqual(st_low["reason"], "LOW_BNB")
+        self.assertAlmostEqual(st_low["bnb_usdt"], 0.60, places=2)
+
+        # 3. Healthy BNB ($3.00 >= $1.00) -> OK
+        fc.balances = [{"asset": "USDT", "free": "60.0", "locked": "0"}, {"asset": "BNB", "free": "0.005", "locked": "0"}]
+        conn.invalidate_balance_cache()
+        st_ok = conn.check_bnb_fee_reserve(min_bnb_usdt=1.0)
+        self.assertTrue(st_ok["ok"])
+        self.assertAlmostEqual(st_ok["bnb_usdt"], 3.00, places=2)
+
+    def test_circuit_breaker_latches_intraday_persists_halt_and_adapts_to_deposits(self):
+        from risk_manager import RiskManager
+        import dashboard
+        bot, fc, conn, rm, nt, eng, cfg = self._live_stack(MAX_DAILY_LOSS=6.0, MAX_TOTAL_DRAWDOWN_PCT=12.0)
+
+        # Start at $100 -> drop to $93.50 (-6.5% >= 6%) -> trips and latches
+        self.assertFalse(rm.check_circuit_breaker(100.0))
+        self.assertTrue(rm.check_circuit_breaker(93.50))
+        # Slight rebound 5m later to $94.50 (-5.5% < 6%) MUST remain halted for the rest of the UTC day!
+        self.assertTrue(rm.check_circuit_breaker(94.50))
+
+        # Dashboard state reflects halted=True
+        dash_st = dashboard.collect_dashboard_state(".")
+        self.assertTrue(dash_st["account"]["halted"])
+
+        # Restart on same UTC day restores halted latch
+        rm_reloaded = RiskManager(cfg)
+        self.assertTrue(rm_reloaded.check_circuit_breaker(95.0))
+
+        # Resetting baselines (e.g. after withdrawal) clears halt cleanly
+        rm_reloaded.reset_circuit_breaker(60.0)
+        self.assertFalse(rm_reloaded.check_circuit_breaker(60.0))
+
+        # Intraday capital deposit ($60 -> $200 while flat) raises daily_start_bal to protect new funds
+        self.assertFalse(rm_reloaded.check_circuit_breaker(200.0))
+        self.assertAlmostEqual(rm_reloaded._daily_start_bal, 200.0, places=2)
+        self.assertTrue(rm_reloaded.check_circuit_breaker(187.0))  # -6.5% off $200 trips immediately!
+
+    def test_decimal_plain_strings_orderlist_oco_executing_fastpath_and_filter_guard(self):
+        from binance.exceptions import BinanceAPIException
+        bot, fc, conn, rm, nt, eng, cfg = self._live_stack()
+
+        # 1. No scientific notation ('5e-05') on tiny BTC lots and 10-decimal meme prices preserved
+        fc.get_symbol_info = lambda symbol=None: {
+            "filters": [
+                {"filterType": "LOT_SIZE", "stepSize": "0.00001000", "minQty": "0.00001"},
+                {"filterType": "PRICE_FILTER", "tickSize": "0.0000000001"},
+            ]
+        }
+        conn._info_cache.clear()
+        self.assertEqual(conn._format_qty("BTCUSDT", 0.00005), "0.00005")
+        self.assertNotIn("e", conn._format_qty("BTCUSDT", 0.00005).lower())
+        self.assertEqual(conn._format_price("MEMEUSDT", 0.0000004567), "0.0000004567")
+
+        # 2. Modern POST orderList/oco payload + fast EXECUTING short-circuit in get_oco_fill (0 history calls)
+        post_calls = []
+        history_calls = []
+
+        class V3BinanceClient:
+            def _post(self, path, signed=False, **kw):
+                post_calls.append((path, signed, kw))
+                return {"orderListId": 321, "listOrderStatus": "EXECUTING"}
+
+            def _get(self, path, signed=False, **kw):
+                return {"orderListId": 321, "listOrderStatus": "EXECUTING", "orders": [{"orderId": 1}, {"orderId": 2}]}
+
+            def get_all_orders(self, **kw):
+                history_calls.append(kw)
+                return []
+
+            def get_account(self):
+                return {"balances": [{"asset": "BTC", "free": "0.00005", "locked": "0"}]}
+
+            def get_symbol_info(self, symbol=None):
+                return {
+                    "filters": [
+                        {"filterType": "LOT_SIZE", "stepSize": "0.00001", "minQty": "0.00001"},
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                    ]
+                }
+
+        conn.client = V3BinanceClient()
+        conn._info_cache.clear()
+        oco = conn.create_oco_sell("BTCUSDT", 0.00005, take_profit=95000.0, stop_loss=88000.0)
+        self.assertEqual(oco["orderListId"], 321)
+        self.assertEqual(post_calls[0][0], "orderList/oco")
+        payload = post_calls[0][2]["data"]
+        self.assertEqual(payload["quantity"], "0.00005")
+        self.assertEqual(payload["aboveType"], "LIMIT_MAKER")
+        self.assertEqual(payload["belowType"], "STOP_LOSS_LIMIT")
+
+        st = conn.get_oco_fill("BTCUSDT", 321)
+        self.assertEqual(st["status"], "OPEN")
+        self.assertEqual(len(history_calls), 0)  # Must NOT waste weight=20 get_all_orders while EXECUTING
+
+        # 3. Permanent -1013 NOTIONAL rejection disables infinite _sync_oco_stop retry loop
+        bot2, fc2, conn2, rm2, nt2, eng2, cfg2 = self._live_stack()
+        pos = rm2.open_position("AAAUSDT", 100.0, 0.05, kind="scanner", atr_value=1.0, details={"oco_needs_sync": True})
+        err_1013 = BinanceAPIException.__new__(BinanceAPIException)
+        err_1013.code = -1013
+        err_1013.status_code = 400
+        err_1013.message = "Filter failure: NOTIONAL"
+        Exception.__init__(err_1013, "APIError(code=-1013): Filter failure: NOTIONAL")
+        fc2.create_oco_order = lambda **kw: (_ for _ in ()).throw(err_1013)
+        eng2._sync_oco_stop("AAAUSDT", pos, 100.0)
+        self.assertTrue(conn2.last_oco_filter_rejected)
+        self.assertFalse(pos.details.get("oco_needs_sync"))
+
+    def test_scanner_24h_rolling_high_crash_guard_and_forming_dump_guard(self):
+        from scanner import MarketScanner
+        n = 210
+        closes = np.full(n, 0.285)
+        highs = closes + 0.002
+        lows = closes - 0.002
+        vols = np.full(n, 100.0)
+        # Pump to 0.326 3 hours ago, then crash -21% to 0.2575 on signal bar (while 24h change vs 0.285 is only -9.6%)
+        closes[-15:-3] = 0.324
+        highs[-15:-3] = 0.326
+        closes[-2] = 0.2575
+        lows[-2] = 0.2560
+        vols[-2] = 600.0
+        closes[-1] = 0.2575
+        highs[-1] = 0.2580
+        lows[-1] = 0.2570
+        df_rug = pd.DataFrame({
+            "open": closes, "high": highs, "low": lows, "close": closes,
+            "volume": vols, "quote_vol": closes * vols,
+        }, index=pd.date_range("2026-11-25", periods=n, freq="15min", tz="UTC"))
+
+        ex = types.SimpleNamespace(
+            get_candles=lambda *a, **k: df_rug,
+            get_spread_pct=lambda s: 0.05,
+            get_orderbook_imbalance=lambda s, depth=10: 1.5,
+        )
+        sc = MarketScanner(ex, make_cfg(STRATEGY_MODE="capitulation", MAX_24H_DUMP_PCT=-18.0, MAX_24H_HIGH_DUMP_PCT=-18.0))
+        self.assertIsNone(sc._analyze_symbol_tf("MMTUSDT", "15m"))
+
+        # Forming-candle active breakdown (>1.2% below closed signal candle) is also rejected
+        closes2 = np.full(n, 100.0)
+        vols2 = np.full(n, 100.0)
+        closes2[-2] = 94.0
+        vols2[-2] = 500.0
+        closes2[-1] = 92.5  # -1.6% below 94.0 signal close -> active waterfall!
+        df_waterfall = pd.DataFrame({
+            "open": closes2, "high": closes2 + 0.2, "low": closes2 - 0.2, "close": closes2,
+            "volume": vols2, "quote_vol": closes2 * vols2,
+        }, index=pd.date_range("2026-11-25", periods=n, freq="15min", tz="UTC"))
+        ex2 = types.SimpleNamespace(
+            get_candles=lambda *a, **k: df_waterfall,
+            get_spread_pct=lambda s: 0.05,
+            get_orderbook_imbalance=lambda s, depth=10: 1.5,
+        )
+        sc2 = MarketScanner(ex2, make_cfg(STRATEGY_MODE="capitulation", MAX_FORMING_DUMP_PCT=-1.2))
+        self.assertIsNone(sc2._analyze_symbol_tf("FALLUSDT", "15m"))
+
+    def test_partial_fill_cumulative_loss_net_pnl_alerts_and_be_cooldown(self):
+        bot, fc, conn, rm, nt, eng, cfg = self._live_stack(ROUND_TRIP_FEE_PCT=0.2)
+
+        # 1. 90% partial SL at $95 (-5%) + 10% final bounce at $101 (+1%) => overall net loss, increments streak & counts as 1 logical trade!
+        pos = rm.open_position("PARTLOSSUSDT", 100.0, 1.0, kind="scanner", atr_value=1.0)
+        self.assertTrue(rm.partial_close_position("PARTLOSSUSDT", 0.9, 95.0, "STOP_LOSS", fill_id="P1"))
+        self.assertTrue(rm.close_position("PARTLOSSUSDT", 101.0, "TAKE_PROFIT", fill_id="P2", executed_qty=0.1))
+        self.assertEqual(rm.consecutive_losses, 1)
+        stats = rm.get_expectancy_stats()
+        self.assertEqual(stats["total_trades"], 1)
+        self.assertEqual(stats["losses"], 1)
+        self.assertLess(stats["net_pnl_usdt"], 0.0)
+
+        # 2. +0.10% gross exit (-0.10% net after 0.20% fees) reports negative net PnL to notifier (never fake WIN)
+        pos2 = rm.open_position("AAAUSDT", 100.0, 1.0, kind="scanner", atr_value=1.0)
+        eng._finalize_sell_order(
+            "AAAUSDT", pos2,
+            {"fills": [{"price": "100.10", "qty": "1.0"}], "executedQty": "1.0", "cummulativeQuoteQty": "100.10"},
+            1.0, 100.10, "TRAILING_STOP"
+        )
+        self.assertAlmostEqual(nt.closed[-1][4], -0.10, places=2)  # net pnl_pct < 0 -> LOSS card!
+
+        # 3. Profitable Break-Even STOP_LOSS (+0.15% net) gets 1h cooldown, whereas losing TREND_INVALIDATED (-2.5% net) gets 12h lockout
+        cd_be = eng._record_cooldown("BEUSDT", "OCO_STOP_LOSS", net_pnl_pct=0.15)
+        cd_ti = eng._record_cooldown("TIUSDT", "TREND_INVALIDATED", net_pnl_pct=-2.50)
+        self.assertEqual(cd_be, cfg.SYMBOL_COOLDOWN_SEC)
+        self.assertEqual(cd_ti, cfg.COOLDOWN_AFTER_SL_SEC)
+
 
 if __name__ == "__main__":
     unittest.main()

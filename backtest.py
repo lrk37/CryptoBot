@@ -202,6 +202,7 @@ class StrategyBacktester:
                 bb_low_1 = c1.rolling(20).mean() - 2.0 * c1.rolling(20).std()
                 tr1 = pd.concat([h1 - l1, (h1 - c1.shift()).abs(), (l1 - c1.shift()).abs()], axis=1).max(axis=1)
                 atr1 = tr1.rolling(14).mean()
+                atr_pct_1 = (atr1 / c1.replace(0, np.nan)) * 100.0
                 d1 = c1.diff()
                 g1 = d1.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
                 ls1 = (-d1.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
@@ -209,15 +210,30 @@ class StrategyBacktester:
                 vr1 = v1 / v1.rolling(20).mean().replace(0, np.nan)
                 st1 = ((e21_1 - c1) / c1) * 100.0
                 bull1 = c1 >= (e200_1 * 0.992)
-                s1 = np.where((c1 <= bb_low_1) & (rsi1 <= 20.0) & (st1 >= 4.0) & (vr1 >= 2.0), 85.0,
-                     np.where(bull1 & (c1 <= bb_low_1) & (rsi1 <= 26.0) & (st1 >= 2.0) & (vr1 >= 1.5), 78.0,
-                     np.where((c1 <= bb_low_1) & (rsi1 <= 28.0) & (st1 >= 1.5) & (vr1 >= 1.2), 62.0, 20.0)))
+                pct24_1 = ((c1 - c1.shift(24)) / c1.shift(24)) * 100.0
+                hi24_1 = h1.rolling(24).max()
+                dd_hi24_1 = ((c1 - hi24_1) / hi24_1.replace(0, np.nan)) * 100.0
+                s1_base = np.where((c1 <= bb_low_1) & (rsi1 <= 20.0) & (st1 >= 4.0) & (vr1 >= 2.0), 85.0,
+                          np.where(bull1 & (c1 <= bb_low_1) & (rsi1 <= 26.0) & (st1 >= 2.0) & (vr1 >= 1.5), 78.0,
+                          np.where((c1 <= bb_low_1) & (rsi1 <= 28.0) & (st1 >= 1.5) & (vr1 >= 1.2), 62.0, 20.0)))
+                pen1 = np.where(pct24_1 > 15.0, -20.0, 0.0)
+                max_dump_1 = getattr(cfg, 'MAX_24H_DUMP_PCT', -18.0)
+                max_hi_dump_1 = getattr(cfg, 'MAX_24H_HIGH_DUMP_PCT', max_dump_1)
+                max_pump_1 = getattr(cfg, 'PARABOLIC_PUMP_MAX_PCT', 25.0)
+                min_atr_1 = getattr(cfg, 'STABLECOIN_ATR_THRESHOLD', 0.3)
+                blk1 = (
+                    (pct24_1 < max_dump_1)
+                    | (pct24_1 > max_pump_1)
+                    | (dd_hi24_1 < max_hi_dump_1)
+                    | (atr_pct_1 < min_atr_1)
+                )
+                s1 = np.where(blk1, 0.0, s1_base + pen1)
                 df_1h['score'] = s1
                 df_1h['atr'] = atr1
                 df_1h['ema21'] = e21_1
-                # Shift 1h index by +1h before ffill so 15m bars only see already-closed 1h EMA21
+                # 1h candle opening at HH:00 finishes at HH+1:00, which is the close of the HH:45 15m bar
                 e21_closed = e21_1.copy()
-                e21_closed.index = e21_closed.index + pd.Timedelta(hours=1)
+                e21_closed.index = e21_closed.index + pd.Timedelta(minutes=45)
                 ema21_1h_aligned = e21_closed.reindex(df.index).ffill()
             else:
                 df_1h = None
@@ -318,6 +334,10 @@ class StrategyBacktester:
                     if bars_held >= 2 * max_hold_bars:
                         exit_price = close_price
                         reason = "HOLD_TIMEOUT"
+                    elif position.get('tf') == '1h' and ema21_1h_aligned is not None:
+                        if getattr(curr_time, 'minute', 45) == 45 and close_price < ema21_1h_aligned.iloc[i]:
+                            exit_price = close_price
+                            reason = "TREND_INVALIDATED"
                     elif close_price < ema21.iloc[i]:
                         exit_price = close_price
                         reason = "TREND_INVALIDATED"
@@ -366,7 +386,12 @@ class StrategyBacktester:
                 })
 
                 position = None
-                if strategy_mode == 'capitulation' and reason == 'STOP_LOSS':
+                is_sl_lockout = (
+                    strategy_mode == 'capitulation'
+                    and pnl_usdt < 0
+                    and reason in ('STOP_LOSS', 'TREND_INVALIDATED', 'HOLD_TIMEOUT')
+                )
+                if is_sl_lockout:
                     cooldown_until_idx = i + (12 if interval == '1h' else 48)
                 else:
                     cooldown_until_idx = i + max(4, int(60 / self._bar_minutes))
@@ -409,11 +434,23 @@ class StrategyBacktester:
 
                 pct_24h = 0.0
                 if strategy_mode == 'capitulation':
+                    min_atr_pct = getattr(cfg, 'STABLECOIN_ATR_THRESHOLD', 0.3)
+                    atr_pct_bar = (atr_val / p_close * 100.0) if p_close > 0 else 0.0
+                    if atr_pct_bar < min_atr_pct:
+                        continue
                     bars_24h = 24 if interval == '1h' else 96
                     max_dump = getattr(cfg, 'MAX_24H_DUMP_PCT', -18.0)
+                    max_high_dump = getattr(cfg, 'MAX_24H_HIGH_DUMP_PCT', max_dump)
+                    pump_penalty = 0.0
                     if i - 1 >= bars_24h and close.iloc[i - 1 - bars_24h] > 0:
                         pct_24h = ((p_close - close.iloc[i - 1 - bars_24h]) / close.iloc[i - 1 - bars_24h]) * 100.0
                         if pct_24h < max_dump or pct_24h > getattr(cfg, 'PARABOLIC_PUMP_MAX_PCT', 25.0):
+                            continue
+                        if pct_24h > 15.0:
+                            pump_penalty = -20.0
+                    if i >= bars_24h:
+                        hi_24h = float(high.iloc[i - bars_24h:i].max())
+                        if hi_24h > 0 and ((p_close - hi_24h) / hi_24h) * 100.0 < max_high_dump:
                             continue
 
                     score = 0.0
@@ -435,13 +472,13 @@ class StrategyBacktester:
                                 rsi_bear, st_bear, vr_bear = 20.0, 4.0, 2.0
 
                             if rsi_val <= rsi_bear and stretch_pct >= st_bear and v_ratio >= vr_bear:
-                                score = 85.0
+                                score = 85.0 + pump_penalty
                             elif is_bull and rsi_val <= rsi_bull and stretch_pct >= st_bull and v_ratio >= vr_bull:
-                                score = 78.0
+                                score = 78.0 + pump_penalty
                             elif rsi_val <= 28.0 and stretch_pct >= 1.5 and v_ratio >= 1.2:
-                                score = 62.0
+                                score = 62.0 + pump_penalty
                             else:
-                                score = 20.0
+                                score = 20.0 + pump_penalty
 
                     # Dual-Timeframe: at the top of each hour, also check the just-closed 1h candle
                     # (matching scanner.py: 1h-only symbols always check 1h; altcoins require pct_24h <= -1.5%)
@@ -788,11 +825,20 @@ def main():
     try:
         df = fetch_historical_candles(args.symbol, interval=args.interval, days=args.days,
                                       refresh=args.refresh)
+        btc_df = None
+        if getattr(cfg, 'ENABLE_BTC_REGIME_FILTER', True):
+            if args.symbol == 'BTCUSDT':
+                btc_df = df
+            else:
+                try:
+                    btc_df = fetch_historical_candles('BTCUSDT', interval=args.interval, days=args.days, refresh=False)
+                except Exception:
+                    btc_df = None
         tester = StrategyBacktester(initial_capital=args.capital, trade_size_usdt=args.trade_size, min_score=args.min_score)
         print_config()
         if args.min_score is not None:
             print(f" (using --min_score {args.min_score})")
-        metrics = tester.run(args.symbol, df, interval=args.interval)
+        metrics = tester.run(args.symbol, df, interval=args.interval, btc_df=btc_df)
         print_report(args.symbol, metrics)
         if args.baseline > 0 and 'error' not in metrics:
             base = random_baseline(args.symbol, df, tester.trades, args.baseline,

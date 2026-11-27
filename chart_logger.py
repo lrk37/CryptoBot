@@ -6,6 +6,7 @@ and Trade Levels (Entry, Exit, SL, TP) upon trade execution/closure.
 """
 import os
 import logging
+import threading
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -13,6 +14,8 @@ from datetime import datetime
 from typing import Optional
 
 log = logging.getLogger(__name__)
+_CHART_LOCK = threading.Lock()
+MAX_SAVED_CHARTS = 200
 
 try:
     import matplotlib
@@ -77,67 +80,80 @@ def save_trade_chart(symbol: str, df: pd.DataFrame, entry_price: float, exit_pri
         log.warning("[CHART LOGGER] Skipped chart logging (Matplotlib not installed)")
         return None
 
-    try:
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-        df_ind = _calculate_indicators(df).tail(50)
-        
-        plt.style.use('dark_background')
-        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 8), sharex=True,
-                                            gridspec_kw={'height_ratios': [3, 1, 1]})
+    with _CHART_LOCK:
+        fig = None
+        try:
+            out_path = Path(output_dir)
+            out_path.mkdir(parents=True, exist_ok=True)
+            df_ind = _calculate_indicators(df).tail(50)
 
-        title_color = '#00FF7F' if pnl_pct >= 0 else '#FF4500'
-        fig.suptitle(f"{symbol} Trade Result: {pnl_pct:+.2f}% (${pnl_usdt:+.4f}) | Exit: {exit_reason}",
-                     color=title_color, fontsize=14, fontweight='bold')
+            plt.style.use('dark_background')
+            fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 8), sharex=True,
+                                                gridspec_kw={'height_ratios': [3, 1, 1]})
 
-        # Panel 1: Price, EMAs, Lower BB, 20-bar High, SL, TP, Entry, Exit
-        ax1.plot(df_ind.index, df_ind['close'], label='Price', color='white', linewidth=1.5)
-        ax1.plot(df_ind.index, df_ind['ema9'], label='EMA9', color='#00FFFF', linewidth=1)
-        ax1.plot(df_ind.index, df_ind['ema21'], label='EMA21', color='#FF00FF', linewidth=1)
-        ax1.plot(df_ind.index, df_ind['ema50'], label='EMA50', color='#FFA500', linewidth=1, linestyle=':')
-        ax1.plot(df_ind.index, df_ind['bb_low'], label='Lower BB(20,2)', color='#00FA9A', linewidth=1, linestyle='--')
-        ax1.plot(df_ind.index, df_ind['high20'], label='20-bar High', color='#ADFF2F', linewidth=0.8, linestyle=':')
+            title_color = '#00FF7F' if pnl_pct >= 0 else '#FF4500'
+            fig.suptitle(f"{symbol} Trade Result: {pnl_pct:+.2f}% (${pnl_usdt:+.4f}) | Exit: {exit_reason}",
+                         color=title_color, fontsize=14, fontweight='bold')
 
-        ax1.axhline(y=entry_price, color='#FFD700', linestyle='--', label=f'Entry: {_fmt_price(entry_price)}')
-        ax1.axhline(y=exit_price, color='#00BFFF', linestyle=':', label=f'Exit: {_fmt_price(exit_price)}')
+            # Panel 1: Price, EMAs, Lower BB, 20-bar High, SL, TP, Entry, Exit
+            ax1.plot(df_ind.index, df_ind['close'], label='Price', color='white', linewidth=1.5)
+            ax1.plot(df_ind.index, df_ind['ema9'], label='EMA9', color='#00FFFF', linewidth=1)
+            ax1.plot(df_ind.index, df_ind['ema21'], label='EMA21', color='#FF00FF', linewidth=1)
+            ax1.plot(df_ind.index, df_ind['ema50'], label='EMA50', color='#FFA500', linewidth=1, linestyle=':')
+            ax1.plot(df_ind.index, df_ind['bb_low'], label='Lower BB(20,2)', color='#00FA9A', linewidth=1, linestyle='--')
+            ax1.plot(df_ind.index, df_ind['high20'], label='20-bar High', color='#ADFF2F', linewidth=0.8, linestyle=':')
 
-        if stop_loss:
-            ax1.axhline(y=stop_loss, color='#FF3333', linestyle='-.', label=f'SL: {_fmt_price(stop_loss)}')
-        if take_profit:
-            ax1.axhline(y=take_profit, color='#33FF33', linestyle='-.', label=f'TP: {_fmt_price(take_profit)}')
+            ax1.axhline(y=entry_price, color='#FFD700', linestyle='--', label=f'Entry: {_fmt_price(entry_price)}')
+            ax1.axhline(y=exit_price, color='#00BFFF', linestyle=':', label=f'Exit: {_fmt_price(exit_price)}')
 
-        ax1.set_ylabel('Price (USDT)')
-        ax1.legend(loc='upper left', fontsize=8, framealpha=0.3)
-        ax1.grid(True, alpha=0.2)
+            if stop_loss:
+                ax1.axhline(y=stop_loss, color='#FF3333', linestyle='-.', label=f'SL: {_fmt_price(stop_loss)}')
+            if take_profit:
+                ax1.axhline(y=take_profit, color='#33FF33', linestyle='-.', label=f'TP: {_fmt_price(take_profit)}')
 
-        # Panel 2: RSI
-        ax2.plot(df_ind.index, df_ind['rsi'], color='#FF8C00', label='RSI(14)')
-        ax2.axhline(y=70, color='red', linestyle='--', alpha=0.5)
-        ax2.axhline(y=30, color='green', linestyle='--', alpha=0.5)
-        ax2.set_ylabel('RSI')
-        ax2.set_ylim(0, 100)
-        ax2.legend(loc='upper left', fontsize=8, framealpha=0.3)
-        ax2.grid(True, alpha=0.2)
+            ax1.set_ylabel('Price (USDT)')
+            ax1.legend(loc='upper left', fontsize=8, framealpha=0.3)
+            ax1.grid(True, alpha=0.2)
 
-        # Panel 3: MACD
-        ax3.plot(df_ind.index, df_ind['macd'], color='#00FFFF', label='MACD')
-        ax3.plot(df_ind.index, df_ind['macd_signal'], color='#FF00FF', label='Signal')
-        colors = ['#00FF00' if v >= 0 else '#FF0000' for v in df_ind['macd_hist']]
-        ax3.bar(df_ind.index, df_ind['macd_hist'], color=colors, alpha=0.5, width=0.005)
-        ax3.set_ylabel('MACD')
-        ax3.legend(loc='upper left', fontsize=8, framealpha=0.3)
-        ax3.grid(True, alpha=0.2)
+            # Panel 2: RSI
+            ax2.plot(df_ind.index, df_ind['rsi'], color='#FF8C00', label='RSI(14)')
+            ax2.axhline(y=70, color='red', linestyle='--', alpha=0.5)
+            ax2.axhline(y=30, color='green', linestyle='--', alpha=0.5)
+            ax2.set_ylabel('RSI')
+            ax2.set_ylim(0, 100)
+            ax2.legend(loc='upper left', fontsize=8, framealpha=0.3)
+            ax2.grid(True, alpha=0.2)
 
-        plt.xticks(rotation=30)
-        plt.tight_layout()
+            # Panel 3: MACD
+            ax3.plot(df_ind.index, df_ind['macd'], color='#00FFFF', label='MACD')
+            ax3.plot(df_ind.index, df_ind['macd_signal'], color='#FF00FF', label='Signal')
+            colors = ['#00FF00' if v >= 0 else '#FF0000' for v in df_ind['macd_hist']]
+            ax3.bar(df_ind.index, df_ind['macd_hist'], color=colors, alpha=0.5, width=0.005)
+            ax3.set_ylabel('MACD')
+            ax3.legend(loc='upper left', fontsize=8, framealpha=0.3)
+            ax3.grid(True, alpha=0.2)
 
-        ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{symbol}_{ts_str}_{pnl_pct:+.2f}pct.png"
-        filepath = os.path.join(output_dir, filename)
-        plt.savefig(filepath, dpi=120)
-        plt.close(fig)
+            plt.xticks(rotation=30)
+            plt.tight_layout()
 
-        log.info(f"[CHART SAVED] {filepath}")
-        return filepath
-    except Exception as e:
-        log.error(f"[CHART LOGGER ERROR] Failed to save chart for {symbol}: {e}")
-        return None
+            ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{symbol}_{ts_str}_{pnl_pct:+.2f}pct.png"
+            filepath = os.path.join(output_dir, filename)
+            plt.savefig(filepath, dpi=120)
+
+            try:
+                pngs = sorted(out_path.glob("*.png"), key=lambda p: p.stat().st_mtime)
+                if len(pngs) > MAX_SAVED_CHARTS:
+                    for stale_png in pngs[:len(pngs) - MAX_SAVED_CHARTS]:
+                        stale_png.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+            log.info(f"[CHART SAVED] {filepath}")
+            return filepath
+        except Exception as e:
+            log.error(f"[CHART LOGGER ERROR] Failed to save chart for {symbol}: {e}")
+            return None
+        finally:
+            if fig is not None:
+                plt.close(fig)

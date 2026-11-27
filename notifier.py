@@ -38,7 +38,9 @@ class TelegramNotifier:
             return f"{val:.4f}"
         if abs_v >= 0.01:
             return f"{val:.6f}"
-        return f"{val:.8f}"
+        if abs_v >= 0.000001:
+            return f"{val:.8f}"
+        return f"{val:.10f}"
 
     def send_photo(self, photo_path: str, caption: str = "") -> bool:
         """Send a saved chart PNG image directly to Telegram chat."""
@@ -193,5 +195,5 @@ class TelegramNotifier:
         return self.send(msg)
 
     def error(self, msg):
-        return self.send(f"🚨 *CRITICAL ERROR*:\n{msg}")
+        return self.send(f"🚨 CRITICAL ERROR:\n{msg}")
 
